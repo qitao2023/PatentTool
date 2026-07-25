@@ -1,0 +1,92 @@
+# =============================================
+# Patent Tool 配置
+# =============================================
+
+# PDF提取
+pdf:
+  max_pages: 500
+  ocr_enabled: false
+  language: "chi_sim+eng"
+
+# AI 引擎配置
+ai:
+  provider: "deepseek"                      # "deepseek" 或 "kimi"
+  deepseek_model: "deepseek-v4-pro"       # 或 deepseek-v4-pro（旗舰）
+  kimi_model: "kimi-k3"                     # 或 kimi-k2.6 / kimi-k2.7-code
+  temperature: 0.4
+
+# 检索式生成
+query_generation:
+  max_queries: 1
+  max_tokens: 4096
+
+# Web自动化
+web:
+  headless: false                 # 强制 false（反检测）
+  viewport_width: 1920
+  viewport_height: 1080
+  locale: "zh-CN"
+  timezone: "Asia/Shanghai"
+
+# HimmPat 配置
+himmpat:
+  base_url: "https://global.himmpat.com"
+  search_url: "https://global.himmpat.com/intelligence?active=6"
+  login_url: "https://global.himmpat.com/login"   # 会自动跳转到 rd.himmpat.com 完成登录
+  login_mode: "auto"            # "manual" 或 "auto"
+  max_results_per_query: 50
+  results_per_page: 20            # 观察后调整
+
+  # 元素选择器（观察HimmPat后调整）
+  selectors:
+    search_input: "textarea[placeholder*='技术'], [placeholder*='技术']"
+    search_button: "button.search-btn"
+    result_container: ".result-list"
+    result_row: ".patent-item"
+    patent_number: ".patent-number"
+    title: ".patent-title"
+    abstract: ".patent-abstract"
+    applicant: ".patent-applicant"
+    inventor: ".patent-inventor"
+    pub_date: ".patent-date"
+    ipc: ".patent-ipc"
+    next_page: ".pagination-next"
+    login_username: "input[name='username']"
+    login_password: "input[type='password']"
+    login_submit: "button[type='submit']"
+    user_avatar: ".user-avatar, .user-info"
+
+# 人类行为模拟
+human:
+  typing_delay_min_ms: 30
+  typing_delay_max_ms: 150
+  action_delay_mean_s: 1.5
+  action_delay_std_s: 0.5
+  search_interval_min_s: 8
+  search_interval_max_s: 15
+  long_pause_interval_queries: 3
+  long_pause_min_s: 25
+  long_pause_max_s: 40
+  typo_probability: 0.02
+  mouse_move_steps: 10
+
+# 去重
+dedup:
+  title_similarity_threshold: 0.90
+  primary_key: "publication_number"
+
+# 分析
+analysis:
+  max_tokens: 8192
+  top_n_for_detailed: 15
+  batch_comparison: true
+
+# Session
+session:
+  max_age_hours: 6
+  profile_dir: "profiles/himmpat_browser"
+
+# 输出
+output:
+  save_intermediate: true
+  report_formats: ["json", "html"]

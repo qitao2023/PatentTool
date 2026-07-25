@@ -1,0 +1,10 @@
+PySide6>=6.6.0
+pymupdf>=1.24.0
+pymupdf4llm>=0.0.15
+anthropic>=0.39.0
+playwright>=1.48.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+markdown>=3.5.0
+jstyleson>=0.0.2
