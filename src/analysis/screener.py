@@ -191,3 +191,99 @@ class PatentScreener:
         result.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
 
         return result[:self.settings.analysis_top_n]
+
+    FULLTEXT_SCORING_PROMPT = """你是一名中国专利审查员。请通读以下对比文件的全文，评估其与本申请的相关度。
+
+## 评分标准
+
+1. **技术领域** (0-25分)：对比文件是否属于相同或相近技术领域
+2. **技术问题** (0-25分)：对比文件是否解决相同或类似的技术问题
+3. **技术方案** (0-25分)：对比文件的技术手段与本申请的重叠程度
+4. **证据强度** (0-25分)：对比文件的权利要求/说明书内容是否能清晰用于评述新颖性或创造性
+
+## 输出格式
+
+纯 JSON，不要其他文字：
+```json
+{"relevance_score": 85, "relevance_reason": "一句话说明相关原因"}
+```"""
+
+    def score_full_text(self, patent_doc, enriched_patents: list[dict],
+                        signals=None) -> list[dict]:
+        """
+        逐篇通读全文，给出 0-100 相关度评分。
+
+        Args:
+            patent_doc: 本申请
+            enriched_patents: Phase 3 获取全文后的专利列表（含 claims, description）
+
+        Returns:
+            附 fulltext_score 和 fulltext_reason 的专利列表
+        """
+        if not enriched_patents:
+            return []
+
+        client = self._get_client()
+        patent_summary = self._build_patent_summary(patent_doc)
+        total = len(enriched_patents)
+
+        for i, p in enumerate(enriched_patents):
+            pub = p.get("publication_number", "?")
+            title = p.get("title", "")
+            claims = p.get("claims", "")[:5000]
+            description = p.get("description", "")[:5000]
+            abstract = p.get("abstract", "")[:2000]
+
+            full_text = f"""## 对比文件 [{i+1}/{total}]
+
+**公开号**: {pub}
+**标题**: {title}
+**摘要**: {abstract}
+
+**权利要求**:
+{claims if claims else '(无)'}
+
+**说明书摘要**:
+{description if description else '(无)'}"""
+
+            if signals:
+                signals.log.emit("INFO",
+                    f"  AI 通读全文 [{i+1}/{total}]: {pub} ...")
+
+            try:
+                response = client.chat(
+                    system_prompt=self.FULLTEXT_SCORING_PROMPT,
+                    user_prompt=f"## 本申请\n\n{patent_summary}\n\n{full_text}",
+                    max_tokens=512,
+                    temperature=0.2,
+                )
+                # 解析 JSON
+                import json as json_module
+                import re
+                resp = response.strip()
+                match = re.search(r'\{[^}]+\}', resp)
+                if match:
+                    data = json_module.loads(match.group(0))
+                    p["fulltext_score"] = data.get("relevance_score", 0)
+                    p["fulltext_reason"] = data.get("relevance_reason", "")
+                else:
+                    p["fulltext_score"] = 0
+                    p["fulltext_reason"] = "解析失败"
+            except Exception as e:
+                p["fulltext_score"] = 0
+                p["fulltext_reason"] = f"评分失败: {e}"
+                if signals:
+                    signals.log.emit("WARN",
+                        f"  {pub} 全文评分失败: {e}")
+
+            if signals:
+                score = p.get("fulltext_score", 0)
+                reason = p.get("fulltext_reason", "")[:60]
+                signals.log.emit("INFO",
+                    f"  [{i+1}/{total}] {pub}: 相关度 {score}分 - {reason}")
+
+        # 按全文评分的相关度降序
+        enriched_patents.sort(
+            key=lambda x: x.get("fulltext_score", 0), reverse=True)
+
+        return enriched_patents

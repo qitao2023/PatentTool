@@ -14,7 +14,12 @@ class Settings:
 
     def __init__(self, config_dir: str | Path | None = None):
         if config_dir is None:
-            config_dir = Path(__file__).parent.parent.parent / "config"
+            import sys
+            if getattr(sys, 'frozen', False):
+                # PyInstaller 打包：exe 同目录下的 config/
+                config_dir = Path(sys.executable).parent / "config"
+            else:
+                config_dir = Path(__file__).parent.parent.parent / "config"
         self.config_dir = Path(config_dir)
 
         # 加载 .env

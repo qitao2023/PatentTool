@@ -4,7 +4,6 @@
 import asyncio
 import os
 import signal
-import subprocess
 import tempfile
 import shutil
 from pathlib import Path
@@ -55,16 +54,6 @@ class BrowserManager:
         except Exception:
             return default
 
-    def _kill_chrome(self):
-        """杀掉所有 chrome.exe"""
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "chrome.exe"],
-                capture_output=True, timeout=10
-            )
-        except Exception:
-            pass
-
     def _storage_path(self) -> Path:
         """持久化 Cookie 文件路径"""
         p = Path(self.settings.session_profile_dir)
@@ -76,8 +65,6 @@ class BrowserManager:
     async def launch(self) -> Tuple:
         """启动浏览器（Edge，持久化 Profile，保留密码/Cookie）"""
         from playwright.async_api import async_playwright
-
-        self._kill_chrome()
 
         self._playwright = await async_playwright().start()
 
@@ -173,8 +160,7 @@ class BrowserManager:
                 shutil.rmtree(str(self._profile_dir), ignore_errors=True)
             except Exception:
                 pass
-        # 清理残留 chrome
-        self._kill_chrome()
+        # 浏览器已通过 Playwright API 关闭
 
     async def launch_with_retry(self, max_retries: int = 2) -> Tuple:
         """带重试的启动"""

@@ -163,6 +163,94 @@ IPC: {result.get('ipc', 'N/A')}
         except json.JSONDecodeError:
             return None
 
+    def compare_single_fulltext(self, patent_doc,
+                                  candidate: dict) -> dict:
+        """
+        单篇全⽂对比 — ⽤于点击左侧专利后在右侧显示详细分析。
+
+        Returns:
+            dict with analysis markdown and structured data
+        """
+        client = self._get_client()
+        pub = candidate.get("publication_number", "?")
+        title = candidate.get("title", "")
+        claims = candidate.get("claims", "")[:6000]
+        description = candidate.get("description", "")[:6000]
+        abstract = candidate.get("abstract", "")[:2000]
+        ipc = candidate.get("ipc", "")
+        applicant = candidate.get("applicant", "")
+        pub_date = candidate.get("publication_date", "")
+        fulltext_score = candidate.get("fulltext_score", "")
+
+        comparison_prompt = f"""# 本申请专利
+**发明名称**: {patent_doc.title}
+**IPC分类**: {', '.join(patent_doc.ipc_classifications)}
+**摘要**: {patent_doc.abstract}
+
+**权利要求书（核心）**:
+{chr(10).join(f'{i+1}. {c}' for i, c in enumerate(patent_doc.claims[:5]))}
+
+# 对比文献
+**公开号**: {pub}
+**标题**: {title}
+**申请人**: {applicant}
+**公开日**: {pub_date}
+**IPC**: {ipc}
+**AI相关度评分**: {fulltext_score}/100
+
+**摘要**:
+{abstract}
+
+**权利要求书**:
+{claims[:3000]}
+
+**说明书（关键部分）**:
+{description[:3000]}
+
+---
+请以中国专利审查员的视角，对这篇对比文献与本申请进行详细对比分析。
+
+按以下 Markdown 格式输出：
+
+## 对比分析: {pub} vs 本申请
+
+### 1. 基本信息对比
+| 项目 | 本申请 | 对比文献 |
+|------|--------|----------|
+| 标题 | {patent_doc.title} | {title} |
+| IPC | {', '.join(patent_doc.ipc_classifications[:3])} | {ipc} |
+| 申请人 | - | {applicant} |
+| 公开日 | - | {pub_date} |
+
+### 2. 技术领域分析
+（100-200字，分析两者是否属于相同或相近技术领域）
+
+### 3. 权利要求对比
+（列出两者权利要求的相同点和不同点）
+
+### 4. 新颖性分析
+（分析对比文献是否影响本申请的新颖性，指出具体哪些权利要求可能被公开）
+
+### 5. 创造性分析（三步法）
+（如果对比文献可作为最接近的现有技术，分析本申请权利要求的创造性）
+- 区别技术特征
+- 实际解决的技术问题
+- 是否显而易见
+
+### 6. 综合结论
+（100-200字，总结这篇对比文献的参考价值）"""
+
+        try:
+            content = client.chat(
+                system_prompt="你是一位资深中国专利审查员，精通专利法第22条（新颖性）和第23条（创造性）的三步法分析。请提供专业、准确、有深度的对比分析。",
+                user_prompt=comparison_prompt,
+                max_tokens=4096,
+                temperature=0.3,
+            )
+            return {"markdown": content, "publication_number": pub}
+        except Exception as e:
+            return {"markdown": f"# 对比分析失败\n\n{pub}: {e}", "publication_number": pub}
+
     def _clean_json(self, content: str) -> str:
         content = content.strip()
         if "```json" in content:

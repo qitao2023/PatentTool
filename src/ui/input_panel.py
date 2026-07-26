@@ -77,6 +77,17 @@ class InputPanel(QWidget):
 
         param_row.addSpacing(20)
 
+        # 详情抓取数
+        param_row.addWidget(QLabel("详情抓取数:"))
+        self.fetch_detail_spin = QSpinBox()
+        self.fetch_detail_spin.setRange(1, 200)
+        self.fetch_detail_spin.setValue(10)
+        self.fetch_detail_spin.setSuffix(" 篇")
+        self.fetch_detail_spin.setToolTip("AI 筛选后最多抓取多少篇专利的全文详情")
+        param_row.addWidget(self.fetch_detail_spin)
+
+        param_row.addSpacing(20)
+
         # 登录方式 — PATENTSCOPE 无需登录，隐藏
         self.login_group = QButtonGroup(self)
         self.manual_radio = QRadioButton("手动登录(推荐)")
@@ -91,7 +102,7 @@ class InputPanel(QWidget):
 
         # AI引擎标签
         self.ai_label = QLabel("DeepSeek")
-        self.ai_label.setStyleSheet("color: #656d76; font-size: 12px;")
+        self.ai_label.setObjectName("aiProviderLabel")
         param_row.addWidget(self.ai_label)
 
         layout.addLayout(param_row)
@@ -99,22 +110,14 @@ class InputPanel(QWidget):
         # --- 控制按钮行 ---
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton("▶ 开始分析")
-        self.start_btn.setMinimumHeight(36)
-        self.start_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0078D4;
-                color: white;
-                font-weight: bold;
-                padding: 6px 24px;
-                border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #106EBE; }
-            QPushButton:disabled { background-color: #CCCCCC; }
-        """)
+        self.start_btn.setObjectName("startBtn")
+        self.start_btn.setMinimumHeight(40)
         self.start_btn.clicked.connect(self.start_clicked.emit)
         btn_row.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("■ 停止")
+        self.stop_btn.setObjectName("stopBtn")
+        self.stop_btn.setMinimumHeight(40)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_clicked.emit)
         btn_row.addWidget(self.stop_btn)
@@ -155,7 +158,8 @@ class InputPanel(QWidget):
 
         # 设置按钮（显眼位置）
         self.settings_btn = QPushButton("⚙ 设置")
-        self.settings_btn.setMinimumHeight(32)
+        self.settings_btn.setObjectName("settingsBtn")
+        self.settings_btn.setMinimumHeight(36)
         self.settings_btn.setToolTip("配置AI引擎、API Key、模型等")
         self.settings_btn.clicked.connect(self.settings_clicked.emit)
         btn_row.addWidget(self.settings_btn)
@@ -194,6 +198,7 @@ class InputPanel(QWidget):
         return {
             "max_queries": self.max_queries_spin.value(),
             "max_results": self.max_results_spin.value(),
+            "fetch_detail": self.fetch_detail_spin.value(),
             "login_mode": "manual" if self.manual_radio.isChecked() else "auto",
             "ai_provider": self._ai_provider,
         }

@@ -2,17 +2,20 @@
 检索结果列表面板 - 按检索式分Tab显示专利列表
 """
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView, QLabel, QSplitter, QHBoxLayout,
+    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
+    QHeaderView, QLabel, QHBoxLayout,
 )
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, Slot, Signal
 
 
 class ResultPanel(QWidget):
     """左下侧检索结果列表"""
 
+    patent_selected = Signal(dict)  # 用户点击某篇专利时发射
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._all_results = []  # 保存去重后的结果，供点击时查找
         self._setup_ui()
 
     def _setup_ui(self):
@@ -26,102 +29,75 @@ class ResultPanel(QWidget):
         info_row.addStretch(1)
         layout.addLayout(info_row)
 
-        # Tab切换：每个检索式一个Tab + 汇总Tab
-        self.tab_widget = QTabWidget()
-        self.tab_widget.addTab(self._create_summary_tab(), "📊 全部去重")
-        layout.addWidget(self.tab_widget, 1)
-
-    def _create_summary_tab(self) -> QWidget:
-        """创建汇总Tab（初始为空）"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        self.summary_table = QTableWidget(0, 6)
+        # 结果表格
+        self.summary_table = QTableWidget(0, 7)
         self.summary_table.setHorizontalHeaderLabels([
-            "公开号", "标题", "申请人", "公开日", "IPC分类", "来源检索式"
+            "公开号", "标题", "相关度", "申请人", "公开日", "IPC分类", "来源检索式"
         ])
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
         self.summary_table.setAlternatingRowColors(True)
-        self.summary_table.setSortingEnabled(True)
         self.summary_table.setSelectionBehavior(
             self.summary_table.SelectionBehavior.SelectRows
         )
-        layout.addWidget(self.summary_table)
-        return tab
-
-    def add_query_tab(self, query_index: int, query_string: str):
-        """为某个检索式添加一个Tab"""
-        # 如果已存在相同index的Tab则不重复添加
-        tab_text = f"检索式{query_index}"
-        for i in range(self.tab_widget.count()):
-            if self.tab_widget.tabText(i) == tab_text:
-                self.tab_widget.setCurrentIndex(i)
-                return
-
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        table = QTableWidget(0, 5)
-        table.setHorizontalHeaderLabels([
-            "公开号", "标题", "申请人", "公开日", "IPC分类"
-        ])
-        table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        table.setAlternatingRowColors(True)
-        table.setSortingEnabled(True)
-        table.setSelectionBehavior(table.SelectionBehavior.SelectRows)
-        layout.addWidget(table)
-
-        # 存储引用以便后续填充数据
-        table.setProperty("query_index", query_index)
-        table.setProperty("query_string", query_string)
-
-        idx = self.tab_widget.addTab(tab, tab_text)
-        self.tab_widget.setCurrentIndex(idx)
+        layout.addWidget(self.summary_table, 1)
 
     @Slot(int, int, list)
     def add_query_results(self, query_index: int, total: int, results: list):
-        """将某个检索式的结果填入对应Tab"""
-        tab_text = f"检索式{query_index}"
-        for i in range(self.tab_widget.count()):
-            if self.tab_widget.tabText(i) == tab_text:
-                tab = self.tab_widget.widget(i)
-                table = tab.findChild(QTableWidget)
-                if table:
-                    self._populate_table(table, results)
-                # 更新Tab标题显示数量
-                self.tab_widget.setTabText(i, f"{tab_text} ({len(results)})")
-                break
+        """检索完成后更新结果表格"""
+        self._populate_table(self.summary_table, results)
 
     @Slot(list)
     def show_dedup_results(self, results: list):
-        """显示去重后的汇总结果"""
-        # 切换到汇总Tab
-        self.tab_widget.setCurrentIndex(0)
+        """显示去重后的结果"""
+        self._all_results = results
         self._populate_table(self.summary_table, results)
-        self.summary_label.setText(f"检索结果: 去重后共 {len(results)} 条")
+        self.summary_label.setText(f"检索结果: 去重后共 {len(results)} 条 | 点击某篇查看对比分析")
+        self.summary_table.cellClicked.connect(self._on_cell_clicked)
 
     def _populate_table(self, table: QTableWidget, results: list):
         """填充表格数据"""
-        # results 是 list[dict]，包含 public_number, title, applicant, pub_date, ipc 等
         table.setRowCount(len(results))
         for row_idx, r in enumerate(results):
             table.setItem(row_idx, 0, QTableWidgetItem(r.get("publication_number", "")))
             table.setItem(row_idx, 1, QTableWidgetItem(r.get("title", "")))
-            table.setItem(row_idx, 2, QTableWidgetItem(r.get("applicant", "")))
-            table.setItem(row_idx, 3, QTableWidgetItem(r.get("publication_date", "")))
-            table.setItem(row_idx, 4, QTableWidgetItem(r.get("ipc", "")))
-            if table.columnCount() > 5:
+            # 相关度：优先用全文评分，否则用摘要阶段评分
+            score = r.get("fulltext_score") or r.get("relevance_score", "")
+            score_item = QTableWidgetItem(str(score) if score != "" else "-")
+            if isinstance(score, (int, float)) and score > 0:
+                if score >= 80:
+                    score_item.setForeground(Qt.GlobalColor.darkGreen)
+                elif score >= 60:
+                    score_item.setForeground(Qt.GlobalColor.darkYellow)
+                else:
+                    score_item.setForeground(Qt.GlobalColor.darkRed)
+            table.setItem(row_idx, 2, score_item)
+            table.setItem(row_idx, 3, QTableWidgetItem(r.get("applicant", "")))
+            table.setItem(row_idx, 4, QTableWidgetItem(
+                (r.get("publication_date") or "").replace("\n", " ").replace("\t", " ")))
+            table.setItem(row_idx, 5, QTableWidgetItem(r.get("ipc", "")))
+            if table.columnCount() > 6:
                 src = r.get("source_queries", "")
-                table.setItem(row_idx, 5, QTableWidgetItem(str(src)))
+                table.setItem(row_idx, 6, QTableWidgetItem(str(src)))
         table.resizeColumnsToContents()
 
+    def _on_cell_clicked(self, row: int, col: int):
+        """表格行点击 → 通过公开号匹配发射专利数据"""
+        item = self.summary_table.item(row, 0)
+        if item is None:
+            return
+        pub_num = item.text().strip()
+        match = next(
+            (r for r in self._all_results
+             if r.get("publication_number", "") == pub_num),
+            None)
+        if match:
+            self.patent_selected.emit(match)
+
     def reset(self):
-        """重置所有Tab"""
-        while self.tab_widget.count() > 1:
-            self.tab_widget.removeTab(1)
+        """重置"""
+        self._all_results = []
         self.summary_table.setRowCount(0)
         self.summary_label.setText("检索结果: 等待执行...")

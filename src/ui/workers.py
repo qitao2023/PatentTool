@@ -308,12 +308,14 @@ class PatentscopeSearchAndFetchWorker(QThread):
     """
 
     def __init__(self, queries: list, settings: Settings,
-                 patent_doc=None, max_fetch: int = 200, parent=None):
+                 patent_doc=None, max_fetch: int = 200,
+                 top_n: int = 10, parent=None):
         super().__init__(parent)
         self.queries = queries
         self.settings = settings
         self.patent_doc = patent_doc
         self.max_fetch = max_fetch
+        self.top_n = top_n
         self.signals = WorkerSignals()
         self._is_running = True
         self.output_dir = None  # 供 main_window 读取
@@ -349,7 +351,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
             import re
             patent_name = re.sub(r'[\\/:*?"<>|]', '_', patent_name)[:80]
         run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_dir = (Path(__file__).parent.parent.parent / "data" / "output"
+        self.output_dir = (Path.cwd() / "data" / "output"
                            / patent_name / run_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         output_dir = self.output_dir  # 局部引用
@@ -443,7 +445,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
             f"阶段2: AI 从 {total_abstracts} 篇摘要中筛选最相关专利...")
         self.signals.progress.emit(35, "阶段2: AI 粗筛...")
 
-        top_n = min(self.settings.analysis_top_n, total_abstracts)
+        top_n = min(self.top_n, total_abstracts)
 
         if self.patent_doc:
             screener = PatentScreener(self.settings)
@@ -488,7 +490,8 @@ class PatentscopeSearchAndFetchWorker(QThread):
         scraper2 = PatentscopeScraper(page2, self.settings, human2)
 
         enriched = await scraper2.fetch_details_batch(
-            screened, signals=self.signals)
+            screened, signals=self.signals,
+            stop_check=lambda: not self._is_running)
 
         await browser_mgr2.close()
 
@@ -507,10 +510,34 @@ class PatentscopeSearchAndFetchWorker(QThread):
         })
         self.signals.log.emit("INFO", f"  已保存: {stage3_path}")
 
+        # ============ 阶段3.5: AI 通读全文 + 相关度打分 ============
+        if self._is_running and enriched and self.patent_doc:
+            self.signals.log.emit("INFO", "=" * 40)
+            self.signals.log.emit("INFO",
+                f"阶段3.5: AI 通读 {len(enriched)} 篇全文，评估相关度...")
+            self.signals.progress.emit(50, "阶段3.5: AI 评估全文相关度...")
+
+            screener2 = PatentScreener(self.settings)
+            enriched = screener2.score_full_text(
+                self.patent_doc, enriched, signals=self.signals)
+
+            # 保存打分后的结果
+            stage35_path = output_dir / "03.5_fulltext_scored.json"
+            self._save_json(stage35_path, {
+                "stage": "fulltext_scored",
+                "timestamp": datetime.now().isoformat(),
+                "total": len(enriched),
+                "results": enriched,
+            })
+            self.signals.log.emit("INFO", f"  已保存: {stage35_path}")
+        elif not self.patent_doc:
+            self.signals.log.emit("WARN",
+                "跳过分: 无本申请信息，使用摘要阶段的评分")
+
         # ============ 完成 ============
         if self._is_running:
             self.signals.log.emit("SUCCESS",
-                f"PATENTSCOPE 三阶段检索完成: {full_count} 篇全文")
+                f"PATENTSCOPE 检索完成: {full_count} 篇全文")
             self.signals.log.emit("INFO",
                 f"所有结果已保存到: {output_dir}")
             self.signals.progress.emit(55, "检索完成，准备分析...")
@@ -809,3 +836,36 @@ class PatentscopeAbstractTestWorker(QThread):
         self.signals.progress.emit(100, "摘要测试完成")
         self.signals.all_searches_done.emit([abstracts])
         self.signals.finished.emit(True, "")
+
+
+class SingleCompareWorker(QThread):
+    """单篇专利对比 Worker — 点击左侧专利时触发，在右侧显示详细对比"""
+
+    def __init__(self, patent_doc, candidate: dict, settings: Settings,
+                 ai_provider: str | None = None, parent=None):
+        super().__init__(parent)
+        self.patent_doc = patent_doc
+        self.candidate = candidate
+        self.settings = settings
+        self.ai_provider = ai_provider
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            pub = self.candidate.get("publication_number", "?")
+            self.signals.log.emit("INFO", f"🔄 AI 正在对比 {pub} vs 本申请...")
+
+            from src.analysis.comparator import PatentComparator
+            comparator = PatentComparator(
+                self.settings, provider=self.ai_provider)
+            result = comparator.compare_single_fulltext(
+                self.patent_doc, self.candidate)
+
+            self.signals.log.emit("SUCCESS", f"对比完成: {pub}")
+            # 用 analysis_done 传结果给主线程
+            self.signals.analysis_done.emit(result)
+            self.signals.finished.emit(True, "")
+        except Exception as e:
+            self.signals.error.emit(f"对比失败: {e}")
+            self.signals.log.emit("ERROR", f"对比失败: {e}")
+            self.signals.finished.emit(False, str(e))

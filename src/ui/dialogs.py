@@ -6,7 +6,7 @@ import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSlider, QTabWidget, QWidget, QMessageBox,
-    QDialogButtonBox, QGroupBox,
+    QGroupBox,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -88,19 +88,23 @@ class SettingsDialog(QDialog):
         hint = QLabel(
             "💡 保存设置时，API Key 和模型选择将写入 config/.env 文件。"
         )
-        hint.setStyleSheet("color: #656d76; font-size: 11px;")
+        hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         layout.addStretch(1)
 
         # --- 按钮 ---
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._on_save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("保存")
+        save_btn.setObjectName("saveBtn")
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
 
     def _load_settings(self):
         """加载当前配置到界面"""
@@ -108,6 +112,8 @@ class SettingsDialog(QDialog):
         idx = self.provider_combo.findData(provider)
         if idx >= 0:
             self.provider_combo.setCurrentIndex(idx)
+        # 确保模型列表已填充（setCurrentIndex 为0且当前已在0时不触发信号）
+        self._populate_models()
 
         # 从环境变量加载 API Key（masked）
         cfg = PROVIDER_CONFIG.get(provider, {})
@@ -120,12 +126,10 @@ class SettingsDialog(QDialog):
         temp = self.settings.ai_temperature
         self.temp_slider.setValue(int(temp * 100))
 
-    def _on_provider_changed(self, idx):
-        """提供商改变时更新模型列表"""
-        provider = self.provider_combo.currentData()
-        self._current_provider = provider
+    def _populate_models(self):
+        """根据当前提供商填充模型下拉框"""
+        provider = self._current_provider
         models = get_provider_models(provider)
-
         self.model_combo.clear()
         current_model = self.settings.ai_model
         selected_idx = 0
@@ -136,8 +140,13 @@ class SettingsDialog(QDialog):
         if self.model_combo.count() > 0:
             self.model_combo.setCurrentIndex(selected_idx)
 
-        # 更新 API Key 输入框占位符
-        cfg = PROVIDER_CONFIG.get(provider, {})
+    def _on_provider_changed(self, idx):
+        """提供商改变时更新模型列表"""
+        self._current_provider = self.provider_combo.currentData()
+        self._populate_models()
+
+        # 更新 API Key 输入框
+        cfg = PROVIDER_CONFIG.get(self._current_provider, {})
         env_var = cfg.get("api_key_env", "")
         api_key = os.getenv(env_var, "")
         self.api_key_input.setText(api_key)

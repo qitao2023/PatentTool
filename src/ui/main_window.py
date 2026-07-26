@@ -19,7 +19,8 @@ from src.ui.workers import (
     PDFParseWorker, QueryGenerateWorker,
     SearchAndFetchWorker, PatentscopeSearchAndFetchWorker,
     AnalysisWorker, OAWriterWorker,
-    PatentscopeTestWorker, PatentscopeAbstractTestWorker
+    PatentscopeTestWorker, PatentscopeAbstractTestWorker,
+    SingleCompareWorker,
 )
 from src.utils.config import Settings
 from src.utils.signals import WorkerSignals
@@ -44,8 +45,7 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("专利检索分析工具 v1.0")
-        self.setMinimumSize(1400, 900)
-        self.resize(1600, 1000)
+        self.setMinimumSize(1024, 700)
 
         # 中央部件
         central = QWidget()
@@ -70,12 +70,15 @@ class MainWindow(QMainWindow):
 
         # ③④ 结果列表 + 报告（水平分割）
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(3)
         self.result_panel = ResultPanel()
+        self.result_panel.patent_selected.connect(self._on_patent_clicked)
         self.report_panel = ReportPanel()
         splitter.addWidget(self.result_panel)
         splitter.addWidget(self.report_panel)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([500, 700])
         main_layout.addWidget(splitter, 1)
 
     def _setup_menu(self):
@@ -170,7 +173,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("测试完成")
         # 保存测试结果
         from datetime import datetime
-        out = (Path(__file__).parent.parent.parent / "data" / "output"
+        out = (Path.cwd() / "data" / "output"
                / "test" / datetime.now().strftime("%Y%m%d_%H%M%S"))
         out.mkdir(parents=True, exist_ok=True)
         import json as json_module
@@ -220,8 +223,19 @@ class MainWindow(QMainWindow):
             f"× {self._user_params.get('max_results', 200)}条/检索式 "
             f"| AI: {self._user_params.get('ai_provider', 'deepseek')}")
 
+        # 保存界面设置（reset 会清掉）
+        saved_queries = self.input_panel.max_queries_spin.value()
+        saved_results = self.input_panel.max_results_spin.value()
+        saved_fetch = self.input_panel.fetch_detail_spin.value()
+
         # 重置界面
         self._on_reset()
+
+        # 恢复界面设置
+        self.input_panel.path_edit.setText(pdf_path)
+        self.input_panel.max_queries_spin.setValue(saved_queries)
+        self.input_panel.max_results_spin.setValue(saved_results)
+        self.input_panel.fetch_detail_spin.setValue(saved_fetch)
         self.input_panel.set_running_state(True)
         self.session_label.setText("会话进行中...")
 
@@ -303,13 +317,17 @@ class MainWindow(QMainWindow):
     def _run_search(self, queries):
         max_results = self._user_params.get("max_results",
                         self.settings.patentscope_max_results)
+        fetch_detail = self._user_params.get("fetch_detail",
+                        self.settings.analysis_top_n)
         max_queries = len(queries)
         self.status_label.setText(
-            f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条)...")
+            f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条, "
+            f"抓取{fetch_detail}篇详情)...")
         self._current_worker = PatentscopeSearchAndFetchWorker(
             queries, self.settings,
             patent_doc=self._patent_doc,
-            max_fetch=max_results)
+            max_fetch=max_results,
+            top_n=fetch_detail)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
@@ -399,7 +417,7 @@ class MainWindow(QMainWindow):
                                or self._patent_doc.title or "unknown")
                 patent_name = re.sub(r'[\\/:*?"<>|]', '_', patent_name)[:80]
             run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._output_dir = (Path(__file__).parent.parent.parent
+            self._output_dir = (Path.cwd()
                                 / "data" / "output" / patent_name / run_dir)
             self._output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -441,6 +459,11 @@ class MainWindow(QMainWindow):
         """OA 通知书撰写完成"""
         self.log_panel.append_log("SUCCESS", "审查意见通知书撰写完成!")
 
+        # 清理格式：去掉开头多余的 --- 和空行
+        oa_markdown = oa_markdown.strip()
+        while oa_markdown.startswith("---"):
+            oa_markdown = oa_markdown[3:].strip()
+
         # 保存 OA 通知书
         oa_path = self._output_dir / "05_审查意见通知书.md"
         with open(oa_path, "w", encoding="utf-8") as f:
@@ -477,6 +500,34 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
         self.report_panel.browser.setHtml(oa_markdown)
         self.input_panel.set_running_state(False)
         self.status_label.setText("审查意见通知书撰写完成")
+
+    @Slot(dict)
+    def _on_patent_clicked(self, patent: dict):
+        """左侧点击某篇专利 → 右侧显示与本申请的对比分析"""
+        if not self._patent_doc:
+            self.log_panel.append_log("WARN", "无本申请信息，无法对比")
+            return
+        pub = patent.get("publication_number", "?")
+        # 显示加载状态
+        self.report_panel.show_loading(pub)
+        # 启动单篇对比 worker
+        ai_provider = self._user_params.get("ai_provider", "deepseek")
+        self._current_worker = SingleCompareWorker(
+            self._patent_doc, patent, self.settings,
+            ai_provider=ai_provider)
+        w = self._current_worker
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.analysis_done.connect(self._on_single_compare_done)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.start()
+
+    @Slot(object)
+    def _on_single_compare_done(self, result: dict):
+        """单篇对比完成，在报告面板显示"""
+        pub = result.get("publication_number", "?")
+        md = result.get("markdown", "")
+        self.report_panel.show_single_comparison(pub, md)
 
     @Slot(str)
     def _handle_error(self, error_msg: str):

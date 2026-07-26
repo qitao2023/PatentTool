@@ -36,50 +36,34 @@ class PatentscopeScraper:
         """
         执行检索，只解析结果页的摘要信息，不访问详情页。
 
+        流程: 搜索 → 结果页把每页条数调到最大 → 一次性解析全部结果
+
         Returns:
             list[dict]: 每项包含 publication_number, doc_id, title,
                         abstract_snippet, ipc, applicant, inventor,
                         publication_date, detail_url
         """
-        all_items = []
-
         # 导航 + 搜索 + 等待结果页
         await self._navigate_and_search(query, signals)
-        self._results_url = self.page.url
 
-        while len(all_items) < max_results:
-            if signals:
-                signals.progress.emit(
-                    int(10 + len(all_items) / max_results * 20) if max_results else 30,
-                    f"解析结果页 {len(all_items)}/{max_results}")
+        # 在结果页把每页条数调到最大（如200），一次性加载全部结果
+        await self._set_max_page_size(signals)
 
-            await self._wait_for_results()
-            page_items = await self._parse_results_table()
+        await self._wait_for_results()
+        page_items = await self._parse_results_table()
 
-            if not page_items:
-                break
+        if signals:
+            signals.log.emit("INFO",
+                f"  结果页解析: {len(page_items)} 条")
 
-            # 只取需要的数量（单页最多200）
-            remaining = max_results - len(all_items)
-            all_items.extend(page_items[:remaining])
-
-            if signals:
-                signals.log.emit("INFO",
-                    f"  已获取 {len(all_items)}/{max_results} 条摘要")
-
-            if len(all_items) >= max_results:
-                break
-
-            # 翻页
-            has_next = await self._go_to_next_page()
-            if not has_next:
-                break
+        # 截断到 max_results
+        result = page_items[:max_results]
 
         if signals:
             signals.log.emit("SUCCESS",
-                f"  摘要检索完成: {len(all_items)} 篇")
+                f"  摘要检索完成: {len(result)} 篇")
 
-        return all_items
+        return result
 
     # ================================================================
     # 阶段2: 按需抓取详情（只对筛选后的专利）
@@ -104,12 +88,14 @@ class PatentscopeScraper:
             return None
 
     async def fetch_details_batch(self, patents: list[dict],
-                                   signals=None) -> list[dict]:
+                                   signals=None,
+                                   stop_check=None) -> list[dict]:
         """
         批量获取多篇专利的全文详情。
 
         Args:
             patents: 阶段1 返回的摘要列表（需含 doc_id）
+            stop_check: 可选的 callable，返回 True 表示应停止
 
         Returns:
             list[dict]: 补充了 claims, description, full_text 的完整专利信息
@@ -118,6 +104,13 @@ class PatentscopeScraper:
         total = len(patents)
 
         for i, p in enumerate(patents):
+            # 检查停止信号
+            if stop_check and stop_check():
+                if signals:
+                    signals.log.emit("WARN",
+                        f"  用户停止，已获取 {len(enriched)}/{total} 篇详情")
+                break
+
             doc_id = p.get("doc_id", "")
             pub_num = p.get("publication_number", "?")
 
@@ -183,14 +176,30 @@ class PatentscopeScraper:
             signals.log.emit("INFO", "  搜索结果已返回")
 
     async def _fill_and_submit(self, query: str):
-        """填入检索式并点击搜索按钮"""
+        """填入检索式、设置每页显示200条、点击搜索按钮"""
         try:
             await self.page.evaluate(f'''(query) => {{
+                // 1. 设置每页显示 200 条（避免默认10条导致需要多次翻页）
+                var listLength = document.querySelector("select[id*='listLength']");
+                if (listLength) {{
+                    // 找最大的选项值
+                    var maxVal = 10;
+                    for (var i = 0; i < listLength.options.length; i++) {{
+                        var v = parseInt(listLength.options[i].value, 10);
+                        if (!isNaN(v) && v > maxVal) maxVal = v;
+                    }}
+                    listLength.value = String(maxVal);
+                    listLength.dispatchEvent(new Event("change", {{bubbles: true}}));
+                }}
+
+                // 2. 填入检索式
                 var input = document.getElementById("simpleSearchForm:fpSearch:input");
                 if (!input) return;
                 input.value = query;
                 input.dispatchEvent(new Event("input", {{bubbles: true}}));
                 input.dispatchEvent(new Event("change", {{bubbles: true}}));
+
+                // 3. 点击搜索按钮
                 var buttons = document.querySelectorAll("button");
                 for (var i = 0; i < buttons.length; i++) {{
                     if (buttons[i].id && buttons[i].id.indexOf("fpSearch") >= 0) {{
@@ -203,6 +212,83 @@ class PatentscopeScraper:
             }}''', query)
         except Exception as e:
             raise RuntimeError(f"搜索提交失败: {e}")
+
+    async def _set_max_page_size(self, signals=None):
+        """
+        在结果页把「每页显示条数」下拉框调到最大值（200）。
+        先用 Playwright 截图 + 原生 select_option API，比裸 JS 更可靠。
+        """
+        try:
+            # 用 Playwright 原生 select_option，正确处理 PrimeFaces 动态下拉框
+            changed = False
+            page_size_selectors = [
+                "select[id*='listLength']",
+                "select[id*='pageSize']",
+                "select[id*='resultList']",
+                "select[id*='maxResults']",
+                ".ui-paginator select",
+                "[class*='paginator'] select",
+                "select",
+            ]
+
+            for sel in page_size_selectors:
+                try:
+                    loc = self.page.locator(sel)
+                    count = await loc.count()
+                    for i in range(count):
+                        el = loc.nth(i)
+                        if not await el.is_visible():
+                            continue
+                        # 检查选项
+                        opts = await el.evaluate(
+                            "el => Array.from(el.options).map(o => ({v: o.value, t: o.textContent.trim()}))")
+                        max_v = 0
+                        max_val_text = ""
+                        for o in opts:
+                            try:
+                                n = int(o['v'])
+                                if n > max_v:
+                                    max_v = n
+                                    max_val_text = o['v']
+                            except ValueError:
+                                try:
+                                    n = int(o['t'])
+                                    if n > max_v:
+                                        max_v = n
+                                        max_val_text = o['v']
+                                except ValueError:
+                                    pass
+                        cur = await el.input_value()
+                        if max_v >= 200:
+                            # 这个 select 支持 200，用它
+                            if signals:
+                                signals.log.emit("INFO",
+                                    f"  切换每页条数: {cur} → {max_val_text}")
+                            await el.select_option(max_val_text)
+                            changed = True
+                            break
+                except Exception:
+                    continue
+                if changed:
+                    break
+
+            if changed:
+                await asyncio.sleep(4)
+                try:
+                    await self.page.wait_for_load_state(
+                        "networkidle", timeout=30000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+                self._results_url = self.page.url
+            else:
+                if signals:
+                    signals.log.emit("WARN",
+                        "  未找到含200选项的每页条数下拉框，使用默认分页（可尝试手动切换）")
+        except Exception as e:
+            if signals:
+                signals.log.emit("WARN",
+                    f"  设置每页条数失败: {e}，使用默认分页")
 
     # ================================================================
     # 结果页解析（仅摘要）
@@ -432,17 +518,55 @@ class PatentscopeScraper:
     async def _go_to_next_page(self) -> bool:
         """翻到下一页"""
         try:
-            next_btn = self.page.locator(
-                "a[id*='nextPage'], a[id*='navigationNext'], "
-                "a:has-text('Next'), "
-                ".ui-paginator-next:not(.ui-state-disabled)"
-            ).first
-            if await next_btn.count() > 0:
-                cls = await next_btn.get_attribute("class") or ""
-                if "disabled" in cls:
-                    return False
-                await next_btn.click()
-                await self.page.wait_for_load_state("networkidle", timeout=30000)
+            # PATENTSCOPE 使用 PrimeFaces paginator，尝试多种选择器
+            selectors = [
+                "a.ui-paginator-next:not(.ui-state-disabled)",
+                "a[id*='nextPage']:not([disabled])",
+                "a[id*='navigationNext']",
+                ".ui-paginator-next:not(.ui-state-disabled)",
+                "span.ui-paginator-next:not(.ui-state-disabled)",
+                "a:has-text('Next')",
+                "a[aria-label='Next Page']",
+            ]
+            for sel in selectors:
+                try:
+                    next_btn = self.page.locator(sel).first
+                    if await next_btn.count() > 0:
+                        cls = (await next_btn.get_attribute("class") or "")
+                        if "disabled" in cls or "ui-state-disabled" in cls:
+                            continue
+                        await next_btn.click()
+                        await self.page.wait_for_load_state(
+                            "networkidle", timeout=30000)
+                        await asyncio.sleep(2)
+                        self._results_url = self.page.url
+                        return True
+                except Exception:
+                    continue
+
+            # JS fallback: 查找并点击翻页元素
+            clicked = await self.page.evaluate("""() => {
+                var next = document.querySelector(
+                    '.ui-paginator-next:not(.ui-state-disabled), '
+                    + 'a[id*="nextPage"]:not([disabled])');
+                if (next) { next.click(); return true; }
+                // PrimeFaces 翻页
+                var links = document.querySelectorAll(
+                    '.ui-paginator-element');
+                for (var i = 0; i < links.length; i++) {
+                    if (links[i].textContent.trim() === '>'
+                        || links[i].classList.contains('ui-paginator-next')) {
+                        if (!links[i].classList.contains('ui-state-disabled')) {
+                            links[i].click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }""")
+            if clicked:
+                await self.page.wait_for_load_state(
+                    "networkidle", timeout=30000)
                 await asyncio.sleep(2)
                 self._results_url = self.page.url
                 return True
