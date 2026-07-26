@@ -111,7 +111,46 @@ class Settings:
     def web_timezone(self) -> str:
         return self._raw.get("web", {}).get("timezone", "Asia/Shanghai")
 
-    # --- HimmPat ---
+    @property
+    def web_proxy(self) -> str | None:
+        return self._raw.get("web", {}).get("proxy")
+
+    # --- PATENTSCOPE ---
+    @property
+    def patentscope_base_url(self) -> str:
+        return self._raw.get("patentscope", {}).get("base_url", "https://patentscope.wipo.int")
+
+    @property
+    def patentscope_search_url(self) -> str:
+        return self._raw.get("patentscope", {}).get("search_url",
+            "https://patentscope.wipo.int/search/en/search.jsf")
+
+    @property
+    def patentscope_advanced_search_url(self) -> str:
+        return self._raw.get("patentscope", {}).get("advanced_search_url",
+            "https://patentscope.wipo.int/search/en/advancedSearch.jsf")
+
+    @property
+    def patentscope_max_results(self) -> int:
+        return self._raw.get("patentscope", {}).get("max_results_per_query", 200)
+
+    @property
+    def patentscope_results_per_page(self) -> int:
+        return self._raw.get("patentscope", {}).get("results_per_page", 200)
+
+    @property
+    def patentscope_collections(self) -> list[str]:
+        return self._raw.get("patentscope", {}).get("collections", ["PCT"])
+
+    @property
+    def patentscope_selectors(self) -> dict:
+        return self._raw.get("patentscope", {}).get("selectors", {})
+
+    @property
+    def patentscope_rate_limit(self) -> int:
+        return self._raw.get("patentscope", {}).get("rate_limit_calls_per_hour", 1000)
+
+    # --- HimmPat（保留备用）---
     @property
     def himmpat_base_url(self) -> str:
         return self._raw.get("himmpat", {}).get("base_url", "https://www.himmpat.com")

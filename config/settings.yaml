@@ -17,18 +17,50 @@ ai:
 
 # 检索式生成
 query_generation:
-  max_queries: 1
+  max_queries: 3
   max_tokens: 4096
 
 # Web自动化
 web:
-  headless: false                 # 强制 false（反检测）
+  headless: true                  # 无头模式，后台静默运行
   viewport_width: 1920
   viewport_height: 1080
   locale: "zh-CN"
   timezone: "Asia/Shanghai"
+  proxy: "http://127.0.0.1:7892"    # 代理地址（国内访问WIPO需要）
 
-# HimmPat 配置
+# PATENTSCOPE 配置
+patentscope:
+  base_url: "https://patentscope2.wipo.int"
+  search_url: "https://patentscope2.wipo.int/search/zh/search.jsf"
+  advanced_search_url: "https://patentscope2.wipo.int/search/zh/advancedSearch.jsf"
+  detail_url_pattern: "https://patentscope2.wipo.int/search/zh/detail.jsf?docId={doc_id}"
+  max_results_per_query: 200
+  results_per_page: 200
+  collections:
+    - "PCT"
+  rate_limit_calls_per_hour: 1000
+
+  selectors:
+    # 搜索页
+    search_input: "#simpleSearchForm\\:fpSearch\\:input"
+    search_button: "button[id*='fpSearch']"
+    list_length_select: "select[id*='listLength']"
+
+    # 结果页
+    result_table: "table.patent-result-list"
+    result_row: "tr.trans-result-list-row"
+    patent_title: ".ps-patent-result--title--title"
+    patent_number: ".ps-patent-result--title--patent-number"
+    applicant: ".ps-patent-result--applicant"
+    inventor: ".ps-patent-result--inventor"
+    ipc: ".ps-patent-result--ipc"
+    abstract_snippet: ".ps-patent-result--abstract"
+    detail_link: "a[href*='detail']"
+    next_page_link: "a[id*='nextPage'], a:has-text('Next')"
+    results_count: ".results-count"
+
+# HimmPat 配置（保留备用）
 himmpat:
   base_url: "https://global.himmpat.com"
   search_url: "https://global.himmpat.com/intelligence?active=6"
@@ -84,7 +116,7 @@ analysis:
 # Session
 session:
   max_age_hours: 6
-  profile_dir: "profiles/himmpat_browser"
+  profile_dir: "profiles/patentscope_browser"
 
 # 输出
 output:

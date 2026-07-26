@@ -20,7 +20,8 @@ class InputPanel(QWidget):
     reset_clicked = Signal()
     file_selected = Signal(str)
     settings_clicked = Signal()
-    test_clicked = Signal(str)  # 测试HimmPat全流程，携带检索式
+    test_clicked = Signal(str, int)        # 测试1: 搜索+抓详情 (检索式, 数量)
+    test_abstract_clicked = Signal(str, int)  # 测试2: 仅搜索摘要 (检索式, 数量)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,8 +60,9 @@ class InputPanel(QWidget):
         # 最多检索式数
         param_row.addWidget(QLabel("最多检索式数:"))
         self.max_queries_spin = QSpinBox()
-        self.max_queries_spin.setRange(1, 20)
-        self.max_queries_spin.setValue(1)
+        self.max_queries_spin.setRange(1, 10)
+        self.max_queries_spin.setValue(3)
+        self.max_queries_spin.setSuffix(" 个")
         param_row.addWidget(self.max_queries_spin)
 
         param_row.addSpacing(20)
@@ -68,23 +70,22 @@ class InputPanel(QWidget):
         # 每式结果数
         param_row.addWidget(QLabel("每式结果数:"))
         self.max_results_spin = QSpinBox()
-        self.max_results_spin.setRange(10, 100)
-        self.max_results_spin.setValue(50)
-        self.max_results_spin.setSuffix(" 条")
+        self.max_results_spin.setRange(1, 200)
+        self.max_results_spin.setValue(200)
+        self.max_results_spin.setSuffix(" 条/检索式")
         param_row.addWidget(self.max_results_spin)
 
         param_row.addSpacing(20)
 
-        # 登录方式
-        param_row.addWidget(QLabel("登录方式:"))
+        # 登录方式 — PATENTSCOPE 无需登录，隐藏
         self.login_group = QButtonGroup(self)
         self.manual_radio = QRadioButton("手动登录(推荐)")
         self.manual_radio.setChecked(True)
         self.auto_radio = QRadioButton("自动登录")
         self.login_group.addButton(self.manual_radio)
         self.login_group.addButton(self.auto_radio)
-        param_row.addWidget(self.manual_radio)
-        param_row.addWidget(self.auto_radio)
+        self.manual_radio.setVisible(False)
+        self.auto_radio.setVisible(False)
 
         param_row.addStretch(1)
 
@@ -122,12 +123,27 @@ class InputPanel(QWidget):
         self.test_query_edit = QLineEdit()
         self.test_query_edit.setPlaceholderText("输入测试检索式...")
         self.test_query_edit.setText("掉电")
-        self.test_query_edit.setMaximumWidth(400)
-        self.test_query_edit.setToolTip("仅用于「测试HimmPat」，不影响正式分析流程")
+        self.test_query_edit.setMaximumWidth(300)
+        self.test_query_edit.setToolTip("PATENTSCOPE 测试检索式")
         btn_row.addWidget(self.test_query_edit)
 
-        self.test_btn = QPushButton("测试HimmPat")
-        self.test_btn.setToolTip("用上方检索式测试HimmPat连接及全流程（检索→分页→点击提取→返回）")
+        # 测试数量选择
+        self.test_count_spin = QSpinBox()
+        self.test_count_spin.setRange(1, 10)
+        self.test_count_spin.setValue(5)
+        self.test_count_spin.setSuffix(" 条")
+        self.test_count_spin.setMaximumWidth(80)
+        btn_row.addWidget(self.test_count_spin)
+
+        # 测试1: 仅摘要
+        self.test_abstract_btn = QPushButton("测试摘要")
+        self.test_abstract_btn.setToolTip("搜索摘要（快，验证检索式）")
+        self.test_abstract_btn.clicked.connect(self._on_test_abstract_clicked)
+        btn_row.addWidget(self.test_abstract_btn)
+
+        # 测试2: 抓详情
+        self.test_btn = QPushButton("测试详情")
+        self.test_btn.setToolTip("搜索摘要 + 抓全文")
         self.test_btn.clicked.connect(self._on_test_clicked)
         btn_row.addWidget(self.test_btn)
 
@@ -156,9 +172,17 @@ class InputPanel(QWidget):
             self.path_edit.setText(path)
             self.file_selected.emit(path)
 
+    def _on_test_abstract_clicked(self):
+        """点击测试摘要按钮"""
+        self.test_abstract_clicked.emit(
+            self.test_query_edit.text().strip(),
+            self.test_count_spin.value())
+
     def _on_test_clicked(self):
-        """点击测试HimmPat按钮，携带检索式"""
-        self.test_clicked.emit(self.test_query_edit.text().strip())
+        """点击测试详情按钮"""
+        self.test_clicked.emit(
+            self.test_query_edit.text().strip(),
+            self.test_count_spin.value())
 
     def get_test_query(self) -> str:
         return self.test_query_edit.text().strip()

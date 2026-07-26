@@ -1,5 +1,5 @@
 """
-AI检索式生成模块 - 调用AI API(DeepSeek/Kimi)生成HimmPat指令检索式
+AI检索式生成模块 - 调用AI API(DeepSeek/Kimi)生成PATENTSCOPE高级检索式
 """
 import json
 from typing import Optional
@@ -11,7 +11,7 @@ from src.ai_client import AIClient
 
 
 class QueryGenerator:
-    """使用DeepSeek/Kimi生成HimmPat检索式"""
+    """使用DeepSeek/Kimi生成PATENTSCOPE高级检索式"""
 
     def __init__(self, settings: Settings, provider: str | None = None):
         self.settings = settings

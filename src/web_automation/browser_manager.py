@@ -23,6 +23,7 @@ class BrowserManager:
         self.settings = settings
         self._context = None
         self._page = None
+        self._browser = None
         self._playwright = None
         self._profile_dir = None
         self._is_temp_profile = False
@@ -88,29 +89,48 @@ class BrowserManager:
         self._profile_dir = profile_dir
         self._is_temp_profile = False  # 标记为非临时目录，close 时不删除
 
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self._profile_dir),
+        headless = self.settings.web_headless
+        proxy = self.settings.web_proxy
+
+        # 启动浏览器
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+        if headless:
+            launch_args.append("--headless=new")
+
+        self._browser = await self._playwright.chromium.launch(
             channel="msedge",
-            headless=False,
-            locale=self.settings.web_locale,
-            timezone_id=self.settings.web_timezone,
-            no_viewport=True,
-            args=[
-                "--start-maximized",
-                "--disable-password-manager-reauthentication",
-            ],
+            headless=headless,
+            args=launch_args,
         )
 
-        # Stealth 脚本
+        # 创建 context（proxy 在 context 级别，避免 persistent_context bug）
+        ctx_opts = {
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": self.settings.web_locale,
+            "timezone_id": self.settings.web_timezone,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        }
+        if proxy:
+            ctx_opts["proxy"] = {"server": proxy}
+
+        self._context = await self._browser.new_context(**ctx_opts)
+
+        # Stealth 脚本（对抗无头模式检测）
         await self._context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get:()=>undefined});
             Object.defineProperty(navigator, 'plugins', {get:()=>{
                 const p=[{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}];
-                p.item=i=>p[i]; p.length=p.length; return p;
+                p.item=i=>p[i]; p.length=3; return p;
             }});
             Object.defineProperty(navigator, 'languages', {get:()=>['zh-CN','zh','en-US','en']});
             Object.defineProperty(navigator, 'platform', {get:()=>'Win32'});
             Object.defineProperty(navigator, 'hardwareConcurrency', {get:()=>8});
+            Object.defineProperty(navigator, 'deviceMemory', {get:()=>8});
+            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
         """)
 
         self._page = await self._context.new_page()
@@ -141,6 +161,8 @@ class BrowserManager:
                 await self._page.close()
             if self._context:
                 await self._context.close()
+            if self._browser:
+                await self._browser.close()
             if self._playwright:
                 await self._playwright.stop()
         except Exception:

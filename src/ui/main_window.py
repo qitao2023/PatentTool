@@ -15,7 +15,12 @@ from src.ui.log_panel import LogPanel
 from src.ui.result_panel import ResultPanel
 from src.ui.report_panel import ReportPanel
 from src.ui.dialogs import SettingsDialog
-from src.ui.workers import PDFParseWorker, QueryGenerateWorker, SearchAndFetchWorker, AnalysisWorker
+from src.ui.workers import (
+    PDFParseWorker, QueryGenerateWorker,
+    SearchAndFetchWorker, PatentscopeSearchAndFetchWorker,
+    AnalysisWorker, OAWriterWorker,
+    PatentscopeTestWorker, PatentscopeAbstractTestWorker
+)
 from src.utils.config import Settings
 from src.utils.signals import WorkerSignals
 
@@ -55,6 +60,7 @@ class MainWindow(QMainWindow):
         self.input_panel.stop_clicked.connect(self._on_stop)
         self.input_panel.reset_clicked.connect(self._on_reset)
         self.input_panel.test_clicked.connect(self._on_test)
+        self.input_panel.test_abstract_clicked.connect(self._on_test_abstract)
         self.input_panel.settings_clicked.connect(self._on_open_settings)
         main_layout.addWidget(self.input_panel)
 
@@ -116,19 +122,61 @@ class MainWindow(QMainWindow):
             "<p>技术栈: PySide6 + DeepSeek/Kimi + Playwright</p>"
         )
 
-    def _on_test(self, query: str):
-        """运行HimmPat全流程连接测试"""
+    def _on_test(self, query: str, count: int):
+        """测试详情：搜索 → 抓全文 → 显示结果"""
+        if not query.strip():
+            QMessageBox.warning(self, "提示", "请输入测试检索式")
+            return
         self.log_panel.append_log("INFO", "=" * 50)
-        self.log_panel.append_log("INFO",
-            f"启动HimmPat全流程测试: {query}")
-        self.log_panel.append_log("INFO",
-            "测试将在独立终端窗口中运行，请查看终端输出")
-        import subprocess, sys
-        subprocess.Popen(
-            [sys.executable, "-m", "src.test_himmpat_flow", query],
-            cwd=str(Path(__file__).parent.parent.parent),
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-        )
+        self.log_panel.append_log("INFO", f"PATENTSCOPE 测试详情: {query} ({count}条)")
+        self.input_panel.set_running_state(True)
+        self.status_label.setText(f"测试详情 ({count}条)...")
+        self._current_worker = PatentscopeTestWorker(
+            query, self.settings, max_results=count)
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.query_complete.connect(self.result_panel.add_query_results)
+        w.signals.all_searches_done.connect(self._on_test_done)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.start()
+
+    def _on_test_abstract(self, query: str, count: int):
+        """测试摘要：仅搜索摘要"""
+        if not query.strip():
+            QMessageBox.warning(self, "提示", "请输入测试检索式")
+            return
+        self.log_panel.append_log("INFO", "=" * 50)
+        self.log_panel.append_log("INFO", f"PATENTSCOPE 摘要测试: {query} ({count}条)")
+        self.input_panel.set_running_state(True)
+        self.status_label.setText(f"测试摘要 ({count}条)...")
+        self._current_worker = PatentscopeAbstractTestWorker(
+            query, self.settings, max_results=count)
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.query_complete.connect(self.result_panel.add_query_results)
+        w.signals.all_searches_done.connect(self._on_test_done)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.start()
+
+    def _on_test_done(self, results):
+        """测试完成"""
+        self.log_panel.append_log("SUCCESS",
+            f"测试完成: 获取 {sum(len(r) for r in results)} 篇专利")
+        self.input_panel.set_running_state(False)
+        self.status_label.setText("测试完成")
+        # 保存测试结果
+        from datetime import datetime
+        out = (Path(__file__).parent.parent.parent / "data" / "output"
+               / "test" / datetime.now().strftime("%Y%m%d_%H%M%S"))
+        out.mkdir(parents=True, exist_ok=True)
+        import json as json_module
+        with open(out / "test_results.json", "w", encoding="utf-8") as f:
+            json_module.dump(results, f, indent=2, ensure_ascii=False, default=str)
+        self.log_panel.append_log("INFO", f"结果已保存: {out / 'test_results.json'}")
 
     def _on_open_settings(self):
         """打开设置对话框"""
@@ -165,14 +213,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请选择 PDF 文件")
             return
 
-        # 保存界面参数
+        # 保存界面参数（max_queries, max_results, ai_provider 等）
         self._user_params = self.input_panel.get_params()
-        ai_provider = self._user_params.get("ai_provider", "deepseek")
-        self.log_panel.append_log("INFO", f"AI引擎: {ai_provider}")
+        self.log_panel.append_log("INFO",
+            f"检索设置: {self._user_params.get('max_queries', 3)}个检索式 "
+            f"× {self._user_params.get('max_results', 200)}条/检索式 "
+            f"| AI: {self._user_params.get('ai_provider', 'deepseek')}")
 
         # 重置界面
         self._on_reset()
-        self._user_params = {"ai_provider": ai_provider}
         self.input_panel.set_running_state(True)
         self.session_label.setText("会话进行中...")
 
@@ -232,9 +281,11 @@ class MainWindow(QMainWindow):
 
     def _run_query_generate(self, patent_doc):
         ai_provider = self._user_params.get("ai_provider", "deepseek")
-        self.status_label.setText("正在生成检索式...")
+        max_queries = self._user_params.get("max_queries", 3)
+        self.status_label.setText(f"正在生成 {max_queries} 个检索式...")
         self._current_worker = QueryGenerateWorker(
-            patent_doc, self.settings, ai_provider=ai_provider)
+            patent_doc, self.settings,
+            ai_provider=ai_provider, max_queries=max_queries)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
@@ -250,14 +301,19 @@ class MainWindow(QMainWindow):
         self._run_search(queries)
 
     def _run_search(self, queries):
-        self.status_label.setText("正在执行检索...")
-        top_n = self.settings.analysis_top_n
-        self._current_worker = SearchAndFetchWorker(queries, self.settings, max_fetch=top_n)
+        max_results = self._user_params.get("max_results",
+                        self.settings.patentscope_max_results)
+        max_queries = len(queries)
+        self.status_label.setText(
+            f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条)...")
+        self._current_worker = PatentscopeSearchAndFetchWorker(
+            queries, self.settings,
+            patent_doc=self._patent_doc,
+            max_fetch=max_results)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
         w.signals.query_complete.connect(self.result_panel.add_query_results)
-        w.signals.login_done.connect(self._on_login_done)
         w.signals.all_searches_done.connect(self._on_all_searches_done)
         w.signals.error.connect(self._handle_error)
         w.signals.finished.connect(self._on_worker_finished)
@@ -317,10 +373,110 @@ class MainWindow(QMainWindow):
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
-        w.signals.analysis_done.connect(self.report_panel.show_report)
+        w.signals.analysis_done.connect(self._on_analysis_report)
         w.signals.error.connect(self._handle_error)
         w.signals.finished.connect(self._on_worker_finished)
         w.start()
+
+    def _on_analysis_report(self, report):
+        """分析完成：显示报告 + 自动保存 + 启动 OA 撰写"""
+        self.report_panel.show_report(report)
+        self._analysis_report = report  # 保存引用
+
+        # 使用 Worker 创建的带时间戳的输出目录（避免覆盖之前的运行）
+        if (self._current_worker and
+                hasattr(self._current_worker, 'output_dir') and
+                self._current_worker.output_dir):
+            self._output_dir = self._current_worker.output_dir
+        else:
+            # 降级：自己创建目录
+            from pathlib import Path
+            import re
+            from datetime import datetime
+            patent_name = ""
+            if self._patent_doc:
+                patent_name = (self._patent_doc.publication_number
+                               or self._patent_doc.title or "unknown")
+                patent_name = re.sub(r'[\\/:*?"<>|]', '_', patent_name)[:80]
+            run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._output_dir = (Path(__file__).parent.parent.parent
+                                / "data" / "output" / patent_name / run_dir)
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 保存 Markdown
+        md_path = self._output_dir / "04_analysis_report.md"
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(report.markdown_content)
+        self.log_panel.append_log("INFO", f"  报告已保存: {md_path}")
+
+        # 保存 HTML
+        html_path = self._output_dir / "04_analysis_report.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(report.html_content)
+        self.log_panel.append_log("INFO", f"  报告已保存: {html_path}")
+
+        # 启动审查意见通知书撰写
+        self._run_oa_writing(
+            self._patent_doc, report.comparisons, self._dedup_results)
+
+    def _run_oa_writing(self, patent_doc, comparisons, dedup_results):
+        """启动审查意见通知书撰写"""
+        ai_provider = self._user_params.get("ai_provider", "deepseek")
+        self.status_label.setText("正在撰写审查意见通知书...")
+        self.log_panel.append_log("INFO", "=" * 40)
+        self.log_panel.append_log("INFO", "阶段5: AI 撰写审查意见通知书...")
+
+        self._current_worker = OAWriterWorker(
+            patent_doc, dedup_results, comparisons,
+            self.settings, ai_provider=ai_provider)
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.analysis_done.connect(self._on_oa_done)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.start()
+
+    def _on_oa_done(self, oa_markdown: str):
+        """OA 通知书撰写完成"""
+        self.log_panel.append_log("SUCCESS", "审查意见通知书撰写完成!")
+
+        # 保存 OA 通知书
+        oa_path = self._output_dir / "05_审查意见通知书.md"
+        with open(oa_path, "w", encoding="utf-8") as f:
+            f.write(oa_markdown)
+        self.log_panel.append_log("INFO", f"  通知书已保存: {oa_path}")
+
+        # 也保存一份完整的最终输出
+        final_path = self._output_dir / "05_审查意见通知书.html"
+        try:
+            import markdown as md_lib
+            oa_html = md_lib.markdown(oa_markdown, extensions=["tables", "fenced_code"])
+            styled_html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>审查意见通知书</title>
+<style>
+body {{ font-family: "Microsoft YaHei", sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; line-height: 1.8; }}
+h1 {{ border-bottom: 2px solid #333; padding-bottom: 10px; }}
+h2 {{ border-bottom: 1px solid #999; padding-bottom: 5px; margin-top: 30px; }}
+table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
+th {{ background: #f0f0f0; }}
+blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
+</style></head>
+<body>
+{oa_html}
+</body></html>"""
+            with open(final_path, "w", encoding="utf-8") as f:
+                f.write(styled_html)
+            self.log_panel.append_log("INFO", f"  通知书 HTML: {final_path}")
+        except Exception:
+            pass
+
+        # 在报告面板显示
+        self.report_panel.browser.setHtml(oa_markdown)
+        self.input_panel.set_running_state(False)
+        self.status_label.setText("审查意见通知书撰写完成")
 
     @Slot(str)
     def _handle_error(self, error_msg: str):
