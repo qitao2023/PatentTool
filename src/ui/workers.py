@@ -490,8 +490,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
         scraper2 = PatentscopeScraper(page2, self.settings, human2)
 
         enriched = await scraper2.fetch_details_batch(
-            screened, signals=self.signals,
-            stop_check=lambda: not self._is_running)
+            screened, signals=self.signals)
 
         await browser_mgr2.close()
 

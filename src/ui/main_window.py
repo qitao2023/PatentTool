@@ -51,8 +51,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(4)
 
         # ① 输入面板
         self.input_panel = InputPanel()
@@ -64,11 +64,12 @@ class MainWindow(QMainWindow):
         self.input_panel.settings_clicked.connect(self._on_open_settings)
         main_layout.addWidget(self.input_panel)
 
-        # ② 日志面板
+        # ② 日志面板（紧凑高度）
         self.log_panel = LogPanel()
+        self.log_panel.setMaximumHeight(110)
         main_layout.addWidget(self.log_panel)
 
-        # ③④ 结果列表 + 报告（水平分割）
+        # ③④ 结果列表 + 报告（垂直占满剩余空间）
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(3)
         self.result_panel = ResultPanel()
@@ -78,7 +79,6 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.report_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
-        splitter.setSizes([500, 700])
         main_layout.addWidget(splitter, 1)
 
     def _setup_menu(self):

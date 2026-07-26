@@ -30,9 +30,9 @@ class ResultPanel(QWidget):
         layout.addLayout(info_row)
 
         # 结果表格
-        self.summary_table = QTableWidget(0, 7)
+        self.summary_table = QTableWidget(0, 3)
         self.summary_table.setHorizontalHeaderLabels([
-            "公开号", "标题", "相关度", "申请人", "公开日", "IPC分类", "来源检索式"
+            "公开号", "标题", "申请人"
         ])
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.horizontalHeader().setSectionResizeMode(
@@ -46,41 +46,25 @@ class ResultPanel(QWidget):
 
     @Slot(int, int, list)
     def add_query_results(self, query_index: int, total: int, results: list):
-        """检索完成后更新结果表格"""
+        """检索阶段结果（测试按钮用）"""
         self._populate_table(self.summary_table, results)
 
     @Slot(list)
     def show_dedup_results(self, results: list):
-        """显示去重后的结果"""
+        """显示最终筛选结果（AI筛选后 + 全文）"""
         self._all_results = results
+        self.summary_table.setRowCount(0)  # 清空中间摘要
         self._populate_table(self.summary_table, results)
-        self.summary_label.setText(f"检索结果: 去重后共 {len(results)} 条 | 点击某篇查看对比分析")
+        self.summary_label.setText(f"筛选结果: {len(results)} 篇对比文件")
         self.summary_table.cellClicked.connect(self._on_cell_clicked)
 
     def _populate_table(self, table: QTableWidget, results: list):
-        """填充表格数据"""
+        """填充表格数据 — 只显示公开号、标题、申请人三列"""
         table.setRowCount(len(results))
         for row_idx, r in enumerate(results):
             table.setItem(row_idx, 0, QTableWidgetItem(r.get("publication_number", "")))
             table.setItem(row_idx, 1, QTableWidgetItem(r.get("title", "")))
-            # 相关度：优先用全文评分，否则用摘要阶段评分
-            score = r.get("fulltext_score") or r.get("relevance_score", "")
-            score_item = QTableWidgetItem(str(score) if score != "" else "-")
-            if isinstance(score, (int, float)) and score > 0:
-                if score >= 80:
-                    score_item.setForeground(Qt.GlobalColor.darkGreen)
-                elif score >= 60:
-                    score_item.setForeground(Qt.GlobalColor.darkYellow)
-                else:
-                    score_item.setForeground(Qt.GlobalColor.darkRed)
-            table.setItem(row_idx, 2, score_item)
-            table.setItem(row_idx, 3, QTableWidgetItem(r.get("applicant", "")))
-            table.setItem(row_idx, 4, QTableWidgetItem(
-                (r.get("publication_date") or "").replace("\n", " ").replace("\t", " ")))
-            table.setItem(row_idx, 5, QTableWidgetItem(r.get("ipc", "")))
-            if table.columnCount() > 6:
-                src = r.get("source_queries", "")
-                table.setItem(row_idx, 6, QTableWidgetItem(str(src)))
+            table.setItem(row_idx, 2, QTableWidgetItem(r.get("applicant", "")))
         table.resizeColumnsToContents()
 
     def _on_cell_clicked(self, row: int, col: int):

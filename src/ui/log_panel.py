@@ -26,17 +26,19 @@ class LogPanel(QWidget):
         "DEBUG": QColor("#718096"),
     }
 
-    # 匹配文件路径的模式
+    # 匹配文件路径：含盘符或目录分隔符，以已知扩展名结尾
+    _PATH_CHAR = r'[^\s,，。；;\n<>"|?*]'  # 路径中允许的字符（排除空白和标点）
     FILE_PATH_RE = re.compile(
-        r'(?:已保存[：:]?\s*|输出[：:]?\s*|文件[：:]?\s*|结果[：:]?\s*|'
-        r'保存到[：:]?\s*|路径[：:]?\s*)?'
         r'('
-        r'(?:[A-Za-z]:[/\\][^\s,，。；;]+\.\w{2,5})'  # 绝对路径
+        r'(?:[A-Za-z]:[/\\]' + _PATH_CHAR + r'*\.\w{2,5})'  # 绝对路径
         r'|'
-        r'(?:data[/\\]output[/\\][^\s,，。；;]+\.\w{2,5})'  # 相对路径 data/output/...
+        r'(?:' + _PATH_CHAR + r'*[/\\]' + _PATH_CHAR + r'*\.\w{2,5})'  # 相对路径
         r')',
         re.IGNORECASE
     )
+
+    # 常见的可打开文件扩展名
+    OPENABLE_EXTS = {'.json', '.html', '.htm', '.md', '.txt', '.csv', '.xml', '.log'}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,7 +46,8 @@ class LogPanel(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(10, 2, 10, 2)
+        layout.setSpacing(2)
 
         # 进度条
         progress_row = QHBoxLayout()
@@ -78,53 +81,48 @@ class LogPanel(QWidget):
 
     def _make_links(self, message: str) -> str:
         """将消息中的文件路径替换为可点击的 HTML 链接"""
+        import urllib.parse
+
         def replacer(m):
-            path = m.group(1)
-            abs_path = str(Path(path).resolve())
+            path = m.group(1).strip()
             ext = Path(path).suffix.lower()
+            if ext not in self.OPENABLE_EXTS:
+                return m.group(0)  # 不转换，保持原样
+            try:
+                abs_path = str(Path(path).resolve()).replace('\\', '/')
+            except Exception:
+                return m.group(0)
             icon = "🌐" if ext in (".html", ".htm") else "📄"
-            return f'<a href="file:///{abs_path}" style="color:#0550ae;text-decoration:underline;">{icon} {path}</a>'
+            encoded = urllib.parse.quote(abs_path, safe='/:')
+            return f'<a href="open://{encoded}" style="color:#0550ae;text-decoration:underline;">{icon} {m.group(1)}</a>'
 
-        # 只替换文件路径部分，保留其他文本
-        result = self.FILE_PATH_RE.sub(replacer, message)
+        return self.FILE_PATH_RE.sub(replacer, message)
 
-        # 如果消息中包含 已保存/保存到 但没有被正则匹配到，
-        # 再尝试匹配末尾的文件路径
-        if result == message:
-            for pattern in [r'已保存[：:]?\s*', r'保存到[：:]?\s*']:
-                m = re.search(pattern, message)
-                if m:
-                    rest = message[m.end():].strip()
-                    if rest and '.' in rest:
-                        possible_path = rest.split()[0] if ' ' in rest else rest
-                        ext = Path(possible_path).suffix.lower()
-                        if ext in ('.json', '.html', '.htm', '.md', '.txt', '.csv'):
-                            abs_path = str(Path(possible_path).resolve())
-                            icon = "🌐" if ext in (".html", ".htm") else "📄"
-                            linked = f'<a href="file:///{abs_path}" style="color:#0550ae;text-decoration:underline;">{icon} {possible_path}</a>'
-                            result = message[:m.end()] + linked + message[m.end()+len(possible_path):]
-                            break
-        return result
-
-    def _on_link_clicked(self, url):
+    def _on_link_clicked(self, url: QUrl):
         """点击文件链接 → 用系统默认程序打开"""
-        path = url.toLocalFile()
-        if path and Path(path).exists():
-            ext = Path(path).suffix.lower()
-            if ext in (".html", ".htm"):
+        import urllib.parse
+        scheme = url.scheme()
+        if scheme == "open":
+            # 自定义 open:// 协议，路径需要 URL 解码
+            path = urllib.parse.unquote(url.path())
+            if path and Path(path).exists():
+                ext = Path(path).suffix.lower()
+                if ext in (".html", ".htm"):
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                elif ext == ".json":
+                    import subprocess
+                    subprocess.Popen(["notepad", path])
+                else:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                self.file_clicked.emit(path)
+        elif scheme == "file":
+            path = url.toLocalFile()
+            if path and Path(path).exists():
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-            elif ext == ".json":
-                # JSON 用记事本打开
-                import subprocess
-                subprocess.Popen(["notepad", path])
-            elif ext == ".md":
-                # Markdown 用默认关联程序
-                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                self.file_clicked.emit(path)
             else:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-            self.file_clicked.emit(path)
+                QDesktopServices.openUrl(url)
         else:
-            # 文件不存在，尝试用浏览器打开
             QDesktopServices.openUrl(url)
 
     @Slot(str, str)

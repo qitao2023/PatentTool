@@ -39,7 +39,8 @@ class InputPanel(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setContentsMargins(10, 6, 10, 4)
+        layout.setSpacing(4)
 
         # --- 文件路径行 ---
         file_row = QHBoxLayout()

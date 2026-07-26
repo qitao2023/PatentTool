@@ -63,10 +63,12 @@ class ReportPanel(QWidget):
         """)
 
     def show_loading(self, patent_number: str):
+        import html as html_mod
+        safe = html_mod.escape(str(patent_number))
         self.browser.setHtml(f"""
         <div style="text-align: center; color: #8b949e; padding: 60px 20px;">
             <h2>⏳ AI 正在分析...</h2>
-            <p>正在对 <b>{patent_number}</b> 与本申请进行详细对比，请稍候...</p>
+            <p>正在对 <b>{safe}</b> 与本申请进行详细对比，请稍候...</p>
         </div>
         """)
 
