@@ -30,9 +30,9 @@ class ResultPanel(QWidget):
         layout.addLayout(info_row)
 
         # 结果表格
-        self.summary_table = QTableWidget(0, 3)
+        self.summary_table = QTableWidget(0, 4)
         self.summary_table.setHorizontalHeaderLabels([
-            "公开号", "标题", "申请人"
+            "相关度", "公开号", "标题", "申请人"
         ])
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.horizontalHeader().setSectionResizeMode(
@@ -51,25 +51,31 @@ class ResultPanel(QWidget):
 
     @Slot(list)
     def show_dedup_results(self, results: list):
-        """显示最终筛选结果（AI筛选后 + 全文）"""
-        self._all_results = results
-        self.summary_table.setRowCount(0)  # 清空中间摘要
-        self._populate_table(self.summary_table, results)
+        """显示最终筛选结果，按全文评分降序"""
+        self._all_results = sorted(
+            results,
+            key=lambda r: r.get("fulltext_score") or r.get("relevance_score") or 0,
+            reverse=True)
+        self.summary_table.setRowCount(0)
+        self._populate_table(self.summary_table, self._all_results)
         self.summary_label.setText(f"筛选结果: {len(results)} 篇对比文件")
         self.summary_table.cellClicked.connect(self._on_cell_clicked)
 
     def _populate_table(self, table: QTableWidget, results: list):
-        """填充表格数据 — 只显示公开号、标题、申请人三列"""
+        """填充表格数据 — 列: 相关度 | 公开号 | 标题 | 申请人"""
         table.setRowCount(len(results))
         for row_idx, r in enumerate(results):
-            table.setItem(row_idx, 0, QTableWidgetItem(r.get("publication_number", "")))
-            table.setItem(row_idx, 1, QTableWidgetItem(r.get("title", "")))
-            table.setItem(row_idx, 2, QTableWidgetItem(r.get("applicant", "")))
+            score = r.get("fulltext_score") or r.get("relevance_score") or ""
+            score_item = QTableWidgetItem(str(score) if score != "" else "-")
+            table.setItem(row_idx, 0, score_item)
+            table.setItem(row_idx, 1, QTableWidgetItem(r.get("publication_number", "")))
+            table.setItem(row_idx, 2, QTableWidgetItem(r.get("title", "")))
+            table.setItem(row_idx, 3, QTableWidgetItem(r.get("applicant", "")))
         table.resizeColumnsToContents()
 
     def _on_cell_clicked(self, row: int, col: int):
         """表格行点击 → 通过公开号匹配发射专利数据"""
-        item = self.summary_table.item(row, 0)
+        item = self.summary_table.item(row, 1)  # 公开号在第1列
         if item is None:
             return
         pub_num = item.text().strip()

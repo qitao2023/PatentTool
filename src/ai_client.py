@@ -105,8 +105,9 @@ class AIClient:
         )
 
     def chat(self, system_prompt: str, user_prompt: str,
-             max_tokens: int = 4096, temperature: float | None = None) -> str:
-        """统一的聊天接口"""
+             max_tokens: int = 4096, temperature: float | None = None,
+             json_mode: bool = False) -> str:
+        """统一的聊天接口。json_mode=True 时强制输出合法 JSON。"""
         self._ensure_client()
         if temperature is None:
             temperature = self.settings.ai_temperature
@@ -116,10 +117,14 @@ class AIClient:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
 
-        response = self._client.chat.completions.create(
+        kwargs = dict(
             model=self._get_model(),
             max_tokens=max_tokens,
             temperature=temperature,
             messages=messages,
         )
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = self._client.chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""

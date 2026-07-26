@@ -64,22 +64,30 @@ class MainWindow(QMainWindow):
         self.input_panel.settings_clicked.connect(self._on_open_settings)
         main_layout.addWidget(self.input_panel)
 
-        # ② 日志面板（紧凑高度）
+        # ② 日志面板（可拖拽高度）
         self.log_panel = LogPanel()
-        self.log_panel.setMaximumHeight(110)
-        main_layout.addWidget(self.log_panel)
+        self.log_panel.setMinimumHeight(120)
 
-        # ③④ 结果列表 + 报告（垂直占满剩余空间）
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(3)
+        # ③④ 结果列表 + 报告
+        bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+        bottom_splitter.setHandleWidth(3)
         self.result_panel = ResultPanel()
         self.result_panel.patent_selected.connect(self._on_patent_clicked)
         self.report_panel = ReportPanel()
-        splitter.addWidget(self.result_panel)
-        splitter.addWidget(self.report_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 4)
-        main_layout.addWidget(splitter, 1)
+        bottom_splitter.addWidget(self.result_panel)
+        bottom_splitter.addWidget(self.report_panel)
+        bottom_splitter.setStretchFactor(0, 3)
+        bottom_splitter.setStretchFactor(1, 4)
+
+        # 垂直分割：日志在上，结果+报告在下
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_splitter.setHandleWidth(4)
+        main_splitter.addWidget(self.log_panel)
+        main_splitter.addWidget(bottom_splitter)
+        main_splitter.setStretchFactor(0, 0)  # 日志默认紧凑
+        main_splitter.setStretchFactor(1, 1)  # 结果区占满剩余
+        main_splitter.setSizes([180, 600])
+        main_layout.addWidget(main_splitter, 1)
 
     def _setup_menu(self):
         menubar = self.menuBar()
@@ -331,7 +339,7 @@ class MainWindow(QMainWindow):
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
-        w.signals.query_complete.connect(self.result_panel.add_query_results)
+        # 主流程不显示中间摘要，只在 all_searches_done 后显示最终筛选结果
         w.signals.all_searches_done.connect(self._on_all_searches_done)
         w.signals.error.connect(self._handle_error)
         w.signals.finished.connect(self._on_worker_finished)
@@ -399,7 +407,31 @@ class MainWindow(QMainWindow):
     def _on_analysis_report(self, report):
         """分析完成：显示报告 + 自动保存 + 启动 OA 撰写"""
         self.report_panel.show_report(report)
-        self._analysis_report = report  # 保存引用
+        self._analysis_report = report
+
+        # 构建对比缓存：{公开号: markdown}，点击专利时秒开
+        self._comparison_cache = {}
+        for c in (report.comparisons or []):
+            pub = c.get("publication_number", "")
+            if not pub:
+                continue
+            # 把结构化对比结果转成简单 markdown
+            md = c.get("markdown") or c.get("comparison") or ""
+            if not md:
+                md = f"""# 对比分析: {pub}
+
+**标题**: {c.get('title', '')}
+**相关度**: {c.get('relevance_score', '')}
+
+**新颖性影响**: {c.get('novelty_impact', '')}
+**创造性影响**: {c.get('inventive_step_impact', '')}
+
+**相同特征**: {', '.join(c.get('key_features_same', []))}
+**不同特征**: {', '.join(c.get('key_features_different', []))}
+
+**结论**: {c.get('conclusion', '')}
+"""
+            self._comparison_cache[pub] = md
 
         # 使用 Worker 创建的带时间戳的输出目录（避免覆盖之前的运行）
         if (self._current_worker and
@@ -415,7 +447,8 @@ class MainWindow(QMainWindow):
             if self._patent_doc:
                 patent_name = (self._patent_doc.publication_number
                                or self._patent_doc.title or "unknown")
-                patent_name = re.sub(r'[\\/:*?"<>|]', '_', patent_name)[:80]
+                patent_name = re.sub(r'[^\w一-鿿\.\-\s]', '', patent_name)
+            patent_name = re.sub(r'\s+', '_', patent_name.strip())[:80]
             run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
             self._output_dir = (Path.cwd()
                                 / "data" / "output" / patent_name / run_dir)
@@ -503,14 +536,18 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
 
     @Slot(dict)
     def _on_patent_clicked(self, patent: dict):
-        """左侧点击某篇专利 → 右侧显示与本申请的对比分析"""
+        """点击专利 → 从预计算缓存取对比结果，秒开"""
+        pub = patent.get("publication_number", "?")
+        # 先查缓存
+        if self._comparison_cache and pub in self._comparison_cache:
+            self.report_panel.show_single_comparison(
+                pub, self._comparison_cache[pub])
+            return
+        # 缓存未命中（测试按钮场景），fallback 到 AI
         if not self._patent_doc:
             self.log_panel.append_log("WARN", "无本申请信息，无法对比")
             return
-        pub = patent.get("publication_number", "?")
-        # 显示加载状态
         self.report_panel.show_loading(pub)
-        # 启动单篇对比 worker
         ai_provider = self._user_params.get("ai_provider", "deepseek")
         self._current_worker = SingleCompareWorker(
             self._patent_doc, patent, self.settings,

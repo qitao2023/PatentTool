@@ -349,7 +349,8 @@ class PatentscopeSearchAndFetchWorker(QThread):
             patent_name = (self.patent_doc.publication_number
                            or self.patent_doc.title or "unknown")
             import re
-            patent_name = re.sub(r'[\\/:*?"<>|]', '_', patent_name)[:80]
+            patent_name = re.sub(r'[^\w一-鿿\.\-\s]', '', patent_name)
+            patent_name = re.sub(r'\s+', '_', patent_name.strip())[:80]
         run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_dir = (Path.cwd() / "data" / "output"
                            / patent_name / run_dir)
@@ -431,8 +432,63 @@ class PatentscopeSearchAndFetchWorker(QThread):
         # 关闭浏览器（阶段1完成）
         await browser_mgr.close()
 
+        # ============ 0结果重试：AI简化检索式，最多3次 ============
+        retry_count = 0
+        while total_abstracts == 0 and retry_count < 3:
+            retry_count += 1
+            self.signals.log.emit("WARN",
+                f"未找到结果，AI 简化检索式并重试 (第{retry_count}/3次)...")
+            self.signals.progress.emit(10, f"简化检索式重试 {retry_count}/3...")
+
+            # 用 AI 简化所有检索式
+            from src.ai_client import AIClient
+            client = AIClient(self.settings)
+            simplified = []
+            for q in self.queries:
+                q_str = q.get("query_string", "")
+                resp = client.chat(
+                    system_prompt="将以下 PATENTSCOPE 检索式简化为更短更宽泛的版本，只返回简化后的检索式，不要其他内容。",
+                    user_prompt=f"原检索式无结果，请简化：{q_str}",
+                    max_tokens=256, temperature=0.3)
+                simplified_q = resp.strip().strip('"').strip("'")
+                simplified.append({"query_string": simplified_q, "search_angle": q.get("search_angle","重试"), "priority": q.get("priority",1)})
+                self.signals.log.emit("INFO", f"  简化: {q_str[:60]}... → {simplified_q[:60]}...")
+
+            # 重试搜索
+            all_abstracts = []
+            browser_mgr = BrowserManager(self.settings)
+            context, page = await browser_mgr.launch_with_retry(max_retries=1)
+            human = HumanBehavior(self.settings)
+            scraper = PatentscopeScraper(page, self.settings, human)
+
+            for idx, q in enumerate(simplified):
+                if not self._is_running:
+                    break
+                q_str = q.get("query_string", "")
+                self.signals.log.emit("INFO", f"  重试检索 {idx+1}: {q_str}")
+                abstracts = await scraper.search_abstracts(q_str, max_results=self.max_fetch, signals=self.signals)
+                for a in abstracts:
+                    a["source_query"] = q_str
+                all_abstracts.append(abstracts)
+                if idx < len(simplified) - 1:
+                    await human.inter_search_delay(idx + 1)
+
+            await browser_mgr.close()
+
+            # 重新去重
+            seen = set()
+            unique_abstracts = []
+            for batch in all_abstracts:
+                for a in batch:
+                    key = a.get("doc_id") or a.get("publication_number", "")
+                    if key and key not in seen:
+                        seen.add(key)
+                        unique_abstracts.append(a)
+            total_abstracts = len(unique_abstracts)
+            self.signals.log.emit("INFO", f"  重试结果: {total_abstracts} 篇摘要")
+
         if total_abstracts == 0:
-            self.signals.log.emit("WARN", "未找到任何结果")
+            self.signals.log.emit("WARN", "3次重试仍未找到结果，停止检索")
             self.signals.finished.emit(True, "无结果")
             return
 

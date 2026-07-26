@@ -199,10 +199,20 @@ class PatentscopeScraper:
 
     async def _wait_for_results(self, timeout: int = 60) -> bool:
         try:
+            # 同时检测"有结果"和"无结果"两种情况
             await self.page.wait_for_selector(
-                ".ps-patent-result, .trans-result-list-row, table.patent-result-list",
+                ".ps-patent-result, .trans-result-list-row, "
+                "table.patent-result-list, "
+                ".no-results, .noResults, "
+                ":has-text('没有找到符合'), :has-text('No results'), "
+                ":has-text('no results found')",
                 timeout=timeout * 1000)
-            return True
+            # 确认是不是无结果页
+            no_results = await self.page.evaluate('''() => {
+                var body = document.body.innerText || "";
+                return body.includes("没有找到符合") || body.includes("No results") || body.includes("no results found");
+            }''')
+            return not no_results
         except Exception:
             return False
 

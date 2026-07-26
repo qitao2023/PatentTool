@@ -10,12 +10,20 @@ from src.ai_client import AIClient
 
 SCREENING_SYSTEM_PROMPT = """你是一名中国专利审查员。你需要从一批检索结果中，快速筛选出与本申请最相关、最可能用于评述新颖性或创造性的对比文件。
 
-## 筛选标准
+## 筛选标准（重要：宁可多留，不可漏掉）
 
 对每篇对比文件，综合考虑：
-1. **技术领域相关性**：是否与本申请属于同一或相近技术领域（IPC 分类）
+1. **技术领域相关性（权重最高）**：是否与本申请属于同一或相近技术领域
+   - 相同 IPC 大类 或 相同材料/器件体系（如IGZO、GaN、SiC等）的专利，即使摘要关键词不完全匹配，**至少给 60 分**
+   - 同领域专利可能是最接近的现有技术，不应因摘要措辞差异被筛掉
 2. **技术特征重叠度**：摘要中描述的技术方案与本申请的核心发明点有多少重合
 3. **预期可用性**：是否可能作为最接近的现有技术（用于三步法分析）
+
+## 评分指导
+- 相同 IPC 大类 + 相同器件类型（如都是IGZO TFT）：≥70分
+- 相同 IPC 大类 + 相关器件类型：≥60分
+- 不同 IPC 但技术方案相关：50-70分
+- 完全不相关：<40分
 
 ## 输出格式
 
@@ -51,51 +59,61 @@ class PatentScreener:
         return self._client
 
     def screen(self, patent_doc, abstracts: list[dict],
-               top_n: int = 15) -> list[dict]:
-        """
-        从检索结果中筛选最相关的对比文件。
-
-        Args:
-            patent_doc: 本申请的 PatentDocument
-            abstracts: 阶段1 检索到的摘要列表 (含 doc_id, title, abstract_snippet, ipc, applicant)
-            top_n: 最多保留多少篇
-
-        Returns:
-            list[dict]: 筛选后的结果，附 relevance_score 和 relevance_reason
-        """
+               top_n: int = 15, max_batch: int = 40) -> list[dict]:
+        """分层筛选：先粗筛（小token）再基于全文打分。批量超过max_batch时分批。"""
         if not abstracts:
             return []
 
         client = self._get_client()
-
-        # 构建本申请摘要
         patent_summary = self._build_patent_summary(patent_doc)
+        total = len(abstracts)
 
-        # 构建对比文件列表
-        candidates_text = self._build_candidates(abstracts)
+        # 分批处理（每批最多 max_batch 篇）
+        all_scored = []
+        batch_size = min(max_batch, total)
+        num_batches = (total + batch_size - 1) // batch_size
 
-        user_prompt = f"""## 本申请
+        for batch_idx in range(num_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, total)
+            batch = abstracts[start:end]
+
+            if num_batches > 1:
+                # 分批时，每批独立筛选 top_n 篇
+                batch_top_n = top_n
+            else:
+                batch_top_n = top_n
+
+            candidates_text = self._build_candidates(batch)
+
+            user_prompt = f"""## 本申请
 
 {patent_summary}
 
-## 检索结果（共 {len(abstracts)} 篇）
+## 检索结果 第{batch_idx+1}/{num_batches}批（共{batch_top_n}篇任务）
 
 {candidates_text}
 
 ---
 
-请筛选出与本申请最相关的对比文件，最多 {top_n} 篇。"""
+请筛选出与本申请最相关的对比文件。"""
 
-        system_prompt = SCREENING_SYSTEM_PROMPT.replace("{top_n}", str(top_n))
+            system_prompt = SCREENING_SYSTEM_PROMPT.replace("{top_n}", str(batch_top_n))
 
-        response = client.chat(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_tokens=4096,
-            temperature=0.3,
-        )
+            response = client.chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=4096,
+                temperature=0.3,
+                json_mode=True,
+            )
 
-        return self._parse_response(response, abstracts)
+            scored = self._parse_response(response, batch)
+            all_scored.extend(scored)
+
+        # 全部批次合并，按相关度降序取 top_n
+        all_scored.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+        return all_scored[:top_n]
 
     def _build_patent_summary(self, patent_doc) -> str:
         """构建本申请的技术方案摘要"""
@@ -143,15 +161,19 @@ class PatentScreener:
         try:
             selected = json.loads(json_str)
         except json.JSONDecodeError:
-            # 尝试宽松解析
             import re
-            match = re.search(r"\[.*\]", response, re.DOTALL)
+            match = re.search(r"\[[\s\S]*\]", response, re.DOTALL)
             if match:
                 try:
                     selected = json.loads(match.group(0))
                 except json.JSONDecodeError:
+                    # 打印 AI 原始返回以便排查
+                    import sys
+                    print(f"[Screener] JSON parse failed. Raw response (first 500): {response[:500]}", file=sys.stderr)
                     return []
             else:
+                import sys
+                print(f"[Screener] No JSON array found. Raw response (first 500): {response[:500]}", file=sys.stderr)
                 return []
 
         if not isinstance(selected, list):
@@ -192,21 +214,16 @@ class PatentScreener:
 
         return result[:self.settings.analysis_top_n]
 
-    FULLTEXT_SCORING_PROMPT = """你是一名中国专利审查员。请通读以下对比文件的全文，评估其与本申请的相关度。
+    FULLTEXT_SCORING_PROMPT = """你是一台评分机器。请通读对比文件全文，评估与本申请的相关度。
 
-## 评分标准
+评分标准 (0-100):
+- 技术领域 0-25
+- 技术问题 0-25
+- 技术方案重叠度 0-25
+- 证据强度 0-25
 
-1. **技术领域** (0-25分)：对比文件是否属于相同或相近技术领域
-2. **技术问题** (0-25分)：对比文件是否解决相同或类似的技术问题
-3. **技术方案** (0-25分)：对比文件的技术手段与本申请的重叠程度
-4. **证据强度** (0-25分)：对比文件的权利要求/说明书内容是否能清晰用于评述新颖性或创造性
-
-## 输出格式
-
-纯 JSON，不要其他文字：
-```json
-{"relevance_score": 85, "relevance_reason": "一句话说明相关原因"}
-```"""
+你必须只输出一行JSON，不要任何解释、不要markdown、不要换行：
+{"relevance_score": 85, "relevance_reason": "一句话原因"}"""
 
     def score_full_text(self, patent_doc, enriched_patents: list[dict],
                         signals=None) -> list[dict]:
@@ -223,6 +240,7 @@ class PatentScreener:
         if not enriched_patents:
             return []
 
+        import re as re_module
         client = self._get_client()
         patent_summary = self._build_patent_summary(patent_doc)
         total = len(enriched_patents)
@@ -230,9 +248,20 @@ class PatentScreener:
         for i, p in enumerate(enriched_patents):
             pub = p.get("publication_number", "?")
             title = p.get("title", "")
-            claims = p.get("claims", "")[:5000]
-            description = p.get("description", "")[:5000]
-            abstract = p.get("abstract", "")[:2000]
+            claims = (p.get("claims") or "")[:5000]
+            description = (p.get("description") or "")[:5000]
+            abstract = (p.get("abstract") or "")[:2000]
+            # 如果结构化字段为空，从 full_text 中提取
+            ft = p.get("full_text") or ""
+            if not claims.strip() and ft:
+                m = re_module.search(r'(Claims|权利要求书)[\s\S]*?(?=Description|说明书|$)', ft)
+                claims = (m.group(0) if m else ft)[:5000]
+            if not description.strip() and ft:
+                m = re_module.search(r'(Description|说明书)[\s\S]*?(?=Claims|权利要求|$)', ft)
+                description = (m.group(0) if m else ft)[:5000]
+            if not abstract.strip() and ft:
+                m = re_module.search(r'(Abstract|摘要)[\s\S]*?(?=Claims|权利要求|$)', ft)
+                abstract = (m.group(0) if m else ft)[:2000]
 
             full_text = f"""## 对比文件 [{i+1}/{total}]
 
@@ -253,25 +282,50 @@ class PatentScreener:
             try:
                 response = client.chat(
                     system_prompt=self.FULLTEXT_SCORING_PROMPT,
-                    user_prompt=f"## 本申请\n\n{patent_summary}\n\n{full_text}",
+                    user_prompt=f"## 本申请\n\n{patent_summary}\n\n{full_text}\n\n请输出JSON评分。",
                     max_tokens=512,
                     temperature=0.2,
+                    json_mode=False,  # flash 模型 json_mode 不稳定，用降级提取
                 )
-                # 解析 JSON
+                # 解析 JSON（处理 markdown 代码块、多行等变体）
                 import json as json_module
-                import re
+                import re as re_module
                 resp = response.strip()
-                match = re.search(r'\{[^}]+\}', resp)
+                # 先去掉 markdown 代码块
+                if resp.startswith("```"):
+                    resp = re_module.sub(r'^```\w*\n?', '', resp)
+                    resp = re_module.sub(r'\n?```$', '', resp)
+                # 匹配 JSON 对象（支持嵌套）
+                match = re_module.search(r'\{[\s\S]*?\}', resp)
                 if match:
-                    data = json_module.loads(match.group(0))
-                    p["fulltext_score"] = data.get("relevance_score", 0)
-                    p["fulltext_reason"] = data.get("relevance_reason", "")
+                    try:
+                        data = json_module.loads(match.group(0))
+                        p["fulltext_score"] = data.get("relevance_score", 0)
+                        p["fulltext_reason"] = data.get("relevance_reason", "")
+                        continue  # 成功，跳过降级
+                    except json_module.JSONDecodeError:
+                        pass  # JSON 坏了，继续尝试降级
+
+                # 降级1：从任意文本中提取数字分数
+                score_match = re_module.search(r'(?:relevance|score|相关度|评分)\D*(\d{1,3})', resp, re_module.IGNORECASE)
+                if not score_match:
+                    score_match = re_module.search(r'\b(\d{2,3})\b', resp)  # 2-3位数字
+                if score_match:
+                    p["fulltext_score"] = int(score_match.group(1))
+                    p["fulltext_reason"] = resp[:120].replace('\n', ' ')
+                    continue
+
+                # 降级2：不是JSON也不是数字，用摘要分数兜底
+                if len(resp) > 20:
+                    p["fulltext_score"] = max(30, int(p.get("relevance_score", 0) or 0))
+                    p["fulltext_reason"] = resp[:120].replace('\n', ' ')
                 else:
-                    p["fulltext_score"] = 0
-                    p["fulltext_reason"] = "解析失败"
+                    # AI返回空，保留摘要阶段分数
+                    p["fulltext_score"] = p.get("relevance_score", 30)
+                    p["fulltext_reason"] = f"AI未响应，保留摘要评分({p['fulltext_score']})"
             except Exception as e:
                 p["fulltext_score"] = 0
-                p["fulltext_reason"] = f"评分失败: {e}"
+                p["fulltext_reason"] = f"评分异常: {str(e)[:40]}"
                 if signals:
                     signals.log.emit("WARN",
                         f"  {pub} 全文评分失败: {e}")
