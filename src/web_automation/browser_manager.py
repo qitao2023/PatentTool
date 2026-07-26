@@ -25,6 +25,7 @@ class BrowserManager:
         self._page = None
         self._playwright = None
         self._profile_dir = None
+        self._is_temp_profile = False
         self._window_size = self._detect_window_size()
 
     @staticmethod
@@ -72,42 +73,33 @@ class BrowserManager:
         return p / STORAGE_FILE
 
     async def launch(self) -> Tuple:
-        """启动浏览器（Edge，每次用全新临时目录）"""
+        """启动浏览器（Edge，持久化 Profile，保留密码/Cookie）"""
         from playwright.async_api import async_playwright
 
         self._kill_chrome()
 
         self._playwright = await async_playwright().start()
 
-        self._profile_dir = Path(tempfile.mkdtemp(prefix="pp_"))
+        # 使用持久化 profile 目录（保留密码、Cookie、登录状态等）
+        profile_dir = Path(self.settings.session_profile_dir)
+        if not profile_dir.is_absolute():
+            profile_dir = Path.cwd() / profile_dir
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        self._profile_dir = profile_dir
+        self._is_temp_profile = False  # 标记为非临时目录，close 时不删除
 
-        # 使用 Edge (msedge channel) — 系统自带浏览器，指纹更真实
-        # 注意: launch_persistent_context 不支持 args 中传 URL，只能 new_page + goto
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self._profile_dir),
             channel="msedge",
             headless=False,
             locale=self.settings.web_locale,
             timezone_id=self.settings.web_timezone,
-            no_viewport=True,  # 最大化后自动适配实际窗口尺寸
+            no_viewport=True,
             args=[
                 "--start-maximized",
                 "--disable-password-manager-reauthentication",
-                "--disable-save-password-bubble",
             ],
         )
-
-        # 恢复已保存的 Cookie
-        storage_path = self._storage_path()
-        if storage_path.exists():
-            try:
-                with open(storage_path, "r") as f:
-                    import json
-                    data = json.load(f)
-                if "cookies" in data:
-                    await self._context.add_cookies(data["cookies"])
-            except Exception:
-                pass
 
         # Stealth 脚本
         await self._context.add_init_script("""
@@ -139,15 +131,8 @@ class BrowserManager:
         return self._context, self._page
 
     async def save_storage(self):
-        """保存 Cookie 到文件"""
-        try:
-            state = await self._context.storage_state()
-            storage_path = self._storage_path()
-            with open(storage_path, "w") as f:
-                import json
-                json.dump(state, f)
-        except Exception:
-            pass
+        """持久化 profile 已自动保存，此方法保留兼容性"""
+        pass
 
     async def close(self):
         """关闭浏览器"""
@@ -160,8 +145,8 @@ class BrowserManager:
                 await self._playwright.stop()
         except Exception:
             pass
-        # 清理临时目录
-        if self._profile_dir and self._profile_dir.exists():
+        # 只清理临时目录，保留持久化 profile
+        if self._is_temp_profile and self._profile_dir and self._profile_dir.exists():
             try:
                 shutil.rmtree(str(self._profile_dir), ignore_errors=True)
             except Exception:

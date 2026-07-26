@@ -2,7 +2,6 @@
 后台工作线程 - 所有耗时操作在 QThread 中执行
 """
 import asyncio
-import threading
 
 from PySide6.QtCore import QThread
 
@@ -170,8 +169,17 @@ class SearchWorker(QThread):
 
 class SearchAndFetchWorker(QThread):
     """
-    统一检索+抓取 Worker
-    ——— 同一个浏览器会话完成全部检索和专利详情抓取
+    统一检索+抓取 Worker — 使用 HimmPatScraper 一体化流程
+
+    流程（每条检索式独立完成）:
+      1. 输入检索式 → 点击检索
+      2. 对结果页每个专利: 点击链接 → 进入详情页 → 提取全文 → 返回结果列表
+      3. 翻页 → 重复步骤2
+      4. 满50条/全部结束 → 下一条检索式
+      5. 全部检索式完成后 → 合并去重 → 发出结果
+
+    每条检索式的结果会实时通过 query_complete 信号发出，
+    主线程在每条检索式完成后更新 UI。
     """
 
     def __init__(self, queries: list, settings: Settings,
@@ -182,17 +190,9 @@ class SearchAndFetchWorker(QThread):
         self.max_fetch = max_fetch
         self.signals = WorkerSignals()
         self._is_running = True
-        self._fetch_event = threading.Event()
-        self._dedup_results = None
 
     def stop(self):
         self._is_running = False
-        self._fetch_event.set()  # 唤醒等待循环，以便退出
-
-    def continue_fetch(self, dedup_results: list):
-        """主线程调用：告诉 worker 去重已完成，可以开始抓取详情了"""
-        self._dedup_results = dedup_results
-        self._fetch_event.set()
 
     def run(self):
         try:
@@ -208,11 +208,10 @@ class SearchAndFetchWorker(QThread):
     async def _run_async(self):
         from src.web_automation.browser_manager import BrowserManager
         from src.web_automation.authenticator import Authenticator
-        from src.web_automation.searcher import Searcher
-        from src.web_automation.patent_fetcher import PatentFetcher
         from src.web_automation.human_behavior import HumanBehavior
+        from src.web_automation.scraper import HimmPatScraper
 
-        # ============ Phase 1: 检索 ============
+        # ============ 启动浏览器 + 登录 ============
         self.signals.log.emit("INFO", "启动浏览器...")
         self.signals.progress.emit(45, "启动浏览器...")
 
@@ -232,13 +231,14 @@ class SearchAndFetchWorker(QThread):
                 await auth.manual_login(self.signals)
 
         self.signals.log.emit("SUCCESS", "HimmPat 登录成功")
-        self.signals.progress.emit(55, "开始执行检索...")
+        self.signals.progress.emit(55, "开始执行检索与抓取...")
         self.signals.login_done.emit(True, "")
 
-        # 逐条检索
-        all_results = []
+        # ============ 逐条检索 + 逐条抓取详情（一体化） ============
         human = HumanBehavior(self.settings)
-        searcher = Searcher(page, self.settings, human)
+        scraper = HimmPatScraper(page, self.settings, human)
+
+        all_enriched = []  # 每条检索式的 enriched results
 
         for idx, query in enumerate(self.queries):
             if not self._is_running:
@@ -246,66 +246,49 @@ class SearchAndFetchWorker(QThread):
                 break
 
             q_str = query.get("query_string", "")
+            angle = query.get("search_angle", "")
             self.signals.log.emit("INFO",
-                f"执行检索式 {idx+1}/{len(self.queries)}: {q_str}")
+                f"🔍 检索式 {idx+1}/{len(self.queries)} [{angle}]: {q_str}")
 
-            progress = 55 + int((idx + 1) / len(self.queries) * 25)
+            progress = 55 + int((idx + 1) / len(self.queries) * 20)
             self.signals.progress.emit(progress,
-                f"检索式 {idx+1}/{len(self.queries)}")
+                f"检索式 {idx+1}/{len(self.queries)}: 检索+抓取中...")
 
-            himmpat_count, results = await searcher.execute_search(q_str, idx + 1)
-            all_results.append(results)
+            # 一体化执行：检索 → 分页 → 逐条点击提取 → 返回 → 翻页
+            enriched = await scraper.execute_query(
+                q_str,
+                query_index=idx + 1,
+                max_results=self.settings.himmpat_max_results,
+                signals=self.signals,
+            )
 
-            count_info = f"{himmpat_count}条" if himmpat_count >= 0 else "未知"
+            all_enriched.append(enriched)
+
             self.signals.log.emit("SUCCESS",
-                f"检索式{idx+1}完成: HimmPat显示{count_info}, 提取{len(results)}条")
-            self.signals.query_complete.emit(idx + 1, len(self.queries), results)
+                f"检索式{idx+1}完成: 获取 {len(enriched)} 篇专利全文")
+
+            # 发出该检索式的结果（用于实时更新 UI）
+            self.signals.query_complete.emit(idx + 1, len(self.queries), enriched)
 
             if idx < len(self.queries) - 1 and self._is_running:
                 await human.inter_search_delay(idx + 1)
 
-        # 保存登录态（后面的抓取阶段可能用到）
+        # 保存登录态
         try:
             await browser_mgr.save_storage()
         except Exception:
             pass
 
-        # 通知主线程检索完成，等待去重
-        self.signals.progress.emit(80, "检索完成，等待去重...")
-        self.signals.all_searches_done.emit(all_results)
-
-        # ============ Phase 1.5: 暂停，等主线程去重 ============
-        while not self._fetch_event.is_set() and self._is_running:
-            await asyncio.sleep(0.1)
-
-        if not self._is_running or not self._dedup_results:
-            self.signals.log.emit("WARN", "未获取到对比文献，跳过详情抓取")
-            await browser_mgr.close()
-            self.signals.finished.emit(True, "完成（跳过详情抓取）")
-            return
-
-        # ============ Phase 2: 抓取专利详情 ============
-        top_n = min(len(self._dedup_results), self.max_fetch)
-        self.signals.log.emit("INFO",
-            f"开始抓取 Top {top_n} 篇专利详情（从当前搜索结果页点击进入）...")
-        self.signals.progress.emit(82, "抓取专利详情中...")
-
-        fetcher = PatentFetcher(page, self.settings, human)
-        enriched = await fetcher.fetch_batch(
-            self._dedup_results,
-            signals=self.signals,
-            max_count=self.max_fetch,
-        )
-
-        self.signals.log.emit("SUCCESS",
-            f"专利详情抓取完成: {sum(1 for r in enriched if r.get('full_text'))} 篇获取到全文")
-        self.signals.progress.emit(85, "详情抓取完成")
-
-        # 关浏览器
+        # 关闭浏览器
         await browser_mgr.close()
 
+        # ============ 发出全部结果（主线程会做去重 + 分析） ============
         if self._is_running:
-            self.signals.fetch_done.emit(enriched)
+            total = sum(len(r) for r in all_enriched)
+            self.signals.log.emit("SUCCESS",
+                f"全部检索+抓取完成: 共 {total} 篇专利（含重复）")
+            self.signals.progress.emit(82, "检索与抓取全部完成")
+            self.signals.all_searches_done.emit(all_enriched)
             self.signals.finished.emit(True, "")
         else:
             self.signals.finished.emit(True, "用户停止")

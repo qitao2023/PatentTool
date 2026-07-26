@@ -116,14 +116,16 @@ class MainWindow(QMainWindow):
             "<p>技术栈: PySide6 + DeepSeek/Kimi + Playwright</p>"
         )
 
-    def _on_test(self):
-        """运行HimmPat连接测试"""
+    def _on_test(self, query: str):
+        """运行HimmPat全流程连接测试"""
         self.log_panel.append_log("INFO", "=" * 50)
-        self.log_panel.append_log("INFO", "启动HimmPat连接测试...")
-        self.log_panel.append_log("INFO", "测试将在独立窗口中运行，请查看终端输出")
+        self.log_panel.append_log("INFO",
+            f"启动HimmPat全流程测试: {query}")
+        self.log_panel.append_log("INFO",
+            "测试将在独立终端窗口中运行，请查看终端输出")
         import subprocess, sys
         subprocess.Popen(
-            [sys.executable, "-m", "src.test_himm"],
+            [sys.executable, "-m", "src.test_himmpat_flow", query],
             cwd=str(Path(__file__).parent.parent.parent),
             creationflags=subprocess.CREATE_NEW_CONSOLE,
         )
@@ -257,7 +259,6 @@ class MainWindow(QMainWindow):
         w.signals.query_complete.connect(self.result_panel.add_query_results)
         w.signals.login_done.connect(self._on_login_done)
         w.signals.all_searches_done.connect(self._on_all_searches_done)
-        w.signals.fetch_done.connect(self._on_fetch_done)
         w.signals.error.connect(self._handle_error)
         w.signals.finished.connect(self._on_worker_finished)
         w.start()
@@ -268,44 +269,45 @@ class MainWindow(QMainWindow):
             self.log_panel.append_log("ERROR", f"登录失败: {msg}")
 
     @Slot(list)
-    def _on_all_searches_done(self, all_results):
-        self._all_raw_results = all_results
-        # 去重
-        self._run_dedup(all_results)
+    def _on_all_searches_done(self, all_enriched):
+        """
+        全部检索+抓取完成（结果已包含全文）。
 
-    def _run_dedup(self, all_results):
+        all_enriched: list[list[dict]]，每条检索式的 enriched results。
+        enriched result 包含: publication_number, title, full_text,
+                              claims, description, abstract 等。
+        """
+        self._all_raw_results = all_enriched
+        # 去重 + 进入分析
+        self._run_dedup_and_analyze(all_enriched)
+
+    def _run_dedup_and_analyze(self, all_enriched):
         self.status_label.setText("正在去重...")
         self.log_panel.append_log("INFO", "开始去重...")
 
         from src.result_collector.deduplicator import Deduplicator
         deduper = Deduplicator(self.settings)
-        deduped, removed = deduper.deduplicate(all_results)
+        deduped, removed = deduper.deduplicate(all_enriched)
 
         self._dedup_results = deduped
+
+        total_raw = sum(len(r) for r in all_enriched)
+        full_text_count = sum(1 for r in deduped if r.get("full_text"))
         self.log_panel.append_log("SUCCESS",
-            f"去重完成: 原始 {sum(len(r) for r in all_results)} 条 → 去重后 {len(deduped)} 条 (移除 {removed} 条)")
+            f"去重完成: 原始 {total_raw} 条 → 去重后 {len(deduped)} 条 "
+            f"(移除 {removed} 条)，其中 {full_text_count} 篇已获取全文")
         self.result_panel.show_dedup_results(deduped)
 
-        # 继续：用当前浏览器从搜索结果页点击进入专利详情
+        # 直接进入对比分析
         if self._patent_doc and deduped:
-            top_n = self.settings.analysis_top_n
             self.log_panel.append_log("INFO",
-                f"开始从搜索结果页抓取 Top {top_n} 篇专利详情...")
-            self.status_label.setText("抓取专利详情中...")
-            if hasattr(self._current_worker, 'continue_fetch'):
-                self._current_worker.continue_fetch(deduped)
+                f"开始对比分析: 本申请 vs {len(deduped)} 篇对比文献")
+            self._run_analysis(self._patent_doc, deduped)
         else:
             self.log_panel.append_log("WARN", "没有对比文献或专利文档，跳过分析")
             self.log_panel.update_progress(100, "完成（无分析）")
             self.input_panel.set_running_state(False)
             self.status_label.setText("完成")
-
-    def _on_fetch_done(self, enriched_results):
-        """详情抓取完成，进入分析"""
-        self.log_panel.append_log("SUCCESS",
-            f"已获取 {sum(1 for r in enriched_results if r.get("full_text"))} 篇专利全文")
-        if self._patent_doc:
-            self._run_analysis(self._patent_doc, enriched_results)
 
     def _run_analysis(self, patent_doc, dedup_results):
         ai_provider = self._user_params.get("ai_provider", "deepseek")

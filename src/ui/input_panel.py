@@ -20,7 +20,7 @@ class InputPanel(QWidget):
     reset_clicked = Signal()
     file_selected = Signal(str)
     settings_clicked = Signal()
-    test_clicked = Signal()  # 测试连接
+    test_clicked = Signal(str)  # 测试HimmPat全流程，携带检索式
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -118,9 +118,17 @@ class InputPanel(QWidget):
         self.stop_btn.clicked.connect(self.stop_clicked.emit)
         btn_row.addWidget(self.stop_btn)
 
-        self.test_btn = QPushButton("🔍 测试连接")
-        self.test_btn.setToolTip("测试HimmPat登录、页面跳转、元素定位")
-        self.test_btn.clicked.connect(self.test_clicked.emit)
+        # 测试检索式输入框
+        self.test_query_edit = QLineEdit()
+        self.test_query_edit.setPlaceholderText("输入测试检索式...")
+        self.test_query_edit.setText("掉电")
+        self.test_query_edit.setMaximumWidth(400)
+        self.test_query_edit.setToolTip("仅用于「测试HimmPat」，不影响正式分析流程")
+        btn_row.addWidget(self.test_query_edit)
+
+        self.test_btn = QPushButton("测试HimmPat")
+        self.test_btn.setToolTip("用上方检索式测试HimmPat连接及全流程（检索→分页→点击提取→返回）")
+        self.test_btn.clicked.connect(self._on_test_clicked)
         btn_row.addWidget(self.test_btn)
 
         self.reset_btn = QPushButton("↻ 重置")
@@ -147,6 +155,13 @@ class InputPanel(QWidget):
         if path:
             self.path_edit.setText(path)
             self.file_selected.emit(path)
+
+    def _on_test_clicked(self):
+        """点击测试HimmPat按钮，携带检索式"""
+        self.test_clicked.emit(self.test_query_edit.text().strip())
+
+    def get_test_query(self) -> str:
+        return self.test_query_edit.text().strip()
 
     def get_pdf_path(self) -> str:
         return self.path_edit.text().strip()
