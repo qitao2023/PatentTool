@@ -116,7 +116,8 @@ def build_user_prompt(patent: PatentDocument, max_queries: int = 10) -> str:
 ]
 ```
 
-- 数组长度不超过 {max_queries} 个
+- 必须恰好生成 {max_queries} 个检索式，一个都不能少
+- 如果本申请技术特征不够支持 {max_queries} 个角度，就从 IPC 分类、申请人、相近技术领域等角度扩展
 - priority: 1 = 最宽泛/最重要
 - 第1个检索式必须是最简单、最宽泛、保证有结果的
 """

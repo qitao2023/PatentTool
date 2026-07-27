@@ -32,7 +32,7 @@ class ResultPanel(QWidget):
         # 结果表格
         self.summary_table = QTableWidget(0, 4)
         self.summary_table.setHorizontalHeaderLabels([
-            "相关度", "公开号", "标题", "申请人"
+            "相关度", "公布号", "标题", "申请人"
         ])
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.horizontalHeader().setSectionResizeMode(
@@ -62,7 +62,7 @@ class ResultPanel(QWidget):
         self.summary_table.cellClicked.connect(self._on_cell_clicked)
 
     def _populate_table(self, table: QTableWidget, results: list):
-        """填充表格数据 — 列: 相关度 | 公开号 | 标题 | 申请人"""
+        """填充表格数据 — 列: 相关度 | 公布号 | 标题 | 申请人"""
         table.setRowCount(len(results))
         for row_idx, r in enumerate(results):
             score = r.get("fulltext_score") or r.get("relevance_score") or ""
@@ -74,8 +74,8 @@ class ResultPanel(QWidget):
         table.resizeColumnsToContents()
 
     def _on_cell_clicked(self, row: int, col: int):
-        """表格行点击 → 通过公开号匹配发射专利数据"""
-        item = self.summary_table.item(row, 1)  # 公开号在第1列
+        """表格行点击 → 通过公布号匹配发射专利数据"""
+        item = self.summary_table.item(row, 1)  # 公布号在第1列
         if item is None:
             return
         pub_num = item.text().strip()

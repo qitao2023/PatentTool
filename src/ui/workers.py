@@ -3,7 +3,7 @@
 """
 import asyncio
 
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, Signal
 
 from src.utils.signals import WorkerSignals
 from src.utils.config import Settings
@@ -309,13 +309,14 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
     def __init__(self, queries: list, settings: Settings,
                  patent_doc=None, max_fetch: int = 200,
-                 top_n: int = 10, parent=None):
+                 top_n: int = 10, output_dir=None, parent=None):
         super().__init__(parent)
         self.queries = queries
         self.settings = settings
         self.patent_doc = patent_doc
         self.max_fetch = max_fetch
         self.top_n = top_n
+        self._given_output_dir = output_dir  # 由外部指定（PDF旁边），None则为自动
         self.signals = WorkerSignals()
         self._is_running = True
         self.output_dir = None  # 供 main_window 读取
@@ -343,18 +344,21 @@ class PatentscopeSearchAndFetchWorker(QThread):
         from src.web_automation.patentscope_scraper import PatentscopeScraper
         from src.analysis.screener import PatentScreener
 
-        # 确定输出目录（专利名 + 时间戳，避免覆盖之前的运行）
-        patent_name = ""
-        if self.patent_doc:
-            patent_name = (self.patent_doc.publication_number
-                           or self.patent_doc.title or "unknown")
-            import re
-            patent_name = re.sub(r'[^\w一-鿿\.\-\s]', '', patent_name)
-            patent_name = re.sub(r'\s+', '_', patent_name.strip())[:80]
-        run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_dir = (Path.cwd() / "data" / "output"
-                           / patent_name / run_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # 输出目录：外部指定 > 降级到 data/output/
+        if self._given_output_dir:
+            self.output_dir = Path(self._given_output_dir)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            from src.utils.paths import normalize_patent_number
+            pname = "unknown"
+            if self.patent_doc:
+                pname = normalize_patent_number(
+                    self.patent_doc.publication_number
+                    or self.patent_doc.title or "unknown"
+                )
+            run_dir = f"{pname}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+            self.output_dir = Path.cwd() / "data" / "output" / run_dir
+            self.output_dir.mkdir(parents=True, exist_ok=True)
         output_dir = self.output_dir  # 局部引用
 
         # ============ 阶段0: 启动浏览器 ============
@@ -924,3 +928,97 @@ class SingleCompareWorker(QThread):
             self.signals.error.emit(f"对比失败: {e}")
             self.signals.log.emit("ERROR", f"对比失败: {e}")
             self.signals.finished.emit(False, str(e))
+
+
+class PatentLookupWorker(QThread):
+    """公开号直查 Worker：先搜索拿到 docId，再抓详情"""
+
+    lookup_done = Signal(dict)
+
+    def __init__(self, query: str, settings: Settings, parent=None):
+        super().__init__(parent)
+        self.query = query.strip()
+        self.settings = settings
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(self._run_async())
+            loop.close()
+            if result:
+                self.lookup_done.emit(result)
+                self.signals.finished.emit(True, "")
+            else:
+                self.signals.error.emit(f"未找到专利: {self.query}")
+                self.signals.finished.emit(False, "未找到")
+        except Exception as e:
+            self.signals.error.emit(f"查询失败: {e}")
+            self.signals.finished.emit(False, str(e))
+
+    async def _run_async(self) -> dict | None:
+        from src.web_automation.browser_manager import BrowserManager
+        from src.web_automation.patentscope_scraper import PatentscopeScraper
+        from src.web_automation.human_behavior import HumanBehavior
+
+        mgr = BrowserManager(self.settings)
+        context, page = await mgr.launch_with_retry(max_retries=1)
+
+        try:
+            human = HumanBehavior(page)
+            scraper = PatentscopeScraper(page, self.settings, human)
+
+            q = self.query.replace(" ", "")
+            self.signals.log.emit("INFO", f"查询: {q}")
+
+            # 访问搜索页，等表单渲染
+            await page.goto(
+                self.settings.patentscope_search_url,
+                timeout=30000, wait_until="domcontentloaded")
+            await asyncio.sleep(5)
+
+            # 填表提交
+            inp = page.locator("#simpleSearchForm\\:fpSearch\\:input")
+            if await inp.count() > 0:
+                await inp.fill(self.query)
+                btn = page.locator("button[id*='fpSearch']").first
+                if await btn.count() > 0:
+                    await btn.click()
+                    await asyncio.sleep(5)
+                    try:
+                        await page.wait_for_load_state("load", timeout=15000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+
+            # 检查是否跳转到详情页
+            cur = page.url
+            import re as _re
+            m = _re.search(r'docId=([^&]+)', cur)
+            if m and "detail.jsf" in cur:
+                doc_id = m.group(1)
+                self.signals.log.emit("INFO", "搜索命中，正在加载详情...")
+                result = await scraper._extract_detail_page(doc_id)
+            else:
+                # 先尝试直连
+                result = await scraper.fetch_detail(q)
+                if not result:
+                    # 最后尝试解析搜索结果
+                    try:
+                        abstracts = await scraper._parse_results_table()
+                        if abstracts:
+                            doc_id = abstracts[0].get("doc_id", "")
+                            result = await scraper.fetch_detail(doc_id)
+                    except Exception:
+                        pass
+
+            if not result:
+                self.signals.log.emit("WARN", f"未找到: {q}")
+                return None
+
+            self.signals.log.emit("SUCCESS",
+                f"查询完成: claims={len(result.get('claims',''))} desc={len(result.get('description',''))}")
+            return result
+        finally:
+            await context.close()

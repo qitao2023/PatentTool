@@ -81,7 +81,6 @@ class LogPanel(QWidget):
         timestamp = datetime.now().strftime("%H:%M:%S")
         icon = {"INFO": "i", "WARN": "!", "ERROR": "X", "SUCCESS": "V", "DEBUG": "."}.get(level, ".")
         self.log_text.appendPlainText(f"[{timestamp}] {icon} {message}")
-        self.log_text.ensureCursorVisible()
 
     @Slot(int, str)
     def update_progress(self, percent: int, status: str):

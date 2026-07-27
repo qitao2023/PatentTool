@@ -7,6 +7,7 @@ import random
 from typing import Optional
 
 from src.utils.config import Settings
+from src.utils.text_cleaner import clean_patent_html_text
 from src.web_automation.human_behavior import HumanBehavior
 
 
@@ -75,8 +76,7 @@ class PatentscopeScraper:
         detail_url = f"https://patentscope2.wipo.int/search/zh/detail.jsf?docId={doc_id}"
         try:
             await self.page.goto(detail_url, timeout=60000, wait_until="domcontentloaded")
-            await self.page.wait_for_load_state("networkidle", timeout=60000)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
             return await self._extract_detail_page(doc_id)
         except Exception:
             return None
@@ -92,7 +92,11 @@ class PatentscopeScraper:
                     f"  获取详情 [{i+1}/{total}]: {pub_num} (每条约10-15秒)...")
             detail = await self.fetch_detail(doc_id)
             if detail:
+                # 保留摘要中的公开号，不被详情页覆盖
+                pub_num = p.get("publication_number", "")
                 merged = {**p, **{k: v for k, v in detail.items() if v}}
+                if pub_num:
+                    merged["publication_number"] = pub_num
                 enriched.append(merged)
             else:
                 p["_no_detail"] = True
@@ -265,7 +269,7 @@ class PatentscopeScraper:
 
     async def _extract_detail_page(self, doc_id: str) -> dict:
         result = {
-            "publication_number": doc_id, "title": "", "abstract": "",
+            "publication_number": "", "title": "", "abstract": "",
             "claims": "", "description": "", "ipc": "",
             "applicant": "", "inventor": "", "publication_date": "",
             "application_number": "", "full_text": "",
@@ -274,7 +278,7 @@ class PatentscopeScraper:
         # 书目数据
         biblio = await self.page.evaluate('''() => {
             var data = {};
-            var body = document.body.innerText || "";
+            var body = (document.body && document.body.innerText) || "";
             data.full_text = body.substring(0, 80000);
             var h1 = document.querySelector("h1");
             if (h1) data.title = h1.textContent.trim();
@@ -296,6 +300,12 @@ class PatentscopeScraper:
         result["application_number"] = biblio.get("app_number", "")
         result["publication_date"] = biblio.get("pub_date", "")
         result["ipc"] = biblio.get("ipc", "")
+        # 公布号：页面提取，纯数字时补 CN 前缀
+        pub = (biblio.get("pub_number", "") or "").strip()
+        if pub and pub.isdigit():
+            pub = f"CN{pub}"
+        result["publication_number"] = pub or doc_id
+        result["patent_number"] = result["publication_number"]
 
         # 申请人/发明人
         people = await self.page.evaluate('''() => {
@@ -316,57 +326,56 @@ class PatentscopeScraper:
         result["applicant"] = people.get("applicant", "").strip().rstrip(";")
         result["inventor"] = people.get("inventor", "").strip().rstrip(";")
 
-        # 点击 Claims tab
-        try:
-            claims_tab = self.page.locator("a[href*='PCTCLAIMS']").first
-            if await claims_tab.count() > 0:
-                await claims_tab.click()
-                await asyncio.sleep(2)
-                claims_text = await self.page.evaluate('''() => {
-                    var panels = document.querySelectorAll(".ui-tabs-panel");
-                    for (var i = 0; i < panels.length; i++) {
-                        if (panels[i].style.display !== "none" && panels[i].offsetParent) {
-                            return panels[i].textContent.trim();
-                        }
-                    }
-                    return "";
-                }''')
-                if claims_text:
-                    claims_text = re.sub(r'Machine translation[\s\S]*?\[ZH \]\s*', '', claims_text)
-                    claims_text = re.sub(r'\n{3,}', '\n\n', claims_text)
-                result["claims"] = claims_text[:10000] if claims_text else ""
-        except Exception:
-            pass
+        # 点击 Claims / Description tab（CN 专利有效，WO 专利为空）
+        claims_text = await self._click_and_extract_tab("PCTCLAIMS")
+        desc_text = await self._click_and_extract_tab("PCTDESCRIPTION")
 
-        # 点击 Description tab
-        try:
-            desc_tab = self.page.locator("a[href*='PCTDESCRIPTION']").first
-            if await desc_tab.count() > 0:
-                await desc_tab.click()
-                await asyncio.sleep(2)
-                desc_text = await self.page.evaluate('''() => {
-                    var panels = document.querySelectorAll(".ui-tabs-panel");
-                    for (var i = 0; i < panels.length; i++) {
-                        if (panels[i].style.display !== "none" && panels[i].offsetParent) {
-                            return panels[i].textContent.trim();
-                        }
-                    }
-                    return "";
-                }''')
-                result["description"] = desc_text[:20000] if desc_text else ""
-        except Exception:
-            pass
+        if claims_text:
+            claims_text = clean_patent_html_text(claims_text)
+        if desc_text:
+            desc_text = clean_patent_html_text(desc_text)
 
-        # 纯摘要
+        # WO 等非 CN 专利没有独立 Claims/Description 标签，需从「全文」tab 提取
+        if not claims_text or not desc_text:
+            fulltext = await self._click_and_extract_tab("FULLTEXT")
+            if fulltext:
+                fulltext = clean_patent_html_text(fulltext)
+                if not claims_text:
+                    claims_text = _extract_wo_claims(fulltext)
+                if not desc_text:
+                    desc_text = _extract_wo_description(fulltext)
+
+        if claims_text:
+            result["claims"] = claims_text[:10000]
+        if desc_text:
+            result["description"] = desc_text[:20000]
+
+        # 纯摘要 — 摘要/Abstract 双模式，中文优先
         ft = result.get("full_text", "")
         if ft:
-            m = re.search(r'Abstract\n\(EN\)\s*(.*?)(?:\n\n\(ZH\)|\n\n#)', ft, re.DOTALL)
+            abstract = ""
+            # 尝试中文摘要：摘要 ... (ZH) ...
+            m = re.search(r'摘要[\s\S]*?\(ZH\)\s*(.*?)(?:\n\n#|\n相关专利|\n$)', ft, re.DOTALL)
             if m:
-                result["abstract"] = m.group(1).strip()[:5000]
-            else:
-                m = re.search(r'Abstract[\s\S]*?(?=Claims|Description|$)', ft)
+                abstract = m.group(1).strip()
+            if not abstract:
+                # 尝试英文摘要：Abstract\n(EN) ...
+                m = re.search(r'Abstract\n\(EN\)\s*(.*?)(?:\n\n\(ZH\)|\n\n#)', ft, re.DOTALL)
                 if m:
-                    result["abstract"] = m.group(0).replace("Abstract", "").strip()[:5000]
+                    abstract = m.group(1).strip()
+            if not abstract:
+                # 降级：摘要 ... (EN) ... (WO/CN 中文界面)
+                m = re.search(r'摘要[\s\S]*?\(EN\)\s*(.*?)(?:\n\n\(FR\)|\n\n\(ZH\)|\n\n#)', ft, re.DOTALL)
+                if m:
+                    abstract = m.group(1).strip()
+            if not abstract:
+                # 最后降级：任意 Abstract/摘要 开头内容
+                m = re.search(r'(?:摘要|Abstract)\s*[\s\S]*?(?=Claims|Description|$)', ft)
+                if m:
+                    abstract = m.group(0)
+                    abstract = re.sub(r'^(?:摘要|Abstract)\s*', '', abstract).strip()
+            if abstract:
+                result["abstract"] = abstract[:5000]
 
         return result
 
@@ -392,3 +401,62 @@ class PatentscopeScraper:
         except Exception:
             pass
         return False
+
+    # ── 辅助：点击标签页提取文本 ─────────────────────────────────────
+
+    async def _click_and_extract_tab(self, href_keyword: str) -> str:
+        """点击含有关键词的标签页并提取可见面板文本。"""
+        try:
+            tab = self.page.locator(f"a[href*='{href_keyword}']").first
+            if await tab.count() == 0:
+                return ""
+            await tab.click()
+            await asyncio.sleep(2)
+            text = await self.page.evaluate('''() => {
+                var panels = document.querySelectorAll(".ui-tabs-panel");
+                for (var i = 0; i < panels.length; i++) {
+                    if (panels[i].style.display !== "none" && panels[i].offsetParent) {
+                        return panels[i].textContent.trim();
+                    }
+                }
+                return "";
+            }''')
+            return text or ""
+        except Exception:
+            return ""
+
+
+# ── WO 全文切分工具 ──────────────────────────────────────────────────────
+
+def _extract_wo_claims(fulltext: str) -> str:
+    """从 WO 全文文本中提取权利要求书正文。
+
+    WO 全文有两次「权利要求书」：
+    1. 导航区 — 仅编号（1 2 3...20），无正文
+    2. 正文区 — [权利要求 1] ... 实际内容
+    """
+    idx = fulltext.rfind('权利要求书')
+    if idx < 0:
+        m = re.search(r'Claims?\s*\n\s*\[Claim\s*\d+\]', fulltext, re.IGNORECASE)
+        idx = m.start() if m else -1
+    if idx < 0:
+        return ""
+    tail = fulltext[idx:]
+    m = re.search(r'\[权利要求\s*\d+\][\s\S]*', tail)
+    if m:
+        return m.group(0).strip()
+    m = re.search(r'\[Claim\s*\d+\][\s\S]*', tail, re.IGNORECASE)
+    return m.group(0).strip() if m else ""
+
+
+def _extract_wo_description(fulltext: str) -> str:
+    """从 WO 全文文本中提取说明书正文。
+
+    「技术领域」只出现在正文区，用其定位最可靠。
+    """
+    m = re.search(r'(技术领域[\s\S]*?)(?:权利要求书\s*\[权利要求|$)', fulltext)
+    if not m:
+        m = re.search(r'(Technical\s*Field[\s\S]*)$', fulltext, re.IGNORECASE)
+    if not m:
+        m = re.search(r'(发明内容[\s\S]*)$', fulltext)
+    return m.group(1).strip() if m else ""

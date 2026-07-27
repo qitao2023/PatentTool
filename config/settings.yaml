@@ -17,7 +17,7 @@ ai:
 
 # 检索式生成
 query_generation:
-  max_queries: 3
+  max_queries: 10
   max_tokens: 4096
 
 # Web自动化
@@ -110,7 +110,7 @@ dedup:
 # 分析
 analysis:
   max_tokens: 8192
-  top_n_for_detailed: 15
+  top_n_for_detailed: 25
   batch_comparison: true
 
 # Session

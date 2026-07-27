@@ -20,6 +20,7 @@ from src.ui.workers import (
     SearchAndFetchWorker, PatentscopeSearchAndFetchWorker,
     AnalysisWorker, OAWriterWorker,
     PatentscopeTestWorker, PatentscopeAbstractTestWorker,
+    PatentLookupWorker,
     SingleCompareWorker,
 )
 from src.utils.config import Settings
@@ -38,6 +39,8 @@ class MainWindow(QMainWindow):
         self._dedup_results = None
         self._current_worker = None
         self._user_params = {"ai_provider": "deepseek"}
+        self._pdf_path = None       # 用户选择的 PDF 路径
+        self._output_dir = None     # 本次运行输出目录
 
         self._setup_ui()
         self._setup_menu()
@@ -62,6 +65,9 @@ class MainWindow(QMainWindow):
         self.input_panel.test_clicked.connect(self._on_test)
         self.input_panel.test_abstract_clicked.connect(self._on_test_abstract)
         self.input_panel.settings_clicked.connect(self._on_open_settings)
+        self.input_panel.file_selected.connect(self._on_file_selected)
+        self.input_panel.open_existing.connect(self._on_open_existing)
+        self.input_panel.lookup_patent.connect(self._on_lookup)
         main_layout.addWidget(self.input_panel)
 
         # ② 日志面板（可拖拽高度）
@@ -173,12 +179,45 @@ class MainWindow(QMainWindow):
         w.signals.finished.connect(self._on_worker_finished)
         w.start()
 
+    @Slot(str)
+    def _on_lookup(self, doc_id: str):
+        """公开号直查"""
+        if not doc_id.strip():
+            return
+        self.log_panel.append_log("INFO", f"公开号查询: {doc_id}")
+        self.input_panel.set_running_state(True)
+        self.status_label.setText(f"查询 {doc_id}...")
+        self._current_worker = PatentLookupWorker(doc_id, self.settings)
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.lookup_done.connect(self._on_lookup_done)
+        w.start()
+
+    @Slot(dict)
+    def _on_lookup_done(self, patent: dict):
+        """直查结果返回 → 显示在左侧表格 + 右侧详情"""
+        self.result_panel.show_dedup_results([patent])
+        self.report_panel.show_patent_detail(patent)
+        self.input_panel.set_running_state(False)
+        self.status_label.setText("查询完成")
+
     def _on_test_done(self, results):
         """测试完成"""
+        total = sum(len(r) for r in results)
         self.log_panel.append_log("SUCCESS",
-            f"测试完成: 获取 {sum(len(r) for r in results)} 篇专利")
+            f"测试完成: 获取 {total} 篇专利")
         self.input_panel.set_running_state(False)
         self.status_label.setText("测试完成")
+        # 填充表格 + 第一条显示详情
+        flat = []
+        for batch in results:
+            flat.extend(batch)
+        if flat:
+            self.result_panel.show_dedup_results(flat)
+            self.report_panel.show_patent_detail(flat[0])
         # 保存测试结果
         from datetime import datetime
         out = (Path.cwd() / "data" / "output"
@@ -224,6 +263,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请选择 PDF 文件")
             return
 
+        self._pdf_path = pdf_path  # 存储，后续建输出目录用
+
         # 保存界面参数（max_queries, max_results, ai_provider 等）
         self._user_params = self.input_panel.get_params()
         self.log_panel.append_log("INFO",
@@ -252,6 +293,74 @@ class MainWindow(QMainWindow):
         self.log_panel.append_log("INFO", "开始专利检索分析流程")
 
         self._run_pdf_parse(pdf_path)
+
+    @Slot(str)
+    def _on_file_selected(self, pdf_path: str):
+        """PDF 选择后扫描历史运行"""
+        from src.utils.paths import scan_runs
+        runs = scan_runs(pdf_path)
+        self.input_panel.show_runs(runs)
+        if runs:
+            self.log_panel.append_log("INFO",
+                f"发现 {len(runs)} 次历史运行")
+
+    @Slot(str)
+    def _on_open_existing(self, run_path: str):
+        """打开已有运行结果"""
+        import json
+        from pathlib import Path
+        rp = Path(run_path)
+        self.log_panel.append_log("INFO", f"打开已有结果: {rp.name}")
+
+        # 加载各阶段 JSON
+        loaded = {}
+        stage_files = [
+            ("01_search_abstracts.json", "abstracts"),
+            ("02_ai_screened.json", "screened"),
+            ("03_full_details.json", "details"),
+            ("03.5_fulltext_scored.json", "scored"),
+        ]
+        for filename, key in stage_files:
+            fpath = rp / filename
+            if fpath.exists():
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        loaded[key] = json.load(f)
+                except Exception:
+                    pass
+
+        # 显示结果
+        results = []
+        if "screened" in loaded and "results" in loaded["screened"]:
+            results = loaded["screened"]["results"]
+        elif "abstracts" in loaded and "results" in loaded["abstracts"]:
+            results = loaded["abstracts"]["results"]
+
+        if results:
+            self.result_panel.show_results(results)
+
+        # 显示分析报告
+        md_path = rp / "04_analysis_report.md"
+        if md_path.exists():
+            md_text = md_path.read_text(encoding="utf-8")
+            # 模拟一个 report 对象
+            class FakeReport:
+                pass
+            report = FakeReport()
+            report.markdown_content = md_text
+            report.html_content = (rp / "04_analysis_report.html").read_text(
+                encoding="utf-8") if (rp / "04_analysis_report.html").exists() else ""
+            self._analysis_report = report
+            self.report_panel.show_report(report)
+
+        # 读取 OA
+        oa_path = rp / "05_审查意见通知书.md"
+        if oa_path.exists():
+            self.log_panel.append_log("INFO",
+                f"审查意见通知书: {oa_path}")
+
+        self.log_panel.append_log("SUCCESS",
+            f"已加载 {len(results)} 篇专利结果")
 
     def _on_stop(self):
         """点击「停止」"""
@@ -298,6 +407,13 @@ class MainWindow(QMainWindow):
     def _on_pdf_done(self, patent_doc):
         self._patent_doc = patent_doc
         self.log_panel.append_log("SUCCESS", f"标题: {patent_doc.title}")
+
+        # 确定输出目录（PDF 旁边，不可写时降级到 data/output/）
+        from src.utils.paths import get_output_dir
+        self._output_dir = get_output_dir(self._pdf_path, patent_doc)
+        self.log_panel.append_log("INFO",
+            f"输出目录: {self._output_dir}")
+
         # 继续：生成检索式
         self._run_query_generate(patent_doc)
 
@@ -335,7 +451,8 @@ class MainWindow(QMainWindow):
             queries, self.settings,
             patent_doc=self._patent_doc,
             max_fetch=max_results,
-            top_n=fetch_detail)
+            top_n=fetch_detail,
+            output_dir=self._output_dir)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
@@ -433,25 +550,23 @@ class MainWindow(QMainWindow):
 """
             self._comparison_cache[pub] = md
 
-        # 使用 Worker 创建的带时间戳的输出目录（避免覆盖之前的运行）
-        if (self._current_worker and
-                hasattr(self._current_worker, 'output_dir') and
-                self._current_worker.output_dir):
-            self._output_dir = self._current_worker.output_dir
-        else:
-            # 降级：自己创建目录
-            from pathlib import Path
-            import re
-            from datetime import datetime
-            patent_name = ""
-            if self._patent_doc:
-                patent_name = (self._patent_doc.publication_number
-                               or self._patent_doc.title or "unknown")
-                patent_name = re.sub(r'[^\w一-鿿\.\-\s]', '', patent_name)
-            patent_name = re.sub(r'\s+', '_', patent_name.strip())[:80]
-            run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._output_dir = (Path.cwd()
-                                / "data" / "output" / patent_name / run_dir)
+        # 确保输出目录存在（正常流程 _on_pdf_done 已创建）
+        if not self._output_dir:
+            # 降级：从 worker 取或自建
+            if (self._current_worker and
+                    hasattr(self._current_worker, 'output_dir') and
+                    self._current_worker.output_dir):
+                self._output_dir = self._current_worker.output_dir
+            else:
+                from datetime import datetime
+                from src.utils.paths import normalize_patent_number
+                pname = normalize_patent_number(
+                    self._patent_doc.publication_number
+                    if self._patent_doc and self._patent_doc.publication_number
+                    else "unknown"
+                )
+                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                self._output_dir = Path.cwd() / "data" / "output" / f"{pname}_{ts}"
             self._output_dir.mkdir(parents=True, exist_ok=True)
 
         # 保存 Markdown
@@ -536,18 +651,20 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
 
     @Slot(dict)
     def _on_patent_clicked(self, patent: dict):
-        """点击专利 → 从预计算缓存取对比结果，秒开"""
+        """点击专利 → 先展示详情，再触发/获取 AI 对比"""
+        # 立即展示专利详情（无需等待 AI）
+        self.report_panel.show_patent_detail(patent)
+
         pub = patent.get("publication_number", "?")
-        # 先查缓存
+        # 检查预计算缓存
         if self._comparison_cache and pub in self._comparison_cache:
             self.report_panel.show_single_comparison(
                 pub, self._comparison_cache[pub])
             return
-        # 缓存未命中（测试按钮场景），fallback 到 AI
+        # 缓存未命中，触发 AI 对比（结果通过 show_single_comparison 异步更新）
         if not self._patent_doc:
-            self.log_panel.append_log("WARN", "无本申请信息，无法对比")
+            # 测试模式或无本申请，仅显示详情即可
             return
-        self.report_panel.show_loading(pub)
         ai_provider = self._user_params.get("ai_provider", "deepseek")
         self._current_worker = SingleCompareWorker(
             self._patent_doc, patent, self.settings,

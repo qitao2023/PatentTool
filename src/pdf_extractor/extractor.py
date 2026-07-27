@@ -8,6 +8,8 @@ from typing import Optional
 
 import fitz  # PyMuPDF
 
+from src.utils.paths import normalize_patent_number
+
 
 @dataclass
 class PatentDocument:
@@ -105,12 +107,12 @@ class PatentPDFExtractor:
             if "公开号" in line or "申请公布号" in line or "Publication Number" in line:
                 m = re.search(r"(\w{2}\s*\d+[A-Z]?\d*)", line)
                 if m:
-                    patent.publication_number = m.group(1).strip()
+                    patent.publication_number = normalize_patent_number(m.group(1))
                     break
         if not patent.publication_number:
             # 放宽匹配
             for m in self.SECTION_PATTERNS["publication_number"].finditer(text):
-                patent.publication_number = m.group(0).strip()
+                patent.publication_number = normalize_patent_number(m.group(0))
                 break
 
         # 申请号
