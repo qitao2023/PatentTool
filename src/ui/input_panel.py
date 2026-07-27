@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QSpinBox, QRadioButton, QGroupBox, QFileDialog,
     QButtonGroup, QListWidget, QListWidgetItem, QAbstractItemView,
-    QFrame, QComboBox,
+    QFrame, QComboBox, QCheckBox,
 )
 from PySide6.QtCore import Signal, Slot
 
@@ -20,6 +20,7 @@ class InputPanel(QWidget):
     stop_clicked = Signal()
     reset_clicked = Signal()
     file_selected = Signal(str)
+    search_abstract_clicked = Signal()  # 仅搜索摘要
     settings_clicked = Signal()
     test_clicked = Signal(str, int)             # 测试: 搜索+抓详情
     test_abstract_clicked = Signal(str, int)    # 测试: 仅搜索摘要
@@ -127,6 +128,13 @@ class InputPanel(QWidget):
         self.start_btn.clicked.connect(self.start_clicked.emit)
         btn_row.addWidget(self.start_btn)
 
+        self.search_abstract_btn = QPushButton("🔍 检索摘要")
+        self.search_abstract_btn.setToolTip(
+            "仅执行检索并生成摘要列表，不下载全文，用于快速验证对比文件")
+        self.search_abstract_btn.setMinimumHeight(40)
+        self.search_abstract_btn.clicked.connect(self.search_abstract_clicked.emit)
+        btn_row.addWidget(self.search_abstract_btn)
+
         self.stop_btn = QPushButton("■ 停止")
         self.stop_btn.setObjectName("stopBtn")
         self.stop_btn.setMinimumHeight(40)
@@ -207,6 +215,12 @@ class InputPanel(QWidget):
         self.lookup_btn.setToolTip("直接抓取专利详情并显示")
         self.lookup_btn.clicked.connect(self._on_lookup_clicked)
         test_row2.addWidget(self.lookup_btn)
+
+        test_row2.addSpacing(20)
+        self.debug_search_only_cb = QCheckBox("仅搜索（调试断点）")
+        self.debug_search_only_cb.setToolTip(
+            "勾选后全部检索式搜索完就停止，不下载全文、不AI评分")
+        test_row2.addWidget(self.debug_search_only_cb)
         test_outer.addLayout(test_row2)
 
         layout.addWidget(self.test_frame)
@@ -337,6 +351,7 @@ class InputPanel(QWidget):
             "max_results": self.max_results_spin.value(),
             "fetch_detail": self.fetch_detail_spin.value(),
             "ai_provider": self._ai_provider,
+            "debug_search_only": self.debug_search_only_cb.isChecked(),
         }
 
     def set_ai_provider(self, provider: str):
@@ -346,6 +361,7 @@ class InputPanel(QWidget):
 
     def set_running_state(self, running: bool):
         self.start_btn.setEnabled(not running)
+        self.search_abstract_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         self.browse_btn.setEnabled(not running)
         self.max_queries_spin.setEnabled(not running)

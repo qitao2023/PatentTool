@@ -310,13 +310,15 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
     def __init__(self, queries: list, settings: Settings,
                  patent_doc=None, max_fetch: int = 200,
-                 top_n: int = 25, output_dir=None, parent=None):
+                 top_n: int = 25, output_dir=None,
+                 debug_search_only: bool = False, parent=None):
         super().__init__(parent)
         self.queries = queries
         self.settings = settings
         self.patent_doc = patent_doc
         self.max_fetch = max_fetch          # 全文下载上限
         self._given_output_dir = output_dir
+        self.debug_search_only = debug_search_only
         self.signals = WorkerSignals()
         self._is_running = True
         self.output_dir = None
@@ -391,7 +393,8 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 f"阶段1: 搜索 {idx+1}/{len(self.queries)}")
 
             abstracts = await scraper.search_abstracts(
-                q_str, max_results=self.max_fetch, signals=self.signals)
+                q_str, max_results=self.settings.patentscope_max_results,
+                signals=self.signals)
             for a in abstracts:
                 a["source_query"] = q_str
             all_abstracts.append(abstracts)
@@ -414,6 +417,12 @@ class PatentscopeSearchAndFetchWorker(QThread):
                     if key and key not in seen:
                         seen.add(key)
                         unique_abstracts.append(a)
+
+        # 过滤掉目标专利自身
+        unique_abstracts, self_filtered = self._filter_self_patent(unique_abstracts)
+        if self_filtered > 0:
+            self.signals.log.emit("INFO",
+                f"  已排除本申请自身: {self_filtered} 篇")
 
         total_abstracts = len(unique_abstracts)
         self.signals.log.emit("SUCCESS",
@@ -462,7 +471,9 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 if not self._is_running:
                     break
                 q_str = q.get("query_string", "")
-                abstracts = await scraper.search_abstracts(q_str, max_results=self.max_fetch, signals=self.signals)
+                abstracts = await scraper.search_abstracts(
+                    q_str, max_results=self.settings.patentscope_max_results,
+                    signals=self.signals)
                 for a in abstracts:
                     a["source_query"] = q_str
                 all_abstracts.append(abstracts)
@@ -478,6 +489,8 @@ class PatentscopeSearchAndFetchWorker(QThread):
                     if key and key not in seen:
                         seen.add(key)
                         unique_abstracts.append(a)
+            # 过滤掉目标专利自身
+            unique_abstracts, _ = self._filter_self_patent(unique_abstracts)
             total_abstracts = len(unique_abstracts)
             self.signals.log.emit("INFO", f"  重试结果: {total_abstracts} 篇摘要")
 
@@ -487,6 +500,20 @@ class PatentscopeSearchAndFetchWorker(QThread):
             return
 
         self.signals.query_complete.emit(1, 1, unique_abstracts)
+
+        # ── 调试断点：仅搜索模式 ──────────────────────────────────────
+        if self.debug_search_only:
+            self.signals.log.emit("WARN",
+                "🔧 仅搜索模式：阶段1完成，停止（不下载全文）")
+            self.signals.log.emit("SUCCESS",
+                f"共 {total_abstracts} 篇摘要，已保存到 {stage1_path}")
+            # 生成可读摘要文件
+            self._write_summary_txt(unique_abstracts, output_dir)
+            self.signals.progress.emit(100, "检索摘要完成")
+            # 发射实际结果，让 UI 显示
+            self.signals.all_searches_done.emit([unique_abstracts])
+            self.signals.finished.emit(True, "检索摘要完成")
+            return
 
         # ================================================================
         # 阶段2: 超过上限时 AI 快速粗筛（一批搞定，只返回公布号列表）
@@ -620,6 +647,92 @@ class PatentscopeSearchAndFetchWorker(QThread):
         import json as json_module
         with open(path, "w", encoding="utf-8") as f:
             json_module.dump(data, f, indent=2, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _write_summary_txt(abstracts: list[dict], output_dir):
+        """生成可读检索摘要文本文件"""
+        import json as json_module
+        from pathlib import Path
+        out = Path(output_dir)
+
+        lines = []
+        lines.append("=" * 70)
+        lines.append("  专利检索摘要报告")
+        lines.append("=" * 70)
+        lines.append(f"  共 {len(abstracts)} 篇")
+        lines.append("")
+
+        for i, a in enumerate(abstracts, 1):
+            pub = a.get("publication_number", "?")
+            title = a.get("title", "")
+            ipc = a.get("ipc", "")
+            applicant = a.get("applicant", "")
+            snippet = (a.get("abstract_snippet") or "")[:120]
+            source = a.get("source_query", "")
+
+            lines.append(f"[{i:3d}] {pub}")
+            lines.append(f"       标题: {title[:80]}")
+            if ipc:
+                lines.append(f"       IPC : {ipc}")
+            if applicant:
+                lines.append(f"       申请人: {applicant[:60]}")
+            if snippet:
+                lines.append(f"       摘要: {snippet}...")
+            lines.append(f"       来源检索式: {source[:80]}")
+            lines.append("-" * 70)
+
+        summary_path = out / "00_检索摘要.txt"
+        summary_path.write_text("\n".join(lines), encoding="utf-8")
+        # 也保存一份 JSON 方便程序读取
+        summary_json = out / "00_检索摘要.json"
+        summary_json.write_text(
+            json_module.dumps(abstracts, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8")
+
+    def _filter_self_patent(self, abstracts: list[dict]) -> tuple[list[dict], int]:
+        """过滤掉目标专利自身（公布号匹配）。
+
+        返回: (过滤后列表, 过滤掉的篇数)
+        """
+        if not self.patent_doc:
+            return abstracts, 0
+
+        target_pn = _normalize_pn(
+            self.patent_doc.publication_number or ""
+        )
+        if not target_pn:
+            return abstracts, 0
+
+        # 去掉国家前缀的纯数字版本（如 CN116110953 → 116110953）
+        target_digits = _strip_country_prefix(target_pn)
+
+        filtered = []
+        removed = 0
+        for a in abstracts:
+            pn = _normalize_pn(a.get("publication_number", ""))
+            doc_id = _normalize_pn(a.get("doc_id", ""))
+            pn_digits = _strip_country_prefix(pn)
+            doc_digits = _strip_country_prefix(doc_id)
+            # 公布号或 doc_id 任一匹配即视为自身（匹配含/不含CN前缀）
+            if (pn == target_pn or doc_id == target_pn
+                    or pn_digits == target_digits or doc_digits == target_digits
+                    or pn in target_pn or target_pn in pn
+                    or pn_digits in target_pn or target_pn in pn_digits):
+                removed += 1
+            else:
+                filtered.append(a)
+        return filtered, removed
+
+
+def _normalize_pn(pn: str) -> str:
+    """标准化公布号: 去空格去横杠去斜杠大写"""
+    return pn.replace(" ", "").replace("-", "").replace("/", "").upper()
+
+
+def _strip_country_prefix(pn: str) -> str:
+    """去掉国家前缀: CN116110953 → 116110953"""
+    import re as _re
+    return _re.sub(r'^[A-Z]{2}', '', pn)
 
 
 class PatentFetchWorker(QThread):

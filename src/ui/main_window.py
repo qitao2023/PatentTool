@@ -41,6 +41,7 @@ class MainWindow(QMainWindow):
         self._user_params = {"ai_provider": "deepseek"}
         self._pdf_path = None       # 用户选择的 PDF 路径
         self._output_dir = None     # 本次运行输出目录
+        self._force_debug_search = False  # 「检索摘要」按钮强制仅搜索
 
         self._setup_ui()
         self._setup_menu()
@@ -65,6 +66,7 @@ class MainWindow(QMainWindow):
         self.input_panel.test_clicked.connect(self._on_test)
         self.input_panel.test_abstract_clicked.connect(self._on_test_abstract)
         self.input_panel.settings_clicked.connect(self._on_open_settings)
+        self.input_panel.search_abstract_clicked.connect(self._on_search_abstract)
         self.input_panel.file_selected.connect(self._on_file_selected)
         self.input_panel.open_existing.connect(self._on_open_existing)
         self.input_panel.lookup_patent.connect(self._on_lookup)
@@ -195,6 +197,18 @@ class MainWindow(QMainWindow):
         w.signals.finished.connect(self._on_worker_finished)
         w.lookup_done.connect(self._on_lookup_done)
         w.start()
+
+    def _on_search_abstract(self):
+        """「检索摘要」按钮 — 仅搜索+生成摘要，不下载全文"""
+        pdf_path = self.input_panel.get_pdf_path()
+        if not pdf_path:
+            QMessageBox.warning(self, "提示", "请先选择专利PDF文件")
+            return
+        if not Path(pdf_path).exists():
+            QMessageBox.warning(self, "提示", f"文件不存在:\n{pdf_path}")
+            return
+        self._force_debug_search = True
+        self._on_start()
 
     @Slot(dict)
     def _on_lookup_done(self, patent: dict):
@@ -383,6 +397,7 @@ class MainWindow(QMainWindow):
         self._all_raw_results = None
         self._dedup_results = None
         self._current_worker = None
+        self._force_debug_search = False
 
         self.input_panel.reset()
         self.log_panel.reset()
@@ -443,6 +458,10 @@ class MainWindow(QMainWindow):
                         self.settings.patentscope_max_results)
         fetch_detail = self._user_params.get("fetch_detail",
                         self.settings.analysis_top_n)
+        debug_search_only = (
+            self._user_params.get("debug_search_only", False)
+            or self._force_debug_search
+        )
         max_queries = len(queries)
         self.status_label.setText(
             f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条, "
@@ -451,7 +470,8 @@ class MainWindow(QMainWindow):
             queries, self.settings,
             patent_doc=self._patent_doc,
             max_fetch=fetch_detail,           # 全文下载上限（UI控制）
-            output_dir=self._output_dir)
+            output_dir=self._output_dir,
+            debug_search_only=debug_search_only)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
@@ -476,6 +496,26 @@ class MainWindow(QMainWindow):
                               claims, description, abstract 等。
         """
         self._all_raw_results = all_enriched
+
+        # 仅搜索模式：显示摘要列表，不进入分析
+        if self._force_debug_search:
+            self._force_debug_search = False
+            from src.result_collector.deduplicator import Deduplicator
+            flat = []
+            for batch in all_enriched:
+                flat.extend(batch)
+            deduper = Deduplicator(self.settings)
+            deduped, removed = deduper.deduplicate(all_enriched)
+            self._dedup_results = deduped
+            total_raw = sum(len(r) for r in all_enriched)
+            self.log_panel.append_log("SUCCESS",
+                f"检索摘要: 原始 {total_raw} 条 → 去重后 {len(deduped)} 条")
+            self.result_panel.show_dedup_results(deduped)
+            self.status_label.setText(
+                f"检索摘要完成 — {len(deduped)} 篇，结果已保存")
+            self.input_panel.set_running_state(False)
+            return
+
         # 去重 + 进入分析
         self._run_dedup_and_analyze(all_enriched)
 

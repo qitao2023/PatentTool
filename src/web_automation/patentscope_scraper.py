@@ -250,8 +250,8 @@ class PatentscopeScraper:
         if signals:
             signals.log.emit("INFO", "  正在访问 PATENTSCOPE...")
         search_url = self.settings.patentscope_search_url
-        await self.page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
-        await asyncio.sleep(2)  # 等 JSF 表单渲染
+        # networkidle 确保 JSF 页面完全加载，不会中途跳转
+        await self.page.goto(search_url, timeout=30000, wait_until="networkidle")
 
         if signals:
             signals.log.emit("INFO", "  正在提交检索式...")
@@ -275,41 +275,55 @@ class PatentscopeScraper:
             signals.log.emit("INFO", "  搜索结果已返回")
 
     async def _set_max_page_size(self, signals=None):
-        """用 JS 触发下拉框切换每页条数，并等待页面 AJAX 重新加载完成。
+        """用 Playwright locator 找分页下拉框，切到最大值。
 
-        PATENTSCOPE 改变每页条数后会触发 AJAX 重新加载结果列表，
-        必须等待 networkidle 后才能安全解析，否则只会拿到旧 DOM 中的少量结果。
+        PATENTSCOPE 改变每页条数后会触发 AJAX 重新加载结果列表。
         """
-        try:
-            result = await self.page.evaluate('''() => {
-                var ids = [
-                    "resultListCommandsForm:perPage:input",
-                    "settingsForm:lengthOption:input",
-                ];
-                for (var i = 0; i < ids.length; i++) {
-                    var el = document.getElementById(ids[i]);
-                    if (!el || !el.options) continue;
-                    var maxOpt = null, maxVal = null;
-                    for (var j = 0; j < el.options.length; j++) {
-                        var v = parseInt(el.options[j].value, 10);
-                        if (!isNaN(v) && (!maxOpt || v > maxOpt)) {
-                            maxOpt = v;
-                            maxVal = el.options[j].value;
-                        }
-                    }
-                    if (maxVal && maxOpt > parseInt(el.value, 10)) {
-                        el.value = maxVal;
-                        el.dispatchEvent(new Event("change", {bubbles: true}));
-                        return "ok: " + el.value;
-                    }
-                }
-                return "not found";
-            }''')
-            if signals:
-                if result and result.startswith("ok"):
-                    signals.log.emit("INFO", f"  切换每页条数: {result}")
-            if result and result.startswith("ok"):
-                # 等待页面条数切换后的 AJAX 重新加载完成
+        # 候选选择器：JSF 风格 ID + 通用 select
+        candidate_selectors = [
+            "select[id*='perPage']",
+            "select[id*='lengthOption']",
+            "select[id*='pageSize']",
+            "select[id*='listLength']",
+            "select[id*='resultPerPage']",
+            "select.pagination-dropdown",
+            ".ps-paginator select",
+            ".paginator select",
+            ".pagination select",
+        ]
+        found = False
+        for sel in candidate_selectors:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() == 0:
+                    continue
+                # 检查是否有大于当前值的选项
+                options = await loc.locator("option").all()
+                vals = []
+                for opt in options:
+                    try:
+                        v_text = (await opt.text_content()).strip()
+                        v_val = await opt.get_attribute("value")
+                        v_num = int(v_text) if v_text.isdigit() else (int(v_val) if v_val and v_val.isdigit() else 0)
+                        if v_num > 0:
+                            vals.append((v_num, v_val or v_text))
+                    except Exception:
+                        continue
+                if not vals:
+                    continue
+                max_num, max_val = max(vals, key=lambda x: x[0])
+                current_val = await loc.input_value()
+                current_num = int(current_val) if current_val.isdigit() else 0
+                if max_num <= current_num:
+                    if signals:
+                        signals.log.emit("INFO", f"  每页已是最多: {current_num} 条")
+                    found = True
+                    break
+                await loc.select_option(value=max_val)
+                if signals:
+                    signals.log.emit("INFO", f"  切换每页条数: {max_num} 条 ({sel})")
+                found = True
+                # 等待 AJAX 重新加载
                 await asyncio.sleep(3)
                 try:
                     await self.page.wait_for_selector(
@@ -317,27 +331,27 @@ class PatentscopeScraper:
                         timeout=10000)
                 except Exception:
                     pass
-        except Exception:
-            pass
+                break
+            except Exception:
+                continue
+
+        if not found and signals:
+            signals.log.emit("WARN", "  未找到分页下拉框，将逐页翻取")
 
     async def _fill_and_submit(self, query: str):
+        # 步骤1: 使用 Playwright locator 填入检索式（自动等待元素、防导航中断）
         try:
-            await self.page.evaluate(f'''(query) => {{
-                var input = document.getElementById("simpleSearchForm:fpSearch:input");
-                if (!input) return;
-                input.value = query;
-                input.dispatchEvent(new Event("input", {{bubbles: true}}));
-                input.dispatchEvent(new Event("change", {{bubbles: true}}));
-                var buttons = document.querySelectorAll("button");
-                for (var i = 0; i < buttons.length; i++) {{
-                    if (buttons[i].id && buttons[i].id.indexOf("fpSearch") >= 0) {{
-                        buttons[i].click();
-                        return;
-                    }}
-                }}
-                var form = document.getElementById("simpleSearchForm");
-                if (form) form.submit();
-            }}''', query)
+            input_locator = self.page.locator("#simpleSearchForm\\:fpSearch\\:input").first
+            await input_locator.wait_for(state="visible", timeout=10000)
+            await input_locator.fill(query)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            raise RuntimeError(f"搜索框填入失败: {e}")
+
+        # 步骤2: 点击搜索按钮（Playwright 自动等待并处理导航）
+        try:
+            btn_locator = self.page.locator("button[id*='fpSearch']").first
+            await btn_locator.click()
         except Exception as e:
             raise RuntimeError(f"搜索提交失败: {e}")
 
