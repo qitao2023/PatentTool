@@ -484,13 +484,13 @@ class HimmPatScraper:
             const cnRegex = /CN\\s*(\\d{4,}[A-Z]?)/g;
             let cnMatch;
 
-            // 找到所有 CN 公开号的位置（排除申请号）
-            // 公开号特征: CN + 数字 + 字母后缀 (A/B/U/Y等)
+            // 找到所有 CN 公布号的位置（排除申请号）
+            // 公布号特征: CN + 数字 + 字母后缀 (A/B/U/Y等)
             // 申请号特征: CN + 纯数字(可能带.数字)
             const positions = [];
             while ((cnMatch = cnRegex.exec(bodyText)) !== null) {
                 const fullPN = cnMatch[0].replace(/\\s/g, '');
-                // 跳过纯数字的申请号（如 CN202610044689），只保留带字母后缀的公开号
+                // 跳过纯数字的申请号（如 CN202610044689），只保留带字母后缀的公布号
                 if (!/[A-Z]$/i.test(fullPN)) continue;
                 if (!seen.has(fullPN)) {
                     seen.add(fullPN);
@@ -524,7 +524,7 @@ class HimmPatScraper:
                         if (t.length >= 10 && t.length < 300
                             && /[\\u4e00-\\u9fff]/.test(t)
                             && !/^CN\\d/.test(t)
-                            && !/^(申请|IPC|摘要|专利|发明|实用|外观|授权|审中|战略|高价值|申请人|专利权人|发明人|代理|地址|公开号|公开日|主分类)/.test(t)
+                            && !/^(申请|IPC|摘要|专利|发明|实用|外观|授权|审中|战略|高价值|申请人|专利权人|发明人|代理|地址|公布号|公开日|主分类)/.test(t)
                             && !/^[A-H]\\d{2}[A-Z]/.test(t)
                             && !/^\\d{4}[-.]\\d/.test(t)) {
                             title = t;

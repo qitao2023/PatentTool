@@ -304,7 +304,7 @@ async def test_scraper(query: str | None = None):
         )
         if result:
             print(f"  [OK] 提取成功!")
-            print(f"  公开号: {result.get('publication_number', '?')}")
+            print(f"  公布号: {result.get('publication_number', '?')}")
             print(f"  标题: {(result.get('title') or '')[:80]}")
             print(f"  全文长度: {len(result.get('full_text', ''))} 字符")
             print(f"  权利要求长度: {len(result.get('claims', ''))} 字符")

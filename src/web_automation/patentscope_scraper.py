@@ -75,8 +75,12 @@ class PatentscopeScraper:
     async def fetch_detail(self, doc_id: str) -> Optional[dict]:
         detail_url = f"https://patentscope2.wipo.int/search/zh/detail.jsf?docId={doc_id}"
         try:
-            await self.page.goto(detail_url, timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
+            await self.page.goto(detail_url, timeout=30000, wait_until="domcontentloaded")
+            try:
+                await self.page.wait_for_selector("h1", timeout=10000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
             return await self._extract_detail_page(doc_id)
         except Exception:
             return None
@@ -92,7 +96,7 @@ class PatentscopeScraper:
                     f"  获取详情 [{i+1}/{total}]: {pub_num} (每条约10-15秒)...")
             detail = await self.fetch_detail(doc_id)
             if detail:
-                # 保留摘要中的公开号，不被详情页覆盖
+                # 保留摘要中的公布号，不被详情页覆盖
                 pub_num = p.get("publication_number", "")
                 merged = {**p, **{k: v for k, v in detail.items() if v}}
                 if pub_num:
@@ -108,6 +112,136 @@ class PatentscopeScraper:
             signals.log.emit("SUCCESS", f"  详情获取完成: {full_count}/{total} 篇获取到全文")
         return enriched
 
+    async def fetch_details_parallel(self, patents: list[dict], output_dir,
+                                      concurrency: int = 5, signals=None) -> int:
+        """并行抓取完整详情，每篇写入独立 JSON 到 output_dir。
+
+        Args:
+            patents: 搜索阶段的结果列表，每项含 doc_id, publication_number 等
+            output_dir: 输出目录
+            concurrency: 并发数
+
+        已存在的文件自动跳过（断点续传）。返回成功抓取的数量。
+        """
+        import json as json_module
+        from pathlib import Path
+
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        # 构建 doc_id → 原始元数据的映射，用于保留正确的公布号
+        meta_map = {}
+        for p in patents:
+            did = p.get("doc_id") or p.get("publication_number", "")
+            if did:
+                meta_map[did] = p
+
+        doc_ids = list(meta_map.keys())
+
+        # 断点续传：跳过已存在的文件
+        remaining = []
+        skipped = 0
+        for did in doc_ids:
+            safe = _safe_filename(did)
+            fpath = out / f"{safe}.json"
+            if fpath.exists():
+                try:
+                    existing = json_module.loads(fpath.read_text(encoding="utf-8"))
+                    if existing.get("fetch_status") == "ok":
+                        skipped += 1
+                        continue
+                except Exception:
+                    pass
+            remaining.append(did)
+
+        if signals:
+            signals.log.emit("INFO",
+                f"  并行抓取: 共 {len(doc_ids)} 篇, "
+                f"已缓存 {skipped} 篇, 待抓取 {len(remaining)} 篇 "
+                f"(并发 {concurrency})")
+
+        if not remaining:
+            if signals:
+                signals.log.emit("SUCCESS", "  全部已缓存，无需抓取")
+            return len(doc_ids)
+
+        sem = asyncio.Semaphore(concurrency)
+        success_count = 0
+        fail_count = 0
+
+        async def _fetch_one(doc_id: str):
+            nonlocal success_count, fail_count
+            async with sem:
+                # 随机延迟 1-3 秒，避免同时涌入触发限流
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+                pg = await self.page.context.new_page()
+                try:
+                    detail_url = (
+                        f"https://patentscope2.wipo.int/search/zh/detail.jsf"
+                        f"?docId={doc_id}"
+                    )
+                    await pg.goto(detail_url, timeout=30000,
+                                  wait_until="domcontentloaded")
+                    try:
+                        await pg.wait_for_selector("h1", timeout=10000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+                    detail = await self._extract_detail_page(doc_id, page=pg)
+                    detail["fetch_status"] = "ok"
+
+                    # 用搜索阶段的正确公布号覆盖，并用公布号命名文件
+                    meta = meta_map.get(doc_id, {})
+                    pub_from_search = meta.get("publication_number", "")
+                    if pub_from_search:
+                        detail["publication_number"] = pub_from_search
+                        detail["patent_number"] = pub_from_search
+                        file_key = pub_from_search
+                    else:
+                        file_key = doc_id
+
+                    safe = _safe_filename(file_key)
+                    fpath = out / f"{safe}.json"
+                    fpath.write_text(
+                        json_module.dumps(detail, indent=2,
+                                          ensure_ascii=False, default=str),
+                        encoding="utf-8")
+                    success_count += 1
+                    if signals:
+                        signals.log.emit("INFO",
+                            f"    ✓ [{success_count+fail_count}/{len(remaining)}] "
+                            f"{detail.get('publication_number', doc_id)}")
+                except Exception as e:
+                    fail_count += 1
+                    safe = _safe_filename(doc_id)
+                    fpath = out / f"{safe}.json"
+                    fpath.write_text(
+                        json_module.dumps({
+                            "doc_id": doc_id,
+                            "fetch_status": "failed",
+                            "error": str(e)[:200],
+                        }, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+                    if signals:
+                        signals.log.emit("WARN",
+                            f"    ✗ [{success_count+fail_count}/{len(remaining)}] "
+                            f"{doc_id}: {str(e)[:80]}")
+                finally:
+                    await pg.close()
+                    # 请求间微小延迟，避免触发限流
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+
+        await asyncio.gather(
+            *[_fetch_one(did) for did in remaining],
+            return_exceptions=True)
+
+        total_ok = skipped + success_count
+        if signals:
+            signals.log.emit("SUCCESS",
+                f"  并行抓取完成: {total_ok}/{len(doc_ids)} 篇 "
+                f"(新增 {success_count}, 缓存 {skipped}, 失败 {fail_count})")
+        return total_ok
+
     # ================================================================
     # 搜索表单
     # ================================================================
@@ -116,33 +250,36 @@ class PatentscopeScraper:
         if signals:
             signals.log.emit("INFO", "  正在访问 PATENTSCOPE...")
         search_url = self.settings.patentscope_search_url
-        await self.page.goto(search_url, timeout=90000, wait_until="domcontentloaded")
-        try:
-            await self.page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            pass
-        await asyncio.sleep(2)
+        await self.page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
+        await asyncio.sleep(2)  # 等 JSF 表单渲染
 
         if signals:
             signals.log.emit("INFO", "  正在提交检索式...")
         await self._fill_and_submit(query)
 
         if signals:
-            signals.log.emit("INFO", "  等待搜索结果（可能需要30-60秒）...")
+            signals.log.emit("INFO", "  等待搜索结果...")
+        # 先等 URL 跳到结果页（快），再等结果表格出现
         try:
-            await self.page.wait_for_url("**/result.jsf*", timeout=90000)
+            await self.page.wait_for_url("**/result.jsf*", timeout=30000)
         except Exception:
             pass
         try:
-            await self.page.wait_for_load_state("networkidle", timeout=30000)
+            await self.page.wait_for_selector(
+                ".ps-patent-result, .trans-result-list-row, table.patent-result-list",
+                timeout=10000)
         except Exception:
             pass
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
         if signals:
             signals.log.emit("INFO", "  搜索结果已返回")
 
     async def _set_max_page_size(self, signals=None):
-        """直接用 JS getElementById 设置每页200条"""
+        """用 JS 触发下拉框切换每页条数，并等待页面 AJAX 重新加载完成。
+
+        PATENTSCOPE 改变每页条数后会触发 AJAX 重新加载结果列表，
+        必须等待 networkidle 后才能安全解析，否则只会拿到旧 DOM 中的少量结果。
+        """
         try:
             result = await self.page.evaluate('''() => {
                 var ids = [
@@ -172,7 +309,14 @@ class PatentscopeScraper:
                 if result and result.startswith("ok"):
                     signals.log.emit("INFO", f"  切换每页条数: {result}")
             if result and result.startswith("ok"):
-                await asyncio.sleep(2)
+                # 等待页面条数切换后的 AJAX 重新加载完成
+                await asyncio.sleep(3)
+                try:
+                    await self.page.wait_for_selector(
+                        ".ps-patent-result, .trans-result-list-row",
+                        timeout=10000)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -201,22 +345,13 @@ class PatentscopeScraper:
     # 结果页解析
     # ================================================================
 
-    async def _wait_for_results(self, timeout: int = 60) -> bool:
+    async def _wait_for_results(self, timeout: int = 10) -> bool:
+        """等待搜索结果表格出现，超时则假定无结果"""
         try:
-            # 同时检测"有结果"和"无结果"两种情况
             await self.page.wait_for_selector(
-                ".ps-patent-result, .trans-result-list-row, "
-                "table.patent-result-list, "
-                ".no-results, .noResults, "
-                ":has-text('没有找到符合'), :has-text('No results'), "
-                ":has-text('no results found')",
+                ".ps-patent-result, .trans-result-list-row, table.patent-result-list",
                 timeout=timeout * 1000)
-            # 确认是不是无结果页
-            no_results = await self.page.evaluate('''() => {
-                var body = document.body.innerText || "";
-                return body.includes("没有找到符合") || body.includes("No results") || body.includes("no results found");
-            }''')
-            return not no_results
+            return True
         except Exception:
             return False
 
@@ -267,7 +402,8 @@ class PatentscopeScraper:
     # 详情页提取
     # ================================================================
 
-    async def _extract_detail_page(self, doc_id: str) -> dict:
+    async def _extract_detail_page(self, doc_id: str, page=None) -> dict:
+        pg = page or self.page
         result = {
             "publication_number": "", "title": "", "abstract": "",
             "claims": "", "description": "", "ipc": "",
@@ -276,7 +412,7 @@ class PatentscopeScraper:
         }
 
         # 书目数据
-        biblio = await self.page.evaluate('''() => {
+        biblio = await pg.evaluate('''() => {
             var data = {};
             var body = (document.body && document.body.innerText) || "";
             data.full_text = body.substring(0, 80000);
@@ -308,7 +444,7 @@ class PatentscopeScraper:
         result["patent_number"] = result["publication_number"]
 
         # 申请人/发明人
-        people = await self.page.evaluate('''() => {
+        people = await pg.evaluate('''() => {
             var body = document.body.innerText || "";
             var lines = body.split(/\\n/);
             var result = {applicant: "", inventor: ""};
@@ -327,8 +463,8 @@ class PatentscopeScraper:
         result["inventor"] = people.get("inventor", "").strip().rstrip(";")
 
         # 点击 Claims / Description tab（CN 专利有效，WO 专利为空）
-        claims_text = await self._click_and_extract_tab("PCTCLAIMS")
-        desc_text = await self._click_and_extract_tab("PCTDESCRIPTION")
+        claims_text = await self._click_and_extract_tab("PCTCLAIMS", page=pg)
+        desc_text = await self._click_and_extract_tab("PCTDESCRIPTION", page=pg)
 
         if claims_text:
             claims_text = clean_patent_html_text(claims_text)
@@ -337,7 +473,7 @@ class PatentscopeScraper:
 
         # WO 等非 CN 专利没有独立 Claims/Description 标签，需从「全文」tab 提取
         if not claims_text or not desc_text:
-            fulltext = await self._click_and_extract_tab("FULLTEXT")
+            fulltext = await self._click_and_extract_tab("FULLTEXT", page=pg)
             if fulltext:
                 fulltext = clean_patent_html_text(fulltext)
                 if not claims_text:
@@ -384,18 +520,81 @@ class PatentscopeScraper:
     # ================================================================
 
     async def _go_to_next_page(self) -> bool:
+        """翻到下一页。先尝试 CSS 选择器，再尝试 JS 直接点击。"""
         try:
+            # 多语言/多版本选择器：英文 + 中文 + PrimeFaces + 新版 PATENTSCOPE
             next_btn = self.page.locator(
                 "a[id*='nextPage'], a[id*='navigationNext'], "
-                "a:has-text('Next'), .ui-paginator-next:not(.ui-state-disabled)"
+                "a:has-text('Next'), a:has-text('下一页'), "
+                "a:has-text('›'), a:has-text('>'), a:has-text('»'), "
+                "a.paginator-next, a.pagination-next, "
+                "a[class*='ps-paginator']:has-text('>'), "
+                ".ui-paginator-next:not(.ui-state-disabled)"
             ).first
             if await next_btn.count() > 0:
-                cls = await next_btn.get_attribute("class") or ""
-                if "disabled" in cls:
+                cls = (await next_btn.get_attribute("class")) or ""
+                style = (await next_btn.get_attribute("style")) or ""
+                aria_disabled = (await next_btn.get_attribute("aria-disabled")) or ""
+                if "disabled" in cls or "disabled" in aria_disabled or "display: none" in style:
                     return False
                 await next_btn.click()
-                await self.page.wait_for_load_state("networkidle", timeout=30000)
                 await asyncio.sleep(2)
+                try:
+                    await self.page.wait_for_selector(
+                        ".ps-patent-result, .trans-result-list-row",
+                        timeout=10000)
+                except Exception:
+                    pass
+                self._results_url = self.page.url
+                return True
+        except Exception:
+            pass
+
+        # 选择器兜底：用 JS 查找并点击下一页
+        try:
+            clicked = await self.page.evaluate('''() => {
+                // CSS 选择器查找
+                var selectors = [
+                    "a[id*='nextPage']", "a[id*='navigationNext']",
+                    "a.paginator-next", "a.pagination-next",
+                    "a[class*='ps-paginator']",
+                    ".ui-paginator-next:not(.ui-state-disabled)",
+                    "a[aria-label*='Next']", "a[aria-label*='next']",
+                    "button[aria-label*='Next']", "button[aria-label*='next']",
+                ];
+                for (var s = 0; s < selectors.length; s++) {
+                    try {
+                        var el = document.querySelector(selectors[s]);
+                        if (el && el.offsetParent !== null) {
+                            el.click();
+                            return true;
+                        }
+                    } catch(e) {}
+                }
+                // 文本匹配：遍历所有 a 和 button 标签
+                var elems = document.querySelectorAll("a, button");
+                for (var i = 0; i < elems.length; i++) {
+                    var t = (elems[i].textContent || "").trim();
+                    var tag = elems[i].tagName;
+                    // 精确匹配下一页文本
+                    if (t === "Next" || t === ">" || t === ">>" ||
+                        t === "›" || t === "»") {
+                        if (elems[i].offsetParent !== null) {
+                            elems[i].click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }''')
+            if clicked:
+                await asyncio.sleep(2)
+                try:
+                    await self.page.wait_for_selector(
+                        ".ps-patent-result, .trans-result-list-row",
+                        timeout=10000)
+                except Exception:
+                    pass
                 self._results_url = self.page.url
                 return True
         except Exception:
@@ -404,15 +603,16 @@ class PatentscopeScraper:
 
     # ── 辅助：点击标签页提取文本 ─────────────────────────────────────
 
-    async def _click_and_extract_tab(self, href_keyword: str) -> str:
+    async def _click_and_extract_tab(self, href_keyword: str, page=None) -> str:
         """点击含有关键词的标签页并提取可见面板文本。"""
+        pg = page or self.page
         try:
-            tab = self.page.locator(f"a[href*='{href_keyword}']").first
+            tab = pg.locator(f"a[href*='{href_keyword}']").first
             if await tab.count() == 0:
                 return ""
             await tab.click()
             await asyncio.sleep(2)
-            text = await self.page.evaluate('''() => {
+            text = await pg.evaluate('''() => {
                 var panels = document.querySelectorAll(".ui-tabs-panel");
                 for (var i = 0; i < panels.length; i++) {
                     if (panels[i].style.display !== "none" && panels[i].offsetParent) {
@@ -427,6 +627,11 @@ class PatentscopeScraper:
 
 
 # ── WO 全文切分工具 ──────────────────────────────────────────────────────
+
+def _safe_filename(doc_id: str) -> str:
+    """将 doc_id 转为安全的文件名, 替换斜杠、冒号等非法字符。"""
+    return re.sub(r'[\\/:*?"<>|]', '_', doc_id)
+
 
 def _extract_wo_claims(fulltext: str) -> str:
     """从 WO 全文文本中提取权利要求书正文。

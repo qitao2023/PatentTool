@@ -32,7 +32,7 @@ class AnalysisReport:
         if self.patent_doc:
             lines.append("## 一、本申请概览\n")
             lines.append(f"- **发明名称**: {self.patent_doc.title}")
-            lines.append(f"- **公开号**: {self.patent_doc.publication_number}")
+            lines.append(f"- **公布号**: {self.patent_doc.publication_number}")
             lines.append(f"- **申请人**: {', '.join(self.patent_doc.applicants)}")
             lines.append(f"- **发明人**: {', '.join(self.patent_doc.inventors)}")
             lines.append(f"- **IPC分类**: {', '.join(self.patent_doc.ipc_classifications)}")
@@ -89,7 +89,7 @@ class AnalysisReport:
         # 4. 完整结果列表
         if self.dedup_results:
             lines.append("## 四、全部对比文献列表\n")
-            lines.append("| 序号 | 公开号 | 标题 | 申请人 | 公开日 | 相关度 |")
+            lines.append("| 序号 | 公布号 | 标题 | 申请人 | 公开日 | 相关度 |")
             lines.append("|------|--------|------|--------|--------|--------|")
             for i, r in enumerate(self.dedup_results[:50], 1):
                 pn = r.get("publication_number", "")

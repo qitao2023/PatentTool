@@ -23,7 +23,7 @@ class InputPanel(QWidget):
     settings_clicked = Signal()
     test_clicked = Signal(str, int)             # 测试: 搜索+抓详情
     test_abstract_clicked = Signal(str, int)    # 测试: 仅搜索摘要
-    lookup_patent = Signal(str)                 # 公开号直查
+    lookup_patent = Signal(str)                 # 公布号直查
     open_existing = Signal(str)                 # 打开已有结果
 
     def __init__(self, parent=None):
@@ -105,12 +105,11 @@ class InputPanel(QWidget):
         param_row.addWidget(self.max_results_spin)
         param_row.addSpacing(20)
 
-        param_row.addWidget(QLabel("详情抓取数:"))
+        param_row.addWidget(QLabel("全文下载上限:"))
         self.fetch_detail_spin = QSpinBox()
-        self.fetch_detail_spin.setRange(1, 200)
-        self.fetch_detail_spin.setValue(25)
+        self.fetch_detail_spin.setRange(1, 1000)
+        self.fetch_detail_spin.setValue(200)
         self.fetch_detail_spin.setSuffix(" 篇")
-        self.fetch_detail_spin.setToolTip("AI 筛选后最多抓取多少篇专利的全文详情")
         param_row.addWidget(self.fetch_detail_spin)
         param_row.addStretch(1)
 
@@ -191,7 +190,7 @@ class InputPanel(QWidget):
         test_row1.addWidget(self.test_btn)
         test_outer.addLayout(test_row1)
 
-        # 行2: 公开号直查
+        # 行2: 公布号直查
         test_row2 = QHBoxLayout()
         test_row2.setSpacing(8)
         test_row2.addWidget(QLabel("公布号:"))
@@ -351,6 +350,7 @@ class InputPanel(QWidget):
         self.browse_btn.setEnabled(not running)
         self.max_queries_spin.setEnabled(not running)
         self.max_results_spin.setEnabled(not running)
+        self.fetch_detail_spin.setEnabled(not running)
         self.test_abstract_btn.setEnabled(not running)
         self.test_btn.setEnabled(not running)
         self.lookup_btn.setEnabled(not running)

@@ -97,7 +97,13 @@ class PatentComparator:
     def _detailed_comparison(self, client: AIClient,
                               patent: PatentDocument,
                               result: dict) -> Optional[dict]:
-        """阶段2: 对单个结果做详细对比"""
+        """阶段2: 对单个结果做详细对比（使用完整全文）"""
+
+        # 候选专利：完整全文，不截断
+        cand_claims = result.get("claims") or ""
+        cand_desc = result.get("description") or ""
+        cand_abstract = result.get("abstract") or result.get("abstract_snippet") or ""
+
         prompt = f"""# 本申请专利
 发明名称: {patent.title}
 IPC分类: {', '.join(patent.ipc_classifications)}
@@ -107,21 +113,27 @@ IPC分类: {', '.join(patent.ipc_classifications)}
 {chr(10).join(patent.claims[:10])}
 
 说明书（节选）:
-{patent.description[:1500] if patent.description else '(无提要从说明书)'}
+{patent.description[:1500] if patent.description else '(无)'}
 
 # 对比文献
-公开号: {result.get('publication_number', 'N/A')}
+公布号: {result.get('publication_number', 'N/A')}
 标题: {result.get('title', 'N/A')}
 申请人: {result.get('applicant', 'N/A')}
 公开日: {result.get('publication_date', 'N/A')}
 IPC: {result.get('ipc', 'N/A')}
-摘要: {result.get('abstract', 'N/A')}
+摘要: {cand_abstract}
+
+权利要求书:
+{cand_claims if cand_claims else '(无)'}
+
+说明书（节选）:
+{cand_desc if cand_desc else '(无)'}
 
 # 分析任务
 请对以上对比文献与本申请进行专业对比分析，输出JSON格式：
 
 {{
-  "publication_number": "对比文献公开号",
+  "publication_number": "对比文献公布号",
   "relevance_score": 0-100的评分,
   "novelty_impact": "新颖性影响: high/moderate/low",
   "inventive_step_impact": "创造性影响: high/moderate/low",
@@ -174,9 +186,9 @@ IPC: {result.get('ipc', 'N/A')}
         client = self._get_client()
         pub = candidate.get("publication_number", "?")
         title = candidate.get("title", "")
-        claims = candidate.get("claims", "")[:6000]
-        description = candidate.get("description", "")[:6000]
-        abstract = candidate.get("abstract", "")[:2000]
+        claims = candidate.get("claims", "") or ""
+        description = candidate.get("description", "") or ""
+        abstract = candidate.get("abstract", "") or ""
         ipc = candidate.get("ipc", "")
         applicant = candidate.get("applicant", "")
         pub_date = candidate.get("publication_date", "")
@@ -191,7 +203,7 @@ IPC: {result.get('ipc', 'N/A')}
 {chr(10).join(f'{i+1}. {c}' for i, c in enumerate(patent_doc.claims[:5]))}
 
 # 对比文献
-**公开号**: {pub}
+**公布号**: {pub}
 **标题**: {title}
 **申请人**: {applicant}
 **公开日**: {pub_date}

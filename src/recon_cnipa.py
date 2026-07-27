@@ -107,7 +107,7 @@ async def analyze(page, label: str) -> dict:
 
         const t = document.body?.innerText || '';
         r.feat = {
-            search: /检索|搜索|查询/.test(t), patentNum: /申请号|公开号|专利号/.test(t),
+            search: /检索|搜索|查询/.test(t), patentNum: /申请号|公布号|专利号/.test(t),
             keyword: /关键词|发明名称/.test(t), applicant: /申请人|专利权人/.test(t),
             inventor: /发明人/.test(t), ipc: /IPC|分类号/.test(t),
             login: /登录|密码|验证码/.test(t), captcha: /验证码|滑块/.test(t),
@@ -271,7 +271,7 @@ async def main():
                     if not inp['vis']: continue
                     s = 0
                     txt = (inp.get('ph','') + inp.get('label','')).lower()
-                    if any(kw in txt for kw in ['申请号','公开号','专利号']): s += 10
+                    if any(kw in txt for kw in ['申请号','公布号','专利号']): s += 10
                     if any(kw in txt for kw in ['检索','搜索']): s += 3
                     scored.append((s, inp))
                 scored.sort(key=lambda x: -x[0])

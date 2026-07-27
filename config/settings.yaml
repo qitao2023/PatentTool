@@ -11,7 +11,7 @@ pdf:
 # AI 引擎配置
 ai:
   provider: "deepseek"                      # "deepseek" 或 "kimi"
-  deepseek_model: "deepseek-v4-pro"       # 或 deepseek-v4-pro（旗舰）
+  deepseek_model: "deepseek-v4-flash"       # 或 deepseek-v4-pro（旗舰）
   kimi_model: "kimi-k3"                     # 或 kimi-k2.6 / kimi-k2.7-code
   temperature: 0.4
 
@@ -22,7 +22,7 @@ query_generation:
 
 # Web自动化
 web:
-  headless: true                  # 无头模式，后台静默运行
+  headless: false                 # 有头模式（无头会被 PATENTSCOPE 403）
   viewport_width: 1920
   viewport_height: 1080
   locale: "zh-CN"
@@ -110,7 +110,10 @@ dedup:
 # 分析
 analysis:
   max_tokens: 8192
-  top_n_for_detailed: 25
+  max_detail_fetch: 200       # 全文下载上限（超过则AI快速粗筛，~30秒）
+  fulltext_batch_size: 30     # 全文筛选时每批发给AI的篇数
+  max_chars_per_patent: 3000  # 全文筛选时每篇最多发给AI的字符数
+  top_n_for_detailed: 10
   batch_comparison: true
 
 # Session

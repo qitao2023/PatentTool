@@ -19,8 +19,8 @@ from pathlib import Path
 
 STAGE_FILES = {
     "search":    "01_search_abstracts.json",
-    "screen":    "02_ai_screened.json",
-    "detail":    "03_full_details.json",
+    "detail":    "02_patent_details",           # 全部专利完整详情目录
+    "screen":    "03_ai_screened.json",
     "analysis":  "04_analysis_report.md",
     "oa":        "05_审查意见通知书.md",
 }
@@ -73,12 +73,12 @@ def _patent_name_from_doc(patent_doc) -> str:
 
 
 def get_output_dir(pdf_path: str, patent_doc) -> Path:
-    """在 PDF 同级创建 公开号_时间 文件夹。
+    """在 PDF 同级创建 公布号_时间 文件夹。
 
     降级策略：
-    1. PDF 目录 + 公开号_时间（首选）
-    2. PDF 目录不可写 → <cwd>/data/output/公开号_时间
-    3. 公开号解析失败 → 用 PDF 文件名（去扩展名）
+    1. PDF 目录 + 公布号_时间（首选）
+    2. PDF 目录不可写 → <cwd>/data/output/公布号_时间
+    3. 公布号解析失败 → 用 PDF 文件名（去扩展名）
     """
     pdf = Path(pdf_path)
     pdf_dir = pdf.parent
@@ -107,8 +107,8 @@ def get_output_dir(pdf_path: str, patent_doc) -> Path:
 def scan_runs(pdf_path: str, patent_doc=None) -> list[RunInfo]:
     """扫描 PDF 同级目录下匹配的历史运行文件夹。
 
-    匹配规则：文件夹名以规范化的公开号开头（如 CN116417058_*）
-    如果无法获取公开号，用 PDF 文件名匹配。
+    匹配规则：文件夹名以规范化的公布号开头（如 CN116417058_*）
+    如果无法获取公布号，用 PDF 文件名匹配。
 
     Returns:
         按时间倒序排列的 RunInfo 列表

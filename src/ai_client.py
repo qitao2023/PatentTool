@@ -63,6 +63,16 @@ class AIClient:
         self.settings = settings
         self._provider = provider or settings.ai_provider
         self._client: OpenAI | None = None
+        self._log_dir = None  # 可选，用于保存每次 AI 交互内容
+        self._call_counter = 0
+
+    def set_log_dir(self, path):
+        """设置 AI 交互日志目录，设置后每次 chat 都会保存 prompt 和 response"""
+        from pathlib import Path
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+        self._log_dir = p
+        self._call_counter = 0
 
     @property
     def provider(self) -> str:
@@ -127,4 +137,21 @@ class AIClient:
             kwargs["response_format"] = {"type": "json_object"}
 
         response = self._client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content or ""
+
+        # 保存 AI 交互日志
+        if self._log_dir:
+            self._call_counter += 1
+            import json as _json
+            from datetime import datetime
+            ts = datetime.now().strftime("%H%M%S")
+            log_file = self._log_dir / f"{self._call_counter:03d}_{ts}.json"
+            log_file.write_text(_json.dumps({
+                "call": self._call_counter,
+                "model": self._get_model(),
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "response": content,
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        return content

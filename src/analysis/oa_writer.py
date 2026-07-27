@@ -48,7 +48,7 @@ OA_SYSTEM_PROMPT = """你是一名中国国家知识产权局（CNIPA）专利�
 简述检索数据库、检索式、检索结果。
 
 ## 三、对比文件列表
-| 编号 | 公开号 | 标题 | 相关度 |
+| 编号 | 公布号 | 标题 | 相关度 |
 |---|---|---|---|
 | 1 | ... | ... | 最接近现有技术 |
 | 2 | ... | ... | 用于结合评述创造性 |
@@ -166,7 +166,7 @@ class OAWriter:
         if patent_doc.title:
             parts.append(f"## 发明名称\n{patent_doc.title}")
         if patent_doc.publication_number:
-            parts.append(f"**公开号**: {patent_doc.publication_number}")
+            parts.append(f"**公布号**: {patent_doc.publication_number}")
         if patent_doc.application_number:
             parts.append(f"**申请号**: {patent_doc.application_number}")
         if patent_doc.applicants:

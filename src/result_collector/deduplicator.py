@@ -26,7 +26,7 @@ class Deduplicator:
             for result in results:
                 is_dup = False
 
-                # 主键去重：公开号
+                # 主键去重：公布号
                 pn = result.get("publication_number", "").strip()
                 if pn:
                     normalized_pn = self._normalize_pn(pn)
@@ -38,7 +38,7 @@ class Deduplicator:
                     else:
                         seen_numbers.add(normalized_pn)
 
-                # 辅助去重：标题相似度（当无公开号时）
+                # 辅助去重：标题相似度（当无公布号时）
                 if not is_dup and not pn:
                     title = result.get("title", "").strip()
                     if title:
@@ -57,7 +57,7 @@ class Deduplicator:
         return unique_results, removed
 
     def _normalize_pn(self, pn: str) -> str:
-        """标准化公开号"""
+        """标准化公布号"""
         # 去除空格和特殊字符
         return pn.replace(" ", "").replace("-", "").replace("/", "").upper()
 

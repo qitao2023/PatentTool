@@ -223,6 +223,16 @@ class Settings:
     def analysis_top_n(self) -> int:
         return self._raw.get("analysis", {}).get("top_n_for_detailed", 15)
 
+    @property
+    def analysis_max_detail_fetch(self) -> int:
+        """全文下载上限，默认 200"""
+        return self._raw.get("analysis", {}).get("max_detail_fetch", 200)
+
+    @property
+    def analysis_fulltext_batch_size(self) -> int:
+        """全文筛选时每批发给 AI 的篇数，默认 30"""
+        return self._raw.get("analysis", {}).get("fulltext_batch_size", 30)
+
     # --- Session ---
     @property
     def session_max_age_hours(self) -> int:

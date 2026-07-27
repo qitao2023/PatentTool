@@ -101,10 +101,10 @@ class PatentPDFExtractor:
         return patent
 
     def _parse_metadata(self, text: str, patent: PatentDocument):
-        """解析元数据：公开号、申请人等"""
-        # 公开号
+        """解析元数据：公布号、申请人等"""
+        # 公布号
         for line in text.split("\n"):
-            if "公开号" in line or "申请公布号" in line or "Publication Number" in line:
+            if "公布号" in line or "申请公布号" in line or "Publication Number" in line:
                 m = re.search(r"(\w{2}\s*\d+[A-Z]?\d*)", line)
                 if m:
                     patent.publication_number = normalize_patent_number(m.group(1))

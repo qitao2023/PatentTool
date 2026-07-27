@@ -1,18 +1,14 @@
 """
-浏览器管理器 - 使用临时 Profile + Cookie 恢复，彻底避免锁冲突
+浏览器管理器 - 无痕模式启动，不保存任何 Cookie 和缓存
 """
 import asyncio
 import os
 import signal
 import tempfile
-import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
 from src.utils.config import Settings
-
-
-STORAGE_FILE = "storage_state.json"
 
 
 class BrowserManager:
@@ -24,8 +20,6 @@ class BrowserManager:
         self._page = None
         self._browser = None
         self._playwright = None
-        self._profile_dir = None
-        self._is_temp_profile = False
         self._window_size = self._detect_window_size()
 
     @staticmethod
@@ -55,35 +49,21 @@ class BrowserManager:
             return default
 
     def _storage_path(self) -> Path:
-        """持久化 Cookie 文件路径"""
-        p = Path(self.settings.session_profile_dir)
-        if not p.is_absolute():
-            p = Path.cwd() / p
-        p.mkdir(parents=True, exist_ok=True)
-        return p / STORAGE_FILE
+        """（保留兼容性，无痕模式不使用）"""
+        return Path(tempfile.gettempdir()) / "patent_tool_noop.json"
 
     async def launch(self) -> Tuple:
-        """启动浏览器（Edge，持久化 Profile，保留密码/Cookie）"""
+        """启动浏览器（Edge 无痕模式）"""
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
 
-        # 使用持久化 profile 目录（保留密码、Cookie、登录状态等）
-        profile_dir = Path(self.settings.session_profile_dir)
-        if not profile_dir.is_absolute():
-            profile_dir = Path.cwd() / profile_dir
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        self._profile_dir = profile_dir
-        self._is_temp_profile = False  # 标记为非临时目录，close 时不删除
-
         headless = self.settings.web_headless
         proxy = self.settings.web_proxy
 
-        # 启动浏览器
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--disable-dev-shm-usage",
         ]
         if headless:
             launch_args.append("--headless=new")
@@ -94,51 +74,26 @@ class BrowserManager:
             args=launch_args,
         )
 
-        # 创建 context（proxy 在 context 级别，避免 persistent_context bug）
         ctx_opts = {
             "viewport": {"width": 1920, "height": 1080},
             "locale": self.settings.web_locale,
             "timezone_id": self.settings.web_timezone,
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
         }
         if proxy:
             ctx_opts["proxy"] = {"server": proxy}
 
         self._context = await self._browser.new_context(**ctx_opts)
-
-        # Stealth 脚本（对抗无头模式检测）
-        await self._context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get:()=>undefined});
-            Object.defineProperty(navigator, 'plugins', {get:()=>{
-                const p=[{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}];
-                p.item=i=>p[i]; p.length=3; return p;
-            }});
-            Object.defineProperty(navigator, 'languages', {get:()=>['zh-CN','zh','en-US','en']});
-            Object.defineProperty(navigator, 'platform', {get:()=>'Win32'});
-            Object.defineProperty(navigator, 'hardwareConcurrency', {get:()=>8});
-            Object.defineProperty(navigator, 'deviceMemory', {get:()=>8});
-            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
-        """)
-
         self._page = await self._context.new_page()
         self._page.set_default_timeout(30000)
-
-        # 自动接受所有浏览器对话框（alert/confirm/prompt）
         self._page.on("dialog", lambda d: d.accept() if d.type != "prompt" else d.accept(""))
-
-        # 立即跳转到目标站
-        try:
-            await self._page.goto(
-                self.settings.himmpat_base_url,
-                wait_until="commit", timeout=15000  # commit 比 domcontentloaded 更快
-            )
-        except Exception:
-            pass
 
         return self._context, self._page
 
+    def _kill_chrome(self):
+        """兼容旧代码，CDP 模式不需要杀进程"""
+        pass
+
     async def save_storage(self):
-        """持久化 profile 已自动保存，此方法保留兼容性"""
         pass
 
     async def close(self):
@@ -154,13 +109,6 @@ class BrowserManager:
                 await self._playwright.stop()
         except Exception:
             pass
-        # 只清理临时目录，保留持久化 profile
-        if self._is_temp_profile and self._profile_dir and self._profile_dir.exists():
-            try:
-                shutil.rmtree(str(self._profile_dir), ignore_errors=True)
-            except Exception:
-                pass
-        # 浏览器已通过 Playwright API 关闭
 
     async def launch_with_retry(self, max_retries: int = 2) -> Tuple:
         """带重试的启动"""

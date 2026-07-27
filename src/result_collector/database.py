@@ -133,7 +133,7 @@ class PatentDatabase:
                     query_id: int) -> int:
         conn = self.get_connection()
         try:
-            # 插入或忽略（按公开号去重）
+            # 插入或忽略（按公布号去重）
             cur = conn.execute(
                 """INSERT OR IGNORE INTO patent_results
                    (session_id, publication_number, title, abstract, applicant,

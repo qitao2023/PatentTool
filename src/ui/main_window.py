@@ -181,10 +181,10 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_lookup(self, doc_id: str):
-        """公开号直查"""
+        """公布号直查"""
         if not doc_id.strip():
             return
-        self.log_panel.append_log("INFO", f"公开号查询: {doc_id}")
+        self.log_panel.append_log("INFO", f"公布号查询: {doc_id}")
         self.input_panel.set_running_state(True)
         self.status_label.setText(f"查询 {doc_id}...")
         self._current_worker = PatentLookupWorker(doc_id, self.settings)
@@ -446,12 +446,11 @@ class MainWindow(QMainWindow):
         max_queries = len(queries)
         self.status_label.setText(
             f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条, "
-            f"抓取{fetch_detail}篇详情)...")
+            f"下载上限{fetch_detail}篇)...")
         self._current_worker = PatentscopeSearchAndFetchWorker(
             queries, self.settings,
             patent_doc=self._patent_doc,
-            max_fetch=max_results,
-            top_n=fetch_detail,
+            max_fetch=fetch_detail,           # 全文下载上限（UI控制）
             output_dir=self._output_dir)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
@@ -526,7 +525,7 @@ class MainWindow(QMainWindow):
         self.report_panel.show_report(report)
         self._analysis_report = report
 
-        # 构建对比缓存：{公开号: markdown}，点击专利时秒开
+        # 构建对比缓存：{公布号: markdown}，点击专利时秒开
         self._comparison_cache = {}
         for c in (report.comparisons or []):
             pub = c.get("publication_number", "")
