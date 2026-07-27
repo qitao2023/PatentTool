@@ -555,7 +555,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
         scraper2 = PatentscopeScraper(page2, self.settings, human2)
 
         await scraper2.fetch_details_parallel(
-            to_fetch, str(details_dir), concurrency=3, signals=self.signals)
+            to_fetch, str(details_dir), concurrency=1, signals=self.signals)
 
         await browser_mgr2.close()
 

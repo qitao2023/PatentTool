@@ -275,68 +275,46 @@ class PatentscopeScraper:
             signals.log.emit("INFO", "  搜索结果已返回")
 
     async def _set_max_page_size(self, signals=None):
-        """用 Playwright locator 找分页下拉框，切到最大值。
+        """切到每页最多条数（200）。
 
-        PATENTSCOPE 改变每页条数后会触发 AJAX 重新加载结果列表。
+        页面布局: 「相关性」<select> | 「每页:」<select> | 「查看:」
+        找到包含选项"200"的 select 即目标。
         """
-        # 候选选择器：JSF 风格 ID + 通用 select
-        candidate_selectors = [
-            "select[id*='perPage']",
-            "select[id*='lengthOption']",
-            "select[id*='pageSize']",
-            "select[id*='listLength']",
-            "select[id*='resultPerPage']",
-            "select.pagination-dropdown",
-            ".ps-paginator select",
-            ".paginator select",
-            ".pagination select",
-        ]
-        found = False
-        for sel in candidate_selectors:
-            try:
-                loc = self.page.locator(sel).first
-                if await loc.count() == 0:
-                    continue
-                # 检查是否有大于当前值的选项
-                options = await loc.locator("option").all()
-                vals = []
-                for opt in options:
-                    try:
-                        v_text = (await opt.text_content()).strip()
-                        v_val = await opt.get_attribute("value")
-                        v_num = int(v_text) if v_text.isdigit() else (int(v_val) if v_val and v_val.isdigit() else 0)
-                        if v_num > 0:
-                            vals.append((v_num, v_val or v_text))
-                    except Exception:
-                        continue
-                if not vals:
-                    continue
-                max_num, max_val = max(vals, key=lambda x: x[0])
-                current_val = await loc.input_value()
-                current_num = int(current_val) if current_val.isdigit() else 0
-                if max_num <= current_num:
-                    if signals:
-                        signals.log.emit("INFO", f"  每页已是最多: {current_num} 条")
-                    found = True
-                    break
-                await loc.select_option(value=max_val)
-                if signals:
-                    signals.log.emit("INFO", f"  切换每页条数: {max_num} 条 ({sel})")
-                found = True
-                # 等待 AJAX 重新加载
-                await asyncio.sleep(3)
+        try:
+            all_selects = await self.page.locator("select").all()
+            for loc in all_selects:
                 try:
-                    await self.page.wait_for_selector(
-                        ".ps-patent-result, .trans-result-list-row",
-                        timeout=10000)
+                    options = await loc.locator("option").all()
+                    vals = []
+                    for opt in options:
+                        try:
+                            v_text = (await opt.text_content()).strip()
+                            v_num = int(v_text) if v_text.isdigit() else 0
+                            if v_num > 0:
+                                vals.append(v_num)
+                        except Exception:
+                            continue
+                    # 包含 200 就是分页下拉框
+                    if 200 in vals:
+                        await loc.select_option(value="200")
+                        if signals:
+                            signals.log.emit("INFO", "  切换每页条数: 200 条")
+                        await asyncio.sleep(3)
+                        try:
+                            await self.page.wait_for_selector(
+                                ".ps-patent-result, .trans-result-list-row",
+                                timeout=10000)
+                        except Exception:
+                            pass
+                        return
                 except Exception:
-                    pass
-                break
-            except Exception:
-                continue
+                    continue
 
-        if not found and signals:
-            signals.log.emit("WARN", "  未找到分页下拉框，将逐页翻取")
+            if signals:
+                signals.log.emit("WARN", "  未找到包含200的分页下拉框")
+        except Exception:
+            if signals:
+                signals.log.emit("WARN", "  未找到分页下拉框")
 
     async def _fill_and_submit(self, query: str):
         # 步骤1: 使用 Playwright locator 填入检索式（自动等待元素、防导航中断）
