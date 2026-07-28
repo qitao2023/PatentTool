@@ -80,6 +80,7 @@ class PatentComparator:
                 user_prompt=prompt,
                 max_tokens=4096,
                 temperature=0.3,
+                model=self.settings.ai_analysis_model,
             )
             scores = self._parse_scores(content)
 
@@ -150,6 +151,7 @@ IPC: {result.get('ipc', 'N/A')}
                 user_prompt=prompt,
                 max_tokens=4096,
                 temperature=0.3,
+                model=self.settings.ai_analysis_model,
             )
             detail = self._parse_detail(content)
             if detail:
@@ -258,6 +260,7 @@ IPC: {result.get('ipc', 'N/A')}
                 user_prompt=comparison_prompt,
                 max_tokens=4096,
                 temperature=0.3,
+                model=self.settings.ai_analysis_model,
             )
             return {"markdown": content, "publication_number": pub}
         except Exception as e:

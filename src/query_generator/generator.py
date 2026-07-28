@@ -35,6 +35,8 @@ class QueryGenerator:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_tokens=self.settings.query_max_tokens,
+            model=self.settings.ai_query_model,
+            json_mode=True,
         )
 
         # 解析JSON响应
@@ -42,7 +44,9 @@ class QueryGenerator:
         return queries
 
     def _parse_response(self, content: str, max_queries: int) -> list[dict]:
-        """解析AI返回的JSON"""
+        """解析AI返回的JSON，失败时尝试修复截断"""
+        import re
+
         content = content.strip()
 
         # 处理 ```json ... ``` 包裹
@@ -54,21 +58,34 @@ class QueryGenerator:
         # 去掉开头的非JSON字符
         while content and content[0] not in "[{":
             content = content[1:]
-        # 去掉结尾的非JSON字符
-        while content and content[-1] not in "]}":
-            content = content[:-1]
 
+        queries = None
+        errors = []
+
+        # 尝试1: 直接解析
         try:
             queries = json.loads(content)
-        except json.JSONDecodeError as e:
-            # 尝试修正常见JSON错误
+        except json.JSONDecodeError as e1:
+            errors.append(str(e1))
+            # 尝试2: 修复尾部截断 → 找最后一个完整 } 的位置
             try:
-                import re
-                content = re.sub(r",\s*\]", "]", content)
-                content = re.sub(r",\s*\}", "}", content)
-                queries = json.loads(content)
-            except json.JSONDecodeError:
-                raise ValueError(f"AI返回的JSON无法解析: {e}\n原始内容:\n{content[:500]}")
+                # 去掉尾部截断的不完整条目
+                last_complete = content.rfind('"}')
+                if last_complete > 0:
+                    fixed = content[:last_complete + 2] + "\n]"
+                    queries = json.loads(fixed)
+            except json.JSONDecodeError as e2:
+                errors.append(str(e2))
+                # 尝试3: 修正常见JSON错误
+                try:
+                    content = re.sub(r",\s*\]", "]", content)
+                    content = re.sub(r",\s*\}", "}", content)
+                    queries = json.loads(content)
+                except json.JSONDecodeError as e3:
+                    errors.append(str(e3))
+                    raise ValueError(
+                        f"AI返回的JSON无法解析: {'; '.join(errors)}\n"
+                        f"原始内容(前500字):\n{content[:500]}")
 
         if isinstance(queries, dict) and "queries" in queries:
             queries = queries["queries"]
@@ -87,5 +104,8 @@ class QueryGenerator:
             q.setdefault("priority", i + 1)
             if q["query_string"]:
                 validated.append(q)
+
+        if not validated:
+            raise ValueError(f"JSON解析成功但无有效检索式: {content[:300]}")
 
         return validated[:max_queries]

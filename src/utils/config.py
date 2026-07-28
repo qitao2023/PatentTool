@@ -61,11 +61,40 @@ class Settings:
 
     @property
     def ai_model(self) -> str:
-        """根据 provider 返回对应模型名"""
+        """默认模型"""
         ai = self._raw.get("ai", {})
         if self.ai_provider == "kimi":
             return ai.get("kimi_model", "kimi-k3")
         return ai.get("deepseek_model", "deepseek-v4-flash")
+
+    @property
+    def ai_query_provider(self) -> str | None:
+        """检索式生成专用提供商（不设则用全局 provider）"""
+        return self._raw.get("ai", {}).get("query_provider")
+
+    @property
+    def ai_query_model(self) -> str:
+        """检索式生成专用模型（默认用旗舰模型）"""
+        ai = self._raw.get("ai", {})
+        # 如果 query_provider 不同，用对应提供商的默认模型
+        qp = self.ai_query_provider
+        if qp == "kimi":
+            return ai.get("query_model", ai.get("kimi_model", "kimi-k3"))
+        if qp == "deepseek":
+            return ai.get("query_model", ai.get("deepseek_model", "deepseek-v4-pro"))
+        return ai.get("query_model", self.ai_model)
+
+    @property
+    def ai_screen_model(self) -> str:
+        """筛选/评分专用模型（默认用快速模型）"""
+        ai = self._raw.get("ai", {})
+        return ai.get("screen_model", self.ai_model)
+
+    @property
+    def ai_analysis_model(self) -> str:
+        """对比分析专用模型"""
+        ai = self._raw.get("ai", {})
+        return ai.get("analysis_model", self.ai_model)
 
     @property
     def himmpat_username(self) -> str | None:
@@ -95,7 +124,7 @@ class Settings:
 
     @property
     def query_max_tokens(self) -> int:
-        return self._raw.get("query_generation", {}).get("max_tokens", 4096)
+        return self._raw.get("query_generation", {}).get("max_tokens", 8192)
 
     # --- Web ---
     @property

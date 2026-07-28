@@ -116,11 +116,13 @@ class AIClient:
 
     def chat(self, system_prompt: str, user_prompt: str,
              max_tokens: int = 4096, temperature: float | None = None,
-             json_mode: bool = False) -> str:
-        """统一的聊天接口。json_mode=True 时强制输出合法 JSON。"""
+             json_mode: bool = False, model: str | None = None) -> str:
+        """统一的聊天接口。json_mode=True 时强制输出合法 JSON。
+
+        model: 可选覆盖，不传则用默认模型。
+        """
         self._ensure_client()
-        if temperature is None:
-            temperature = self.settings.ai_temperature
+        actual_model = model or self._get_model()
 
         messages = []
         if system_prompt:
@@ -128,16 +130,27 @@ class AIClient:
         messages.append({"role": "user", "content": user_prompt})
 
         kwargs = dict(
-            model=self._get_model(),
+            model=actual_model,
             max_tokens=max_tokens,
-            temperature=temperature,
             messages=messages,
         )
+        # Kimi 思考模型（k2/k3系列）只接受 temperature=1，DeepSeek 正常传
+        if self._provider == "kimi":
+            kwargs["temperature"] = 1.0
+        else:
+            kwargs["temperature"] = temperature if temperature is not None else self.settings.ai_temperature
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
         response = self._client.chat.completions.create(**kwargs)
-        content = response.choices[0].message.content or ""
+        msg = response.choices[0].message
+        content = msg.content or ""
+        # Kimi 思考模型 content 可能为 null，退到 reasoning_content
+        if not content and hasattr(msg, 'reasoning_content'):
+            content = msg.reasoning_content or ""
+            if content:
+                # 附带一段提示标记，方便定位
+                content = f"# Reasoning:\n{content}\n\n# Final Answer:"
 
         # 保存 AI 交互日志
         if self._log_dir:

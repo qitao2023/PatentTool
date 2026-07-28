@@ -121,7 +121,8 @@ class PatentScreener:
         response = client.chat(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=4096, temperature=0.3)
+            max_tokens=4096, temperature=0.3,
+            model=self.settings.ai_screen_model)
 
         # 解析公布号列表
         selected_pubs = self._parse_pub_list(response)
@@ -225,7 +226,8 @@ class PatentScreener:
 
             system_prompt = SCREENING_SYSTEM_PROMPT.replace("{top_n}", str(batch_target))
             response = client.chat(system_prompt=system_prompt, user_prompt=user_prompt,
-                                   max_tokens=8192, temperature=0.3)
+                                   max_tokens=8192, temperature=0.3,
+                                   model=self.settings.ai_screen_model)
             scored = self._parse_response(response, batch)
             all_scored.extend(scored)
 
@@ -256,7 +258,8 @@ class PatentScreener:
         try:
             response = client.chat(
                 system_prompt="你是专利评分机器。只输出JSON数组，别无其他。",
-                user_prompt=batch_prompt, max_tokens=8192, temperature=0.2)
+                user_prompt=batch_prompt, max_tokens=8192, temperature=0.2,
+                model=self.settings.ai_screen_model)
             resp = response.strip()
             if resp.startswith("```"):
                 resp = re_module.sub(r'^```\w*\n?', '', resp)
@@ -397,7 +400,8 @@ class PatentScreener:
                 response = client.chat(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
-                    max_tokens=8192, temperature=0.2)
+                    max_tokens=8192, temperature=0.2,
+                    model=self.settings.ai_screen_model)
 
                 scored = self._parse_response(response, batch)
                 all_scored.extend(scored)

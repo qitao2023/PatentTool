@@ -34,17 +34,19 @@ def build_system_prompt() -> str:
 
 ## 输出格式
 
-纯 JSON 数组（不要 markdown 代码块）：
+纯 JSON 对象，包含 queries 数组：
 
 ```json
-[
-  {
-    "query_string": "PATENTSCOPE检索式（纯关键词）",
-    "search_angle": "角度说明",
-    "rationale": "为什么这个检索式有效",
-    "priority": 1
-  }
-]
+{
+  "queries": [
+    {
+      "query_string": "PATENTSCOPE检索式（纯关键词）",
+      "search_angle": "角度说明",
+      "rationale": "为什么这个检索式有效",
+      "priority": 1
+    }
+  ]
+}
 ```
 
 - priority: 1 = 最宽泛/最重要，往后逐渐精准
@@ -67,7 +69,7 @@ def build_user_prompt(patent: PatentDocument, max_queries: int = 10) -> str:
     if patent.inventors:
         patent_sections.append(f"## 发明人\n" + ", ".join(patent.inventors))
     if patent.description:
-        patent_sections.append(f"## 说明书（节选）\n{patent.description[:2000]}...")
+        patent_sections.append(f"## 说明书\n{patent.description}")
 
     patent_markdown = "\n\n".join(patent_sections)
 
@@ -103,17 +105,19 @@ def build_user_prompt(patent: PatentDocument, max_queries: int = 10) -> str:
 
 ## 输出格式
 
-纯JSON数组（不要markdown代码块包裹）：
+纯JSON对象，包含queries数组（不要markdown代码块包裹）：
 
 ```json
-[
-  {{
-    "query_string": "检索式（纯关键词，AND/OR连接，支持双引号精确匹配）",
-    "search_angle": "角度说明",
-    "rationale": "为什么这个检索式有效",
-    "priority": 1
-  }}
-]
+{{
+  "queries": [
+    {{
+      "query_string": "检索式（纯关键词，AND/OR连接，支持双引号精确匹配）",
+      "search_angle": "角度说明",
+      "rationale": "为什么这个检索式有效",
+      "priority": 1
+    }}
+  ]
+}}
 ```
 
 - 必须恰好生成 {max_queries} 个检索式，一个都不能少

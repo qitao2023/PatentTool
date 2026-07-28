@@ -39,7 +39,7 @@ class SettingsDialog(QDialog):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # --- AI 设置 Tab ---
+        # --- AI 全局设置 ---
         ai_group = QGroupBox("AI 引擎设置")
         ai_layout = QFormLayout(ai_group)
 
@@ -53,9 +53,9 @@ class SettingsDialog(QDialog):
         provider_row.addStretch(1)
         ai_layout.addRow("AI 提供商:", provider_row)
 
-        # 模型选择
+        # 默认模型
         self.model_combo = QComboBox()
-        ai_layout.addRow("模型:", self.model_combo)
+        ai_layout.addRow("默认模型:", self.model_combo)
 
         # API Key
         self.api_key_input = QLineEdit()
@@ -73,7 +73,7 @@ class SettingsDialog(QDialog):
         temp_row = QHBoxLayout()
         self.temp_slider = QSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
-        self.temp_slider.setValue(40)  # 默认 0.4
+        self.temp_slider.setValue(40)
         self.temp_label = QLabel("0.40")
         self.temp_slider.valueChanged.connect(
             lambda v: self.temp_label.setText(f"{v/100:.2f}")
@@ -83,6 +83,24 @@ class SettingsDialog(QDialog):
         ai_layout.addRow("温度 (Temperature):", temp_row)
 
         layout.addWidget(ai_group)
+
+        # --- 各阶段专用模型 ---
+        stage_group = QGroupBox("各阶段专用模型（为空则用默认模型）")
+        stage_layout = QFormLayout(stage_group)
+
+        self.query_model_combo = QComboBox()
+        self.query_model_combo.setToolTip("生成 PATENTSCOPE 检索式时使用的模型")
+        stage_layout.addRow("检索式生成:", self.query_model_combo)
+
+        self.screen_model_combo = QComboBox()
+        self.screen_model_combo.setToolTip("AI 筛选/评分对比文件时使用的模型")
+        stage_layout.addRow("筛选评分:", self.screen_model_combo)
+
+        self.analysis_model_combo = QComboBox()
+        self.analysis_model_combo.setToolTip("逐篇对比分析时使用的模型")
+        stage_layout.addRow("对比分析:", self.analysis_model_combo)
+
+        layout.addWidget(stage_group)
 
         # --- 提示 ---
         hint = QLabel(
@@ -127,18 +145,25 @@ class SettingsDialog(QDialog):
         self.temp_slider.setValue(int(temp * 100))
 
     def _populate_models(self):
-        """根据当前提供商填充模型下拉框"""
+        """根据当前提供商填充所有模型下拉框"""
         provider = self._current_provider
         models = get_provider_models(provider)
-        self.model_combo.clear()
-        current_model = self.settings.ai_model
-        selected_idx = 0
-        for i, (model_name, display_name) in enumerate(models.items()):
-            self.model_combo.addItem(f"{model_name} - {display_name}", model_name)
-            if model_name == current_model:
-                selected_idx = i
-        if self.model_combo.count() > 0:
-            self.model_combo.setCurrentIndex(selected_idx)
+        items = []
+        for model_name, display_name in models.items():
+            items.append((f"{model_name} - {display_name}", model_name))
+
+        def _fill(combo, current_model: str):
+            combo.clear()
+            combo.addItem("（使用默认模型）", "")
+            for text, data in items:
+                combo.addItem(text, data)
+            idx = combo.findData(current_model)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        _fill(self.model_combo, self.settings.ai_model)
+        _fill(self.query_model_combo, self.settings.ai_query_model)
+        _fill(self.screen_model_combo, self.settings.ai_screen_model)
+        _fill(self.analysis_model_combo, self.settings.ai_analysis_model)
 
     def _on_provider_changed(self, idx):
         """提供商改变时更新模型列表"""
@@ -208,14 +233,12 @@ class SettingsDialog(QDialog):
             yaml_path = self.settings.config_dir / "settings.yaml"
             if yaml_path.exists():
                 content = yaml_path.read_text(encoding="utf-8")
-                # 更新 provider
                 import re
                 content = re.sub(
                     r'provider:\s*"[^"]*"',
                     f'provider: "{provider}"',
                     content
                 )
-                # 更新对应模型的默认值
                 if provider == "kimi":
                     content = re.sub(
                         r'kimi_model:\s*"[^"]*"',
@@ -228,12 +251,30 @@ class SettingsDialog(QDialog):
                         f'deepseek_model: "{model}"',
                         content
                     )
-                # 更新温度
                 content = re.sub(
                     r'temperature:\s*\d+\.?\d*',
                     f'temperature: {temperature}',
                     content
                 )
+                # 更新各阶段专用模型
+                for key, combo in [
+                    ("query_model", self.query_model_combo),
+                    ("screen_model", self.screen_model_combo),
+                    ("analysis_model", self.analysis_model_combo),
+                ]:
+                    val = combo.currentData() or ""
+                    if val:
+                        if re.search(fr'{key}:\s*"[^"]*"', content):
+                            content = re.sub(
+                                fr'{key}:\s*"[^"]*"',
+                                f'{key}: "{val}"',
+                                content)
+                        else:
+                            # 不存在则添加到 ai 段
+                            content = re.sub(
+                                r'(temperature:\s*\d+\.?\d*)',
+                                f'\\1\n  {key}: "{val}"',
+                                content)
                 yaml_path.write_text(content, encoding="utf-8")
         except Exception as e:
             QMessageBox.warning(self, "写入配置失败",
@@ -241,8 +282,17 @@ class SettingsDialog(QDialog):
 
         self.settings_saved.emit(provider, model, temperature)
         self.accept()
+        stages = []
+        for label, combo in [
+            ("检索式生成", self.query_model_combo),
+            ("筛选评分", self.screen_model_combo),
+            ("对比分析", self.analysis_model_combo),
+        ]:
+            v = combo.currentData()
+            stages.append(f"  {label}: {v if v else '（默认）'}")
         QMessageBox.information(self, "设置已保存",
             f"AI 引擎: {self.provider_combo.currentText()}\n"
-            f"模型: {model}\n"
+            f"默认模型: {model}\n"
             f"温度: {temperature:.2f}\n\n"
+            f"各阶段模型:\n" + "\n".join(stages) + "\n\n"
             "设置已写入 config/.env 和 config/settings.yaml，持续生效。")

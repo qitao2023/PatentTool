@@ -397,7 +397,8 @@ class MainWindow(QMainWindow):
         self._all_raw_results = None
         self._dedup_results = None
         self._current_worker = None
-        self._force_debug_search = False
+        # 注意: _force_debug_search 不在此重置，它由 _on_search_abstract 设置，
+        # 在 _on_all_searches_done 或 _run_search 中消费后重置。
 
         self.input_panel.reset()
         self.log_panel.reset()
@@ -421,21 +422,113 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_pdf_done(self, patent_doc):
         self._patent_doc = patent_doc
-        self.log_panel.append_log("SUCCESS", f"标题: {patent_doc.title}")
+        pub_num = patent_doc.publication_number or ""
 
-        # 确定输出目录（PDF 旁边，不可写时降级到 data/output/）
+        # 确定输出目录
         from src.utils.paths import get_output_dir
         self._output_dir = get_output_dir(self._pdf_path, patent_doc)
         self.log_panel.append_log("INFO",
             f"输出目录: {self._output_dir}")
 
-        # 继续：生成检索式
+        if pub_num:
+            force_refresh = self._user_params.get("force_refresh", False)
+            cache_path = None
+
+            # 检查本地缓存（除非强制刷新）
+            if self._pdf_path and not force_refresh:
+                import json
+                from src.web_automation.patentscope_scraper import is_cached_patent_valid
+                cache_path = Path(self._pdf_path).parent / f"本申请_{pub_num}.json"
+                if cache_path.exists():
+                    try:
+                        data = json.loads(cache_path.read_text(encoding="utf-8"))
+                        if is_cached_patent_valid(data):
+                            self.log_panel.append_log("INFO",
+                                f"本申请信息已缓存，直接使用: {cache_path.name}")
+                            self._on_main_lookup_done(data)
+                            return
+                        else:
+                            self.log_panel.append_log("WARN",
+                                "缓存数据不完整，重新查询...")
+                    except Exception:
+                        self.log_panel.append_log("WARN", "缓存文件损坏，重新查询...")
+
+            # 无缓存或强制刷新 → 从 PATENTSCOPE 在线获取
+            self.log_panel.append_log("INFO",
+                f"PDF中获取公布号: {pub_num}，从 PATENTSCOPE 联网查询完整信息...")
+            self._run_lookup_for_main(pub_num)
+        else:
+            # 无公布号 → 降级用 PDF 解析结果
+            self.log_panel.append_log("WARN",
+                "PDF中未找到公布号，使用PDF解析结果（可能不完整）")
+            self.log_panel.append_log("SUCCESS", f"标题: {patent_doc.title}")
+            self._run_query_generate(patent_doc)
+
+    def _run_lookup_for_main(self, pub_num: str):
+        """主流程中的公布号查詢：获取完整信息后继续"""
+        self.status_label.setText(f"正在 PATENTSCOPE 查询 {pub_num} 的完整信息...")
+        self._current_worker = PatentLookupWorker(
+            pub_num, self.settings)
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.lookup_done.connect(self._on_main_lookup_done)
+        w.start()
+
+    @Slot(dict)
+    def _on_main_lookup_done(self, data: dict):
+        """PATENTSCOPE 查全完成后，转换为 PatentDocument 继续流程"""
+        from src.pdf_extractor.extractor import PatentDocument
+
+        patent_doc = PatentDocument(
+            title=data.get("title", ""),
+            abstract=data.get("abstract", ""),
+            claims=self._parse_claims(data.get("claims", "")),
+            description=data.get("description", ""),
+            ipc_classifications=[data.get("ipc", "")] if data.get("ipc") else [],
+            applicants=[data.get("applicant", "")] if data.get("applicant") else [],
+            publication_number=data.get("publication_number", ""),
+            application_number=data.get("application_number", ""),
+            publication_date=data.get("publication_date", ""),
+            full_text_markdown=data.get("full_text", ""),
+        )
+        self._patent_doc = patent_doc
+
+        # 保存到 PDF 旁边的 JSON 文件
+        if self._pdf_path:
+            import json
+            pdf_dir = Path(self._pdf_path).parent
+            pub = patent_doc.publication_number or "unknown"
+            info_path = pdf_dir / f"本申请_{pub}.json"
+            info_path.write_text(json.dumps(data, indent=2,
+                ensure_ascii=False, default=str), encoding="utf-8")
+            self.log_panel.append_log("INFO",
+                f"本申请信息已保存: {info_path}")
+
+        self.log_panel.append_log("SUCCESS",
+            f"标题: {patent_doc.title} | "
+            f"权利要求: {len(patent_doc.claims)}项 | "
+            f"IPC: {', '.join(patent_doc.ipc_classifications)}")
+        # 继续生成检索式
         self._run_query_generate(patent_doc)
 
+    @staticmethod
+    def _parse_claims(claims_text: str) -> list[str]:
+        """将权利要求的纯文本按编号拆分为列表"""
+        import re
+        if not claims_text:
+            return []
+        # 按 [权利要求 N] 或 数字. 拆分
+        parts = re.split(r'(?:\[权利要求\s*\d+\]|\n(?=\d+[.、．]))', claims_text)
+        result = [p.strip() for p in parts if p.strip() and len(p.strip()) > 5]
+        return result if result else [claims_text]
+
     def _run_query_generate(self, patent_doc):
-        ai_provider = self._user_params.get("ai_provider", "deepseek")
+        ai_provider = self.settings.ai_query_provider or self._user_params.get("ai_provider", "deepseek")
         max_queries = self._user_params.get("max_queries", 3)
-        self.status_label.setText(f"正在生成 {max_queries} 个检索式...")
+        self.status_label.setText(f"正在生成 {max_queries} 个检索式 ({ai_provider})...")
         self._current_worker = QueryGenerateWorker(
             patent_doc, self.settings,
             ai_provider=ai_provider, max_queries=max_queries)
@@ -466,12 +559,19 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条, "
             f"下载上限{fetch_detail}篇)...")
+        # 共享缓存目录（PDF 同级，多次运行共用）
+        cache_dir = None
+        if self._pdf_path:
+            cache_dir = Path(self._pdf_path).parent / "patent_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
         self._current_worker = PatentscopeSearchAndFetchWorker(
             queries, self.settings,
             patent_doc=self._patent_doc,
             max_fetch=fetch_detail,           # 全文下载上限（UI控制）
             output_dir=self._output_dir,
-            debug_search_only=debug_search_only)
+            cache_dir=str(cache_dir) if cache_dir else None,
+            debug_search_only=debug_search_only,
+            include_citations=self._user_params.get("include_citations", True))
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)

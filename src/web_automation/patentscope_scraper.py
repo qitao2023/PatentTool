@@ -29,15 +29,77 @@ class PatentscopeScraper:
         all_items = []
         await self._navigate_and_search(query, signals)
         self._results_url = self.page.url
-        # 切换每页 200 条
+
+        # 只有1条结果 → PATENTSCOPE 直接跳到详情页
+        if "detail.jsf" in self.page.url:
+            import re as _re
+            m = _re.search(r'docId=([^&]+)', self.page.url)
+            doc_id = m.group(1) if m else ""
+            if signals:
+                signals.log.emit("INFO", f"  仅1条结果，直接进入详情页: {doc_id}")
+            # 从详情页提取摘要信息
+            try:
+                detail = await self._extract_detail_page(doc_id)
+                item = {
+                    "doc_id": doc_id,
+                    "publication_number": detail.get("publication_number", doc_id),
+                    "title": detail.get("title", ""),
+                    "abstract_snippet": (detail.get("abstract") or "")[:300],
+                    "ipc": detail.get("ipc", ""),
+                    "applicant": detail.get("applicant", ""),
+                    "source_query": query,
+                }
+                all_items.append(item)
+            except Exception as e:
+                if signals:
+                    signals.log.emit("WARN", f"  详情页提取失败: {e}")
+            if signals:
+                signals.log.emit("SUCCESS", f"  摘要检索完成: {len(all_items)} 篇")
+            return all_items
+
+        # 切换每页 200 条（仅在循环前设置一次）
         await self._set_max_page_size(signals)
 
+        # 解析首页并检测总结果数
+        await self._wait_for_results()
+        page_items = await self._parse_results_table()
+        if not page_items:
+            if signals:
+                signals.log.emit("WARN", "  首页未解析到结果")
+            return all_items
+
+        total_count = await self._get_total_result_count()
+        if signals:
+            signals.log.emit("INFO",
+                f"  首页解析: {len(page_items)} 条, 检索总结果: {total_count or '?'} 条")
+
+        remaining = min(len(page_items), max_results)
+        all_items.extend(page_items[:remaining])
+
+        # 总数 ≤ 每页条数(200) → 全部在一页内，无需翻页
+        if total_count and total_count <= 200:
+            if signals:
+                signals.log.emit("INFO",
+                    f"  总结果 {total_count} ≤ 200，无需翻页")
+                signals.log.emit("SUCCESS",
+                    f"  摘要检索完成: {len(all_items)} 篇")
+            return all_items
+
+        # 总数 > 200 或无法获取总数 → 需要翻页
         page_num = 1
+        prev_ids = {a.get("doc_id", "") for a in page_items}
         while len(all_items) < max_results:
             if signals:
                 signals.progress.emit(
                     int(10 + len(all_items) / max_results * 20) if max_results else 30,
                     f"解析结果页 {len(all_items)}/{max_results}")
+
+            if signals:
+                signals.log.emit("INFO", "  翻到下一页...")
+            has_next = await self._go_to_next_page()
+            if not has_next:
+                break
+            page_num += 1
 
             await self._wait_for_results()
             page_items = await self._parse_results_table()
@@ -47,22 +109,39 @@ class PatentscopeScraper:
                     signals.log.emit("WARN", f"  第{page_num}页未解析到结果")
                 break
 
+            # 检测翻页重复：本页全部 doc_id 都在上一页出现过
+            this_ids = {a.get("doc_id", "") for a in page_items}
+            if this_ids and prev_ids and this_ids.issubset(prev_ids):
+                if signals:
+                    signals.log.emit("INFO",
+                        f"  第{page_num}页与上页重复，已是最后一页（共{len(all_items)}条）")
+                break
+            prev_ids = this_ids
+
+            # 过滤已获取的条目，避免 pageSize 变化导致重复
+            existing_ids = {a.get("doc_id", "") for a in all_items}
+            new_items = [item for item in page_items
+                         if item.get("doc_id", "") not in existing_ids]
+            if not new_items:
+                if signals:
+                    signals.log.emit("INFO",
+                        f"  第{page_num}页全部重复，已是最后一页（共{len(all_items)}条）")
+                break
+
             remaining = max_results - len(all_items)
-            all_items.extend(page_items[:remaining])
+            took = min(len(new_items), remaining)
+            all_items.extend(new_items[:remaining])
 
             if signals:
-                signals.log.emit("INFO",
-                    f"  结果页解析: {len(page_items)} 条, 累计 {len(all_items)}/{max_results}")
+                if took < len(new_items):
+                    signals.log.emit("INFO",
+                        f"  结果页解析: {len(new_items)} 条(取{took}条), 累计 {len(all_items)}/{max_results}")
+                else:
+                    signals.log.emit("INFO",
+                        f"  结果页解析: {len(new_items)} 条, 累计 {len(all_items)}/{max_results}")
 
             if len(all_items) >= max_results:
                 break
-
-            if signals:
-                signals.log.emit("INFO", "  翻到下一页...")
-            has_next = await self._go_to_next_page()
-            if not has_next:
-                break
-            page_num += 1
 
         if signals:
             signals.log.emit("SUCCESS", f"  摘要检索完成: {len(all_items)} 篇")
@@ -138,7 +217,7 @@ class PatentscopeScraper:
 
         doc_ids = list(meta_map.keys())
 
-        # 断点续传：跳过已存在的文件
+        # 断点续传：跳过已存在且内容有效的文件
         remaining = []
         skipped = 0
         for did in doc_ids:
@@ -147,7 +226,7 @@ class PatentscopeScraper:
             if fpath.exists():
                 try:
                     existing = json_module.loads(fpath.read_text(encoding="utf-8"))
-                    if existing.get("fetch_status") == "ok":
+                    if is_cached_patent_valid(existing):
                         skipped += 1
                         continue
                 except Exception:
@@ -279,6 +358,9 @@ class PatentscopeScraper:
 
         页面布局: 「相关性」<select> | 「每页:」<select> | 「查看:」
         找到包含选项"200"的 select 即目标。
+
+        切换后 PATENTSCOPE 通过 JSF AJAX 重新加载结果表格。
+        必须等待网络空闲 + DOM 稳定后再返回，否则会解析到旧页面的残留数据。
         """
         try:
             all_selects = await self.page.locator("select").all()
@@ -296,16 +378,39 @@ class PatentscopeScraper:
                             continue
                     # 包含 200 就是分页下拉框
                     if 200 in vals:
+                        # 如果已经是 200，无需切换
+                        try:
+                            current_val = await loc.input_value()
+                            if current_val == "200":
+                                if signals:
+                                    signals.log.emit("INFO",
+                                        "  每页已是 200 条，无需切换")
+                                return
+                        except Exception:
+                            pass
+
                         await loc.select_option(value="200")
                         if signals:
                             signals.log.emit("INFO", "  切换每页条数: 200 条")
-                        await asyncio.sleep(3)
+
+                        # 等待 JSF AJAX 请求完成后再解析
+                        # networkidle 确保 POST 响应已写入 DOM
+                        try:
+                            await self.page.wait_for_load_state(
+                                "networkidle", timeout=15000)
+                        except Exception:
+                            await asyncio.sleep(3)
+
+                        # 等待结果表格出现
                         try:
                             await self.page.wait_for_selector(
                                 ".ps-patent-result, .trans-result-list-row",
                                 timeout=10000)
                         except Exception:
                             pass
+
+                        # 额外稳定：等 JSF DOM diff/patch 彻底完成
+                        await asyncio.sleep(1)
                         return
                 except Exception:
                     continue
@@ -389,6 +494,42 @@ class PatentscopeScraper:
             return results;
         }''')
         return items
+
+    async def _get_total_result_count(self) -> int | None:
+        """从 PATENTSCOPE 结果页提取总结果数。
+
+        尝试多种 DOM 位置和文本模式，返回整数或 None。
+        """
+        try:
+            count = await self.page.evaluate('''() => {
+                var body = (document.body && document.body.innerText) || "";
+                // 模式1: "共 N 条" / "共找到 N 条" / "共 N 条结果"
+                var m = body.match(/共\s*找到?\s*(\d[\d,]*)\s*条/);
+                if (m) return parseInt(m[1].replace(/,/g, ""));
+                // 模式2: "Results: N" / "N results"
+                m = body.match(/Results?:?\s*(\d[\d,]*)/i);
+                if (m) return parseInt(m[1].replace(/,/g, ""));
+                // 模式3: "N of N" 取后面的 N（如 "1-200 of 523"）
+                m = body.match(/of\s+(\d[\d,]*)/i);
+                if (m) return parseInt(m[1].replace(/,/g, ""));
+                // 模式4: pagination 元素中的总数
+                var paginators = document.querySelectorAll(
+                    ".ui-paginator-current, .ps-paginator-total, " +
+                    "[class*='result-count'], [class*='total-count'], " +
+                    "[class*='pagination-total']");
+                for (var i = 0; i < paginators.length; i++) {
+                    var t = paginators[i].textContent;
+                    var m2 = t.match(/(\d[\d,]*)/);
+                    if (m2) {
+                        var n = parseInt(m2[1].replace(/,/g, ""));
+                        if (n > 0) return n;
+                    }
+                }
+                return null;
+            }''')
+            return count if count and count > 0 else None
+        except Exception:
+            return None
 
     # ================================================================
     # 详情页提取
@@ -616,6 +757,22 @@ class PatentscopeScraper:
             return text or ""
         except Exception:
             return ""
+
+
+# ── 缓存验证 ──────────────────────────────────────────────────────
+
+_INVALID_TITLES = {"", "(54)发明名称", "(54)", "发明名称", "无标题"}
+
+def is_cached_patent_valid(data: dict) -> bool:
+    """验证缓存的专利 JSON 是否包含有效内容"""
+    try:
+        title = (data.get("title") or "").strip()
+        claims = (data.get("claims") or "").strip()
+        pub = (data.get("publication_number") or "").strip()
+        # 必须有公布号 + 有效标题 + 权利要求内容
+        return bool(pub and title not in _INVALID_TITLES and len(claims) > 20)
+    except Exception:
+        return False
 
 
 # ── WO 全文切分工具 ──────────────────────────────────────────────────────

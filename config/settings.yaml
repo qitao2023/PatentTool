@@ -10,15 +10,21 @@ pdf:
 
 # AI 引擎配置
 ai:
-  provider: "deepseek"                      # "deepseek" 或 "kimi"
-  deepseek_model: "deepseek-v4-flash"       # 或 deepseek-v4-pro（旗舰）
-  kimi_model: "kimi-k3"                     # 或 kimi-k2.6 / kimi-k2.7-code
-  temperature: 0.4
+  provider: "kimi"                      # 默认提供商 "deepseek" 或 "kimi"
+  deepseek_model: "deepseek-v4-flash"       # 默认模型
+  kimi_model: "kimi-k3"                     # kimi-k3 / kimi-k2.6
+  temperature: 1.0
+  # 检索式生成可单独用不同提供商和模型
+  query_provider: "kimi"                    # 检索式专用提供商（不设则用 provider）
+  query_model: "kimi-k3"                    # 检索式模型
+  # 其他阶段模型
+  screen_model: "deepseek-v4-flash"         # 筛选/评分（推荐快速模型）
+  analysis_model: "deepseek-v4-flash"       # 对比分析
 
 # 检索式生成
 query_generation:
   max_queries: 10
-  max_tokens: 4096
+  max_tokens: 8192
 
 # Web自动化
 web:

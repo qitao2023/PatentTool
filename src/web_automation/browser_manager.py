@@ -69,7 +69,6 @@ class BrowserManager:
             launch_args.append("--headless=new")
 
         self._browser = await self._playwright.chromium.launch(
-            channel="msedge",
             headless=headless,
             args=launch_args,
         )

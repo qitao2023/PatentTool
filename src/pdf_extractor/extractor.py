@@ -68,6 +68,9 @@ class PatentPDFExtractor:
         full_text = "\n===== Page {} =====\n".format(1) + \
                     "\n===== Page {} =====\n".join(full_text_pages)
 
+        # 第一页文本（用于提取元数据，避免引文干扰）
+        first_page_text = full_text_pages[0] if full_text_pages else ""
+
         # 逐页格式化（保留页码标记方便LLM理解）
         pages_md = []
         for i, page in enumerate(doc):
@@ -94,8 +97,12 @@ class PatentPDFExtractor:
         except ImportError:
             pass  # 已使用基础文本
 
-        # 解析各字段
-        self._parse_metadata(full_text, patent)
+        # 元数据只从第一页提取（公布号/申请号/申请人等不会出现在后续页码）
+        self._parse_metadata(first_page_text, patent)
+        # 如果第一页没找到公布号，扩大到前两页
+        if not patent.publication_number and len(full_text_pages) >= 2:
+            self._parse_metadata(first_page_text + "\n" + full_text_pages[1], patent)
+        # 段落从全文提取
         self._parse_sections(full_text, patent)
 
         return patent

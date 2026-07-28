@@ -114,6 +114,13 @@ class InputPanel(QWidget):
         param_row.addWidget(self.fetch_detail_spin)
         param_row.addStretch(1)
 
+        param_row.addSpacing(20)
+        self.include_citations_cb = QCheckBox("从说明书提取引用专利")
+        self.include_citations_cb.setChecked(True)
+        self.include_citations_cb.setToolTip(
+            "自动提取说明书中引用的专利号，一并下载加入对比文件")
+        param_row.addWidget(self.include_citations_cb)
+
         self.ai_label = QLabel("DeepSeek")
         self.ai_label.setObjectName("aiProviderLabel")
         param_row.addWidget(self.ai_label)
@@ -221,6 +228,10 @@ class InputPanel(QWidget):
         self.debug_search_only_cb.setToolTip(
             "勾选后全部检索式搜索完就停止，不下载全文、不AI评分")
         test_row2.addWidget(self.debug_search_only_cb)
+        self.force_refresh_cb = QCheckBox("强制重新获取本申请")
+        self.force_refresh_cb.setToolTip(
+            "勾选后忽略本地缓存，重新从 PATENTSCOPE 获取本申请完整信息")
+        test_row2.addWidget(self.force_refresh_cb)
         test_outer.addLayout(test_row2)
 
         layout.addWidget(self.test_frame)
@@ -352,6 +363,8 @@ class InputPanel(QWidget):
             "fetch_detail": self.fetch_detail_spin.value(),
             "ai_provider": self._ai_provider,
             "debug_search_only": self.debug_search_only_cb.isChecked(),
+            "force_refresh": self.force_refresh_cb.isChecked(),
+            "include_citations": self.include_citations_cb.isChecked(),
         }
 
     def set_ai_provider(self, provider: str):
@@ -370,6 +383,8 @@ class InputPanel(QWidget):
         self.test_abstract_btn.setEnabled(not running)
         self.test_btn.setEnabled(not running)
         self.lookup_btn.setEnabled(not running)
+        self.force_refresh_cb.setEnabled(not running)
+        self.include_citations_cb.setEnabled(not running)
 
     def reset(self):
         self.path_edit.clear()
@@ -380,3 +395,4 @@ class InputPanel(QWidget):
         self.test_frame.setVisible(False)
         self._test_visible = False
         self.test_toggle_btn.setChecked(False)
+        self.force_refresh_cb.setChecked(False)

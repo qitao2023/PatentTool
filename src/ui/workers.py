@@ -311,14 +311,18 @@ class PatentscopeSearchAndFetchWorker(QThread):
     def __init__(self, queries: list, settings: Settings,
                  patent_doc=None, max_fetch: int = 200,
                  top_n: int = 25, output_dir=None,
-                 debug_search_only: bool = False, parent=None):
+                 cache_dir: str | None = None,
+                 debug_search_only: bool = False,
+                 include_citations: bool = True, parent=None):
         super().__init__(parent)
         self.queries = queries
         self.settings = settings
         self.patent_doc = patent_doc
         self.max_fetch = max_fetch          # 全文下载上限
         self._given_output_dir = output_dir
+        self._cache_dir = cache_dir         # 共享专利缓存目录
         self.debug_search_only = debug_search_only
+        self.include_citations = include_citations
         self.signals = WorkerSignals()
         self._is_running = True
         self.output_dir = None
@@ -343,7 +347,8 @@ class PatentscopeSearchAndFetchWorker(QThread):
         from datetime import datetime
         from src.web_automation.browser_manager import BrowserManager
         from src.web_automation.human_behavior import HumanBehavior
-        from src.web_automation.patentscope_scraper import PatentscopeScraper
+        from src.web_automation.patentscope_scraper import (
+            PatentscopeScraper, is_cached_patent_valid, _safe_filename)
         from src.analysis.screener import PatentScreener
 
         # ── 输出目录 ──────────────────────────────────────────────
@@ -401,6 +406,11 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
             self.signals.log.emit("SUCCESS",
                 f"检索式{idx+1}: 获取 {len(abstracts)} 篇摘要")
+            # 每条检索式结果单独存盘
+            self._save_json(
+                output_dir / f"01_query_{idx+1:02d}_abstracts.json",
+                {"query": q_str, "search_angle": angle,
+                 "count": len(abstracts), "results": abstracts})
 
             if idx < len(self.queries) - 1 and self._is_running:
                 await human.inter_search_delay(idx + 1)
@@ -457,6 +467,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 resp = client.chat(
                     system_prompt="将以下 PATENTSCOPE 检索式简化为更短更宽泛的版本，只返回简化后的检索式，不要其他内容。",
                     user_prompt=f"原检索式无结果，请简化：{q_str}",
+                    model=self.settings.ai_query_model,
                     max_tokens=256, temperature=0.3)
                 simplified_q = resp.strip().strip('"').strip("'")
                 simplified.append({"query_string": simplified_q, "search_angle": q.get("search_angle","重试"), "priority": q.get("priority",1)})
@@ -477,6 +488,9 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 for a in abstracts:
                     a["source_query"] = q_str
                 all_abstracts.append(abstracts)
+                self._save_json(
+                    output_dir / f"01_query_retry{retry_count}_{idx+1:02d}_abstracts.json",
+                    {"query": q_str, "count": len(abstracts), "results": abstracts})
                 if idx < len(simplified) - 1:
                     await human.inter_search_delay(idx + 1)
             await browser_mgr.close()
@@ -515,6 +529,90 @@ class PatentscopeSearchAndFetchWorker(QThread):
             self.signals.finished.emit(True, "检索摘要完成")
             return
 
+        # ── 从说明书提取引用专利 ─────────────────────────────────────
+        if self.include_citations and self.patent_doc and self.patent_doc.description:
+            cited_pubs = _extract_cited_patent_numbers(self.patent_doc.description)
+            # 排除目标专利自身
+            target_pn = (self.patent_doc.publication_number or "").replace(" ", "")
+            cited_pubs = [p for p in cited_pubs if _normalize_pn(p) != _normalize_pn(target_pn)]
+            # 排除已在搜索结果中的
+            existing_pubs = {_normalize_pn(a.get("publication_number", "")) for a in unique_abstracts}
+            new_pubs = [p for p in cited_pubs if _normalize_pn(p) not in existing_pubs]
+            new_pubs = list(dict.fromkeys(new_pubs))  # 去重保序
+
+            if new_pubs:
+                self.signals.log.emit("INFO", "=" * 40)
+                self.signals.log.emit("INFO",
+                    f"从说明书提取引用专利: 共 {len(cited_pubs)} 个, "
+                    f"新增 {len(new_pubs)} 个, 开始下载...")
+                self.signals.progress.emit(28, f"下载引用专利 ({len(new_pubs)}个)...")
+
+                cache_dir = Path(self._cache_dir) if self._cache_dir else output_dir / "02_patent_details"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+
+                browser_mgr1 = BrowserManager(self.settings)
+                context1, page1 = await browser_mgr1.launch_with_retry(max_retries=2)
+                human1 = HumanBehavior(self.settings)
+                scraper1 = PatentscopeScraper(page1, self.settings, human1)
+
+                added = 0
+                for i, pub in enumerate(new_pubs):
+                    if not self._is_running:
+                        break
+                    # 检查缓存
+                    safe = _safe_filename(pub)
+                    cache_path = cache_dir / f"{safe}.json"
+                    if cache_path.exists():
+                        try:
+                            existing = json_module.loads(cache_path.read_text(encoding="utf-8"))
+                            if is_cached_patent_valid(existing):
+                                item = {
+                                    "doc_id": existing.get("doc_id", pub),
+                                    "publication_number": existing.get("publication_number", pub),
+                                    "title": existing.get("title", ""),
+                                    "abstract_snippet": (existing.get("abstract") or "")[:300],
+                                    "ipc": existing.get("ipc", ""),
+                                    "applicant": existing.get("applicant", ""),
+                                    "source_query": f"说明书引用: {pub}",
+                                }
+                                unique_abstracts.append(item)
+                                added += 1
+                                continue
+                        except Exception:
+                            pass
+
+                    # 缓存未命中 → 联网获取
+                    self.signals.log.emit("INFO",
+                        f"  下载引用专利 [{i+1}/{len(new_pubs)}]: {pub}")
+                    try:
+                        detail = await scraper1.fetch_detail(pub)
+                        if detail:
+                            # 保存到缓存
+                            cache_path.write_text(
+                                json_module.dumps(detail, indent=2, ensure_ascii=False, default=str),
+                                encoding="utf-8")
+                            item = {
+                                "doc_id": detail.get("doc_id", pub),
+                                "publication_number": detail.get("publication_number", pub),
+                                "title": detail.get("title", ""),
+                                "abstract_snippet": (detail.get("abstract") or "")[:300],
+                                "ipc": detail.get("ipc", ""),
+                                "applicant": detail.get("applicant", ""),
+                                "source_query": f"说明书引用: {pub}",
+                            }
+                            unique_abstracts.append(item)
+                            added += 1
+                        else:
+                            self.signals.log.emit("WARN", f"    未能获取: {pub}")
+                    except Exception as e:
+                        self.signals.log.emit("WARN", f"    下载失败: {pub} - {e}")
+                    await asyncio.sleep(1.0)  # 串行，避免限流
+
+                await browser_mgr1.close()
+                self.signals.log.emit("SUCCESS",
+                    f"引用专利下载完成: 新增 {added} 篇, 累计 {len(unique_abstracts)} 篇")
+                total_abstracts = len(unique_abstracts)
+
         # ================================================================
         # 阶段2: 超过上限时 AI 快速粗筛（一批搞定，只返回公布号列表）
         # ================================================================
@@ -540,14 +638,14 @@ class PatentscopeSearchAndFetchWorker(QThread):
             to_fetch = unique_abstracts
 
         # ================================================================
-        # 阶段3: 并行下载完整详情
+        # 阶段3: 串行下载完整详情 → 共享缓存
         # ================================================================
         self.signals.log.emit("INFO", "=" * 40)
         self.signals.log.emit("INFO",
-            f"阶段3: 并行下载 {len(to_fetch)} 篇完整详情...")
-        self.signals.progress.emit(30, "阶段3: 启动浏览器并行下载...")
+            f"阶段3: 下载 {len(to_fetch)} 篇完整详情 → {self._cache_dir or 'output'}")
+        self.signals.progress.emit(30, "阶段3: 启动浏览器下载...")
 
-        details_dir = output_dir / "02_patent_details"
+        details_dir = Path(self._cache_dir) if self._cache_dir else output_dir / "02_patent_details"
 
         browser_mgr2 = BrowserManager(self.settings)
         context2, page2 = await browser_mgr2.launch_with_retry(max_retries=2)
@@ -733,6 +831,34 @@ def _strip_country_prefix(pn: str) -> str:
     """去掉国家前缀: CN116110953 → 116110953"""
     import re as _re
     return _re.sub(r'^[A-Z]{2}', '', pn)
+
+
+def _extract_cited_patent_numbers(text: str) -> list[str]:
+    """从说明书文本中提取引用专利号。
+
+    支持格式: CN110000000A, US12345678B2, WO2020000000A1,
+             EP12345678A1, JP2020000000A, KR1020200000000A 等
+    """
+    import re
+    if not text:
+        return []
+    patterns = [
+        r'\bCN\s*\d{7,13}[A-Z]?\d*\b',    # 中国
+        r'\bUS\s*\d{4,11}[A-Z]?\d*\b',    # 美国
+        r'\bWO\s*\d{2,4}[/-]?\d{4,8}[A-Z]?\d*\b',  # PCT
+        r'\bEP\s*\d{4,11}[A-Z]?\d*\b',    # 欧洲
+        r'\bJP\s*\d{4,11}[A-Z]?\d*\b',    # 日本
+        r'\bKR\s*\d{4,11}[A-Z]?\d*\b',    # 韩国
+    ]
+    seen = set()
+    results = []
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            pn = m.group(0).replace(" ", "").replace("/", "").replace("-", "").upper()
+            if pn not in seen:
+                seen.add(pn)
+                results.append(pn)
+    return results
 
 
 class PatentFetchWorker(QThread):
