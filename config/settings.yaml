@@ -10,21 +10,23 @@ pdf:
 
 # AI 引擎配置
 ai:
-  provider: "kimi"                      # 默认提供商 "deepseek" 或 "kimi"
-  deepseek_model: "deepseek-v4-flash"       # 默认模型
+  provider: "deepseek"                      # 默认提供商 "deepseek" 或 "kimi"
+  deepseek_model: "deepseek-v4-pro"       # 默认模型
   kimi_model: "kimi-k3"                     # kimi-k3 / kimi-k2.6
-  temperature: 1.0
+  temperature: 0.4
   # 检索式生成可单独用不同提供商和模型
-  query_provider: "kimi"                    # 检索式专用提供商（不设则用 provider）
-  query_model: "kimi-k3"                    # 检索式模型
+  query_provider: "deepseek"                    # 检索式专用提供商（不设则用 provider）
+  query_model: "deepseek-v4-pro"                    # 检索式模型
   # 其他阶段模型
   screen_model: "deepseek-v4-flash"         # 筛选/评分（推荐快速模型）
   analysis_model: "deepseek-v4-flash"       # 对比分析
 
 # 检索式生成
 query_generation:
-  max_queries: 10
+  max_queries: 20
   max_tokens: 8192
+  max_description_chars: 5000      # 说明书截断长度（保留发明内容 + 实施方式前段）
+  prompt_profile: "semiconductor"    # 提示词方案: "default" 或 "semiconductor"
 
 # Web自动化
 web:
@@ -65,34 +67,6 @@ patentscope:
     detail_link: "a[href*='detail']"
     next_page_link: "a[id*='nextPage'], a:has-text('Next')"
     results_count: ".results-count"
-
-# HimmPat 配置（保留备用）
-himmpat:
-  base_url: "https://global.himmpat.com"
-  search_url: "https://global.himmpat.com/intelligence?active=6"
-  login_url: "https://global.himmpat.com/login"   # 会自动跳转到 rd.himmpat.com 完成登录
-  login_mode: "auto"            # "manual" 或 "auto"
-  max_results_per_query: 50
-  results_per_page: 20            # 观察后调整
-
-  # 元素选择器（观察HimmPat后调整）
-  selectors:
-    search_input: "textarea[placeholder*='技术'], [placeholder*='技术']"
-    search_button: "button.search-btn"
-    result_container: ".result-list"
-    result_row: ".patent-item"
-    patent_number: ".patent-number"
-    title: ".patent-title"
-    abstract: ".patent-abstract"
-    applicant: ".patent-applicant"
-    inventor: ".patent-inventor"
-    pub_date: ".patent-date"
-    ipc: ".patent-ipc"
-    next_page: ".pagination-next"
-    login_username: "input[name='username']"
-    login_password: "input[type='password']"
-    login_submit: "button[type='submit']"
-    user_avatar: ".user-avatar, .user-info"
 
 # 人类行为模拟
 human:

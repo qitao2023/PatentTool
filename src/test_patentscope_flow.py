@@ -5,10 +5,9 @@ PATENTSCOPE 全流程连接测试脚本
   1. 浏览器启动（无需登录）
   2. 搜索页结构分析
   3. 执行搜索 + 检查结果
-  4. 详情页提取
-  5. 返回结果列表
-  6. 分页测试
-  7. 总结报告
+  4. 切换 200 条/页 + 取第1页摘要
+  5. 翻到第2页 + 取第2页摘要
+  6. 总结报告
 
 用法:
   python -m src.test_patentscope_flow [检索式]
@@ -18,6 +17,12 @@ import asyncio
 import sys
 import time
 from pathlib import Path
+
+# Windows 终端 UTF-8 编码
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
+                                   errors="replace", line_buffering=True)
 
 # 确保项目根目录在 sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -74,9 +79,9 @@ async def main():
 
         search_url = settings.patentscope_search_url
         print(f"  导航到: {search_url}")
-        await page.goto(search_url, timeout=60000, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle", timeout=30000)
-        await asyncio.sleep(2)
+        await page.goto(search_url, timeout=60000, wait_until="load")
+        # JSF 页面可能有初始化跳转，等足够长让页面稳定
+        await asyncio.sleep(5)
 
         # 检测关键元素
         elements = await page.evaluate(
@@ -141,53 +146,21 @@ async def main():
         except Exception:
             print(f"  ⚠️ 未跳转到 result.jsf，当前 URL: {page.url}")
 
-        await page.wait_for_load_state("networkidle", timeout=60000)
+        await page.wait_for_load_state("domcontentloaded", timeout=60000)
         await asyncio.sleep(3)
         print()
 
         # ============ Step 4: 检查结果表格 ============
         print("=" * 60)
-        print("  Step 4: 检查结果列表")
+        print("  Step 4: 检查搜索结果")
         print("=" * 60)
 
-        # 检查结果数
-        count_text = await page.evaluate(
-            """() => {
-            var el = document.querySelector(".results-count");
-            if (el) return el.textContent.trim();
+        result_count = await page.evaluate(
+            "() => document.querySelectorAll("
+            "'tr.trans-result-list-row, .ps-patent-result').length")
+        print(f"  当前页条目: {result_count}")
 
-            var body = document.body.innerText || "";
-            var match = body.match(/(\\d[\\d,]*)\\s+results?/i);
-            return match ? match[1] : "N/A";
-        }"""
-        )
-        print(f"  搜索结果数: {count_text}")
-
-        # 解析结果条目
-        result_items = await page.evaluate(
-            """() => {
-            var rows = document.querySelectorAll("tr.trans-result-list-row, .ps-patent-result");
-            var items = [];
-            rows.forEach(function(row) {
-                var numEl = row.querySelector(".ps-patent-result--title--patent-number");
-                var titleEl = row.querySelector(".ps-patent-result--title--title");
-                var linkEl = row.querySelector("a[href*='detail']");
-                items.push({
-                    number: numEl ? numEl.textContent.trim() : "?",
-                    title: titleEl ? titleEl.textContent.trim().substring(0, 100) : "?",
-                    detailUrl: linkEl ? linkEl.href : ""
-                });
-            });
-            return items;
-        }"""
-        )
-
-        print(f"  结果条目数: {len(result_items)}")
-        for i, item in enumerate(result_items[:5]):
-            print(f"    [{i+1}] {item['number']}")
-            print(f"        {item['title'][:80]}")
-
-        if len(result_items) == 0:
+        if result_count == 0:
             print("  ❌ 没有发现结果条目，测试终止")
             await context.close()
             await browser.close()
@@ -195,126 +168,68 @@ async def main():
 
         print()
 
-        # ============ Step 5: 详情页提取测试 ============
+        # ============ Step 5: 切到 200 并取第1页摘要 ============
         print("=" * 60)
-        print("  Step 5: 详情页提取测试（取第一条）")
+        print("  Step 5: 切换 200 条/页，取第1页摘要")
         print("=" * 60)
 
-        first_item = result_items[0]
-        first_url = first_item.get("detailUrl", "")
+        from src.web_automation.patentscope_scraper import PatentscopeScraper
 
-        if not first_url:
-            print("  ❌ 没有详情页链接")
-        else:
-            print(f"  详情URL: {first_url[:150]}")
+        human = HumanBehavior(settings)
+        scraper = PatentscopeScraper(page, settings, human)
 
-            # 提取 docId
-            import re
+        # 切换分页大小
+        rows_before = await scraper._count_result_rows()
+        print(f"  切换前行数: {rows_before}")
 
-            doc_match = re.search(r"docId=([^&]+)", first_url)
-            doc_id = doc_match.group(1) if doc_match else "UNKNOWN"
-            print(f"  docId: {doc_id}")
+        await scraper._set_max_page_size()
+        stable = await scraper._wait_for_results_stable(label="切换200")
+        total = scraper._total_from_page_text
+        print(f"  切换后稳定行数: {stable}  (总结果: {total or '?'})")
 
-            # 导航到详情页
-            await page.goto(first_url, timeout=30000, wait_until="domcontentloaded")
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await asyncio.sleep(2)
-
-            # 提取数据
-            detail = await page.evaluate(
-                """() => {
-                var result = {};
-                var h1 = document.querySelector("h1");
-                if (h1) result.title = h1.textContent.trim().substring(0, 150);
-
-                var body = document.body.innerText || "";
-                result.bodyLength = body.length;
-
-                // 查找关键字段
-                var rows = document.querySelectorAll("table tr, .ps-field");
-                rows.forEach(function(row) {
-                    var text = row.textContent.trim();
-                    if (text.startsWith("IPC")) result.ipc = text.substring(0, 200);
-                    if (text.startsWith("Applicant")) result.applicant = text.substring(0, 200);
-                    if (text.startsWith("Inventor")) result.inventor = text.substring(0, 200);
-                    if (text.startsWith("Publication Date")) result.pubDate = text.substring(0, 100);
-                });
-
-                // 摘要
-                var absEl = document.querySelector("[class*='abstract'], [id*='abstract']");
-                if (absEl) result.abstract = absEl.textContent.trim().substring(0, 300);
-
-                return result;
-            }"""
-            )
-
-            print(f"  标题: {detail.get('title', 'N/A')}")
-            print(f"  IPC: {detail.get('ipc', 'N/A')[:100]}")
-            print(f"  申请人: {detail.get('applicant', 'N/A')[:100]}")
-            print(f"  发明人: {detail.get('inventor', 'N/A')[:100]}")
-            print(f"  公开日: {detail.get('pubDate', 'N/A')[:100]}")
-            print(f"  摘要: {detail.get('abstract', 'N/A')[:150]}")
-            print(f"  正文长度: {detail.get('bodyLength', 0)}")
-
-            # ============ Step 6: 返回结果列表 ============
-            print()
-            print("=" * 60)
-            print("  Step 6: 返回结果列表")
-            print("=" * 60)
-
-            try:
-                await page.go_back(timeout=15000)
-                await page.wait_for_load_state("networkidle", timeout=30000)
-                await asyncio.sleep(2)
-                back_ok = "result.jsf" in page.url
-                print(f"  {'✅' if back_ok else '❌'} 返回后URL: {page.url}")
-            except Exception as e:
-                print(f"  ❌ go_back 失败: {e}")
+        # 取第1页摘要
+        await scraper._wait_for_results()
+        page1_items = await scraper._parse_results_table()
+        print(f"  第1页摘要: {len(page1_items)} 篇")
+        for i, item in enumerate(page1_items[:3]):
+            pn = item.get('publication_number', '?')
+            title = (item.get('title') or '?')[:60]
+            print(f"    [{i+1}] {pn}  {title}")
 
         print()
 
-        # ============ Step 7: 分页测试 ============
+        # ============ Step 6: 翻到第2页，取摘要 ============
         print("=" * 60)
-        print("  Step 7: 分页测试")
+        print("  Step 6: 翻到第2页，取摘要")
         print("=" * 60)
 
-        has_next = await page.evaluate(
-            """() => {
-            var nextBtn = document.querySelector(
-                "a[id*='nextPage'], a[id*='navigationNext'], " +
-                ".ui-paginator-next:not(.ui-state-disabled)"
-            );
-            return nextBtn !== null && nextBtn.offsetParent !== null;
-        }"""
-        )
-
-        print(f"  有下一页: {'✅' if has_next else '❌ (可能只有一页或最后一页)'}")
-
-        if has_next:
-            try:
-                next_btn = page.locator(
-                    "a[id*='nextPage'], a[id*='navigationNext'], "
-                    ".ui-paginator-next:not(.ui-state-disabled)"
-                ).first
-                await next_btn.click()
-                await page.wait_for_load_state("networkidle", timeout=30000)
-                await asyncio.sleep(2)
-                print(f"  ✅ 翻页成功: {page.url}")
-            except Exception as e:
-                print(f"  ❌ 翻页失败: {e}")
+        has_next = await scraper._go_to_next_page()
+        if not has_next:
+            print("  ❌ 无法翻到第2页")
+        else:
+            print(f"  ✅ 已翻到第2页")
+            await scraper._wait_for_results()
+            await scraper._wait_for_results_stable(label="第2页")
+            page2_items = await scraper._parse_results_table()
+            print(f"  第2页摘要: {len(page2_items)} 篇")
+            for i, item in enumerate(page2_items[:3]):
+                pn = item.get('publication_number', '?')
+                title = (item.get('title') or '?')[:60]
+                print(f"    [{i+1}] {pn}  {title}")
 
         print()
 
         # ============ 总结 ============
         print("=" * 60)
-        print("  ✅ PATENTSCOPE 全流程测试完成")
+        print("  ✅ PATENTSCOPE 翻页测试完成")
         print("=" * 60)
-        print(f"  搜索成功: ✅")
-        print(f"  结果数: {count_text}")
-        print(f"  当前页条目: {len(result_items)}")
-        print(f"  详情提取: {'✅' if detail.get('title') else '❌'}")
-        print(f"  返回结果: {'✅' if back_ok else '❌'}")
-        print(f"  分页: {'✅ 可用' if has_next else '⚠️ 只有一页'}")
+        print(f"  检索式: {query}")
+        print(f"  总结果数: {total or '?'}")
+        print(f"  分页大小: 200 条/页")
+        print(f"  第1页: {len(page1_items)} 篇摘要")
+        if has_next:
+            print(f"  第2页: {len(page2_items)} 篇摘要")
+        print(f"  翻页: {'✅ 正常' if has_next else '⚠️ 无第2页'}")
 
         print()
         print("  按 Enter 关闭浏览器...")

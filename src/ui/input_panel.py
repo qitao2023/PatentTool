@@ -5,9 +5,8 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QSpinBox, QRadioButton, QGroupBox, QFileDialog,
-    QButtonGroup, QListWidget, QListWidgetItem, QAbstractItemView,
-    QFrame, QComboBox, QCheckBox,
+    QPushButton, QSpinBox, QGroupBox, QFileDialog,
+    QListWidget, QListWidgetItem, QAbstractItemView,
 )
 from PySide6.QtCore import Signal, Slot
 
@@ -20,20 +19,15 @@ class InputPanel(QWidget):
     stop_clicked = Signal()
     reset_clicked = Signal()
     file_selected = Signal(str)
-    search_abstract_clicked = Signal()  # 仅搜索摘要
+    test_clicked = Signal()                      # 打开测试工具对话框
     settings_clicked = Signal()
-    test_clicked = Signal(str, int)             # 测试: 搜索+抓详情
-    test_abstract_clicked = Signal(str, int)    # 测试: 仅搜索摘要
-    lookup_patent = Signal(str)                 # 公布号直查
+    test_clicked = Signal()                     # 打开测试工具对话框
     open_existing = Signal(str)                 # 打开已有结果
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._ai_provider = "deepseek"
         self._runs_data: list[dict] = []
-        self._test_visible = False
-        self._history_file = Path.cwd() / "data" / "lookup_history.json"
-        self._lookup_history: list[str] = self._load_history()
         self._setup_ui()
         self._set_default_test_path()
 
@@ -92,8 +86,8 @@ class InputPanel(QWidget):
 
         param_row.addWidget(QLabel("最多检索式数:"))
         self.max_queries_spin = QSpinBox()
-        self.max_queries_spin.setRange(1, 20)
-        self.max_queries_spin.setValue(10)
+        self.max_queries_spin.setRange(1, 50)
+        self.max_queries_spin.setValue(20)
         self.max_queries_spin.setSuffix(" 个")
         param_row.addWidget(self.max_queries_spin)
         param_row.addSpacing(20)
@@ -114,13 +108,6 @@ class InputPanel(QWidget):
         param_row.addWidget(self.fetch_detail_spin)
         param_row.addStretch(1)
 
-        param_row.addSpacing(20)
-        self.include_citations_cb = QCheckBox("从说明书提取引用专利")
-        self.include_citations_cb.setChecked(True)
-        self.include_citations_cb.setToolTip(
-            "自动提取说明书中引用的专利号，一并下载加入对比文件")
-        param_row.addWidget(self.include_citations_cb)
-
         self.ai_label = QLabel("DeepSeek")
         self.ai_label.setObjectName("aiProviderLabel")
         param_row.addWidget(self.ai_label)
@@ -135,13 +122,6 @@ class InputPanel(QWidget):
         self.start_btn.clicked.connect(self.start_clicked.emit)
         btn_row.addWidget(self.start_btn)
 
-        self.search_abstract_btn = QPushButton("🔍 检索摘要")
-        self.search_abstract_btn.setToolTip(
-            "仅执行检索并生成摘要列表，不下载全文，用于快速验证对比文件")
-        self.search_abstract_btn.setMinimumHeight(40)
-        self.search_abstract_btn.clicked.connect(self.search_abstract_clicked.emit)
-        btn_row.addWidget(self.search_abstract_btn)
-
         self.stop_btn = QPushButton("■ 停止")
         self.stop_btn.setObjectName("stopBtn")
         self.stop_btn.setMinimumHeight(40)
@@ -153,162 +133,21 @@ class InputPanel(QWidget):
         self.reset_btn.clicked.connect(self.reset_clicked.emit)
         btn_row.addWidget(self.reset_btn)
 
-        self.test_toggle_btn = QPushButton("🧪 测试")
-        self.test_toggle_btn.setCheckable(True)
-        self.test_toggle_btn.setObjectName("testToggleBtn")
-        self.test_toggle_btn.setToolTip("显示/隐藏测试工具")
-        self.test_toggle_btn.clicked.connect(self._toggle_test)
-        btn_row.addWidget(self.test_toggle_btn)
+        self.test_btn = QPushButton("🧪 测试")
+        self.test_btn.setToolTip("打开测试工具（检索式测试、公布号直查）")
+        self.test_btn.clicked.connect(self.test_clicked.emit)
+        btn_row.addWidget(self.test_btn)
 
         btn_row.addStretch(1)
 
         self.settings_btn = QPushButton("⚙ 设置")
         self.settings_btn.setObjectName("settingsBtn")
         self.settings_btn.setMinimumHeight(36)
-        self.settings_btn.setToolTip("配置AI引擎、API Key、模型等")
+        self.settings_btn.setToolTip("配置AI引擎、检索参数等")
         self.settings_btn.clicked.connect(self.settings_clicked.emit)
         btn_row.addWidget(self.settings_btn)
 
         layout.addLayout(btn_row)
-
-        # ── 测试工具（可折叠） ──────────────────────────────────────
-        self.test_frame = QFrame()
-        self.test_frame.setObjectName("testFrame")
-        self.test_frame.setVisible(False)
-        test_outer = QVBoxLayout(self.test_frame)
-        test_outer.setContentsMargins(8, 4, 8, 4)
-        test_outer.setSpacing(4)
-
-        # 行1: 检索式测试
-        test_row1 = QHBoxLayout()
-        test_row1.setSpacing(8)
-        test_row1.addWidget(QLabel("检索式:"))
-        self.test_query_edit = QLineEdit()
-        self.test_query_edit.setPlaceholderText("输入 PATENTSCOPE 检索式...")
-        self.test_query_edit.setText("掉电")
-        self.test_query_edit.setMinimumWidth(200)
-        test_row1.addWidget(self.test_query_edit, 1)
-        test_row1.addWidget(QLabel("数量:"))
-        self.test_count_spin = QSpinBox()
-        self.test_count_spin.setRange(1, 10)
-        self.test_count_spin.setValue(5)
-        self.test_count_spin.setSuffix(" 条")
-        self.test_count_spin.setMaximumWidth(80)
-        test_row1.addWidget(self.test_count_spin)
-        self.test_abstract_btn = QPushButton("🔍 测试摘要")
-        self.test_abstract_btn.setToolTip("仅搜索摘要（快，验证检索式）")
-        self.test_abstract_btn.clicked.connect(self._on_test_abstract_clicked)
-        test_row1.addWidget(self.test_abstract_btn)
-        self.test_btn = QPushButton("📄 测试详情")
-        self.test_btn.setToolTip("搜索摘要 + 抓全文详情")
-        self.test_btn.clicked.connect(self._on_test_clicked)
-        test_row1.addWidget(self.test_btn)
-        test_outer.addLayout(test_row1)
-
-        # 行2: 公布号直查
-        test_row2 = QHBoxLayout()
-        test_row2.setSpacing(8)
-        test_row2.addWidget(QLabel("公布号:"))
-        self.lookup_combo = QComboBox()
-        self.lookup_combo.setEditable(True)
-        self.lookup_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.lookup_combo.setMinimumWidth(200)
-        self.lookup_combo.lineEdit().setPlaceholderText("输入公布号，如 WO2019006821...")
-        # 加载历史
-        for h in self._lookup_history:
-            self.lookup_combo.addItem(h)
-        test_row2.addWidget(self.lookup_combo, 1)
-        self.lookup_btn = QPushButton("🔎 查看专利")
-        self.lookup_btn.setToolTip("直接抓取专利详情并显示")
-        self.lookup_btn.clicked.connect(self._on_lookup_clicked)
-        test_row2.addWidget(self.lookup_btn)
-
-        test_row2.addSpacing(20)
-        self.debug_search_only_cb = QCheckBox("仅搜索（调试断点）")
-        self.debug_search_only_cb.setToolTip(
-            "勾选后全部检索式搜索完就停止，不下载全文、不AI评分")
-        test_row2.addWidget(self.debug_search_only_cb)
-        self.force_refresh_cb = QCheckBox("强制重新获取本申请")
-        self.force_refresh_cb.setToolTip(
-            "勾选后忽略本地缓存，重新从 PATENTSCOPE 获取本申请完整信息")
-        test_row2.addWidget(self.force_refresh_cb)
-        test_outer.addLayout(test_row2)
-
-        layout.addWidget(self.test_frame)
-
-        # 测试按钮样式
-        self.setStyleSheet("""
-            QPushButton#testToggleBtn:checked {
-                background: #e8f0fe;
-                border: 1px solid #0078d4;
-            }
-            QFrame#testFrame {
-                background: #f8f9fa;
-                border: 1px solid #e0e0e0;
-                border-radius: 4px;
-            }
-        """)
-
-    # ── 测试面板 ──────────────────────────────────────────────────────
-
-    def _toggle_test(self):
-        self._test_visible = not self._test_visible
-        self.test_frame.setVisible(self._test_visible)
-        self.test_toggle_btn.setChecked(self._test_visible)
-
-    def _on_lookup_clicked(self):
-        doc_id = self.lookup_combo.currentText().strip()
-        if doc_id:
-            self._add_history(doc_id)
-            self.lookup_patent.emit(doc_id)
-
-    # ── 查询历史 ──────────────────────────────────────────────────
-
-    def _load_history(self) -> list[str]:
-        try:
-            if self._history_file.exists():
-                import json
-                data = json.loads(self._history_file.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    return data[:20]  # 最多保留20条
-        except Exception:
-            pass
-        return []
-
-    def _save_history(self):
-        try:
-            self._history_file.parent.mkdir(parents=True, exist_ok=True)
-            self._history_file.write_text(
-                __import__('json').dumps(self._lookup_history, ensure_ascii=False),
-                encoding="utf-8")
-        except Exception:
-            pass
-
-    def _add_history(self, doc_id: str):
-        doc_id = doc_id.strip()
-        if not doc_id:
-            return
-        # 去重：移除旧的，插入到最前
-        if doc_id in self._lookup_history:
-            self._lookup_history.remove(doc_id)
-        self._lookup_history.insert(0, doc_id)
-        self._lookup_history = self._lookup_history[:20]
-        # 更新下拉框
-        self.lookup_combo.clear()
-        for h in self._lookup_history:
-            self.lookup_combo.addItem(h)
-        self.lookup_combo.setCurrentIndex(0)
-        self._save_history()
-
-    def _on_test_abstract_clicked(self):
-        q = self.test_query_edit.text().strip()
-        if q:
-            self.test_abstract_clicked.emit(q, self.test_count_spin.value())
-
-    def _on_test_clicked(self):
-        q = self.test_query_edit.text().strip()
-        if q:
-            self.test_clicked.emit(q, self.test_count_spin.value())
 
     # ── 公开方法 ──────────────────────────────────────────────────────
 
@@ -350,9 +189,6 @@ class InputPanel(QWidget):
         if item:
             self.open_existing.emit(str(item.data(1)))
 
-    def get_test_query(self) -> str:
-        return self.test_query_edit.text().strip()
-
     def get_pdf_path(self) -> str:
         return self.path_edit.text().strip()
 
@@ -362,9 +198,6 @@ class InputPanel(QWidget):
             "max_results": self.max_results_spin.value(),
             "fetch_detail": self.fetch_detail_spin.value(),
             "ai_provider": self._ai_provider,
-            "debug_search_only": self.debug_search_only_cb.isChecked(),
-            "force_refresh": self.force_refresh_cb.isChecked(),
-            "include_citations": self.include_citations_cb.isChecked(),
         }
 
     def set_ai_provider(self, provider: str):
@@ -374,17 +207,12 @@ class InputPanel(QWidget):
 
     def set_running_state(self, running: bool):
         self.start_btn.setEnabled(not running)
-        self.search_abstract_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         self.browse_btn.setEnabled(not running)
         self.max_queries_spin.setEnabled(not running)
         self.max_results_spin.setEnabled(not running)
         self.fetch_detail_spin.setEnabled(not running)
-        self.test_abstract_btn.setEnabled(not running)
         self.test_btn.setEnabled(not running)
-        self.lookup_btn.setEnabled(not running)
-        self.force_refresh_cb.setEnabled(not running)
-        self.include_citations_cb.setEnabled(not running)
 
     def reset(self):
         self.path_edit.clear()
@@ -392,7 +220,3 @@ class InputPanel(QWidget):
         self.set_running_state(False)
         self.runs_group.setVisible(False)
         self.runs_list.clear()
-        self.test_frame.setVisible(False)
-        self._test_visible = False
-        self.test_toggle_btn.setChecked(False)
-        self.force_refresh_cb.setChecked(False)

@@ -25,7 +25,6 @@ Thumbs.db
 .DS_Store
 
 # Project specific
-profiles/himmpat_browser/
 data/db/patent_tool.db
 data/output/reports/
 *.log

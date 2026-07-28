@@ -17,11 +17,10 @@ from src.ui.report_panel import ReportPanel
 from src.ui.dialogs import SettingsDialog
 from src.ui.workers import (
     PDFParseWorker, QueryGenerateWorker,
-    SearchAndFetchWorker, PatentscopeSearchAndFetchWorker,
+    PatentscopeSearchAndFetchWorker,
     AnalysisWorker, OAWriterWorker,
     PatentscopeTestWorker, PatentscopeAbstractTestWorker,
     PatentLookupWorker,
-    SingleCompareWorker,
 )
 from src.utils.config import Settings
 from src.utils.signals import WorkerSignals
@@ -41,8 +40,8 @@ class MainWindow(QMainWindow):
         self._user_params = {"ai_provider": "deepseek"}
         self._pdf_path = None       # 用户选择的 PDF 路径
         self._output_dir = None     # 本次运行输出目录
-        self._force_debug_search = False  # 「检索摘要」按钮强制仅搜索
-
+        self._comparison_cache = {} # 对比结果缓存 {pub: markdown}
+        self._analysis_report = None
         self._setup_ui()
         self._setup_menu()
         self._setup_statusbar()
@@ -60,16 +59,16 @@ class MainWindow(QMainWindow):
 
         # ① 输入面板
         self.input_panel = InputPanel()
+        # 从配置加载检索式数量
+        self.input_panel.max_queries_spin.setRange(1, 50)
+        self.input_panel.max_queries_spin.setValue(self.settings.query_max_queries)
         self.input_panel.start_clicked.connect(self._on_start)
         self.input_panel.stop_clicked.connect(self._on_stop)
         self.input_panel.reset_clicked.connect(self._on_reset)
-        self.input_panel.test_clicked.connect(self._on_test)
-        self.input_panel.test_abstract_clicked.connect(self._on_test_abstract)
+        self.input_panel.test_clicked.connect(self._on_open_test)
         self.input_panel.settings_clicked.connect(self._on_open_settings)
-        self.input_panel.search_abstract_clicked.connect(self._on_search_abstract)
         self.input_panel.file_selected.connect(self._on_file_selected)
         self.input_panel.open_existing.connect(self._on_open_existing)
-        self.input_panel.lookup_patent.connect(self._on_lookup)
         main_layout.addWidget(self.input_panel)
 
         # ② 日志面板（可拖拽高度）
@@ -109,6 +108,14 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._on_open_settings)
         file_menu.addAction(settings_action)
         file_menu.addSeparator()
+        history_action = QAction("历史记录...", self)
+        history_action.triggered.connect(self._on_open_history)
+        file_menu.addAction(history_action)
+        file_menu.addSeparator()
+        prompts_action = QAction("提示词配置...", self)
+        prompts_action.triggered.connect(self._on_open_prompt_editor)
+        file_menu.addAction(prompts_action)
+        file_menu.addSeparator()
         exit_action = QAction("退出", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -141,33 +148,21 @@ class MainWindow(QMainWindow):
             "<p>技术栈: PySide6 + DeepSeek/Kimi + Playwright</p>"
         )
 
-    def _on_test(self, query: str, count: int):
-        """测试详情：搜索 → 抓全文 → 显示结果"""
-        if not query.strip():
-            QMessageBox.warning(self, "提示", "请输入测试检索式")
-            return
-        self.log_panel.append_log("INFO", "=" * 50)
-        self.log_panel.append_log("INFO", f"PATENTSCOPE 测试详情: {query} ({count}条)")
-        self.input_panel.set_running_state(True)
-        self.status_label.setText(f"测试详情 ({count}条)...")
-        self._current_worker = PatentscopeTestWorker(
-            query, self.settings, max_results=count)
-        w = self._current_worker
-        w.signals.progress.connect(self.log_panel.update_progress)
-        w.signals.log.connect(self.log_panel.append_log)
-        w.signals.query_complete.connect(self.result_panel.add_query_results)
-        w.signals.all_searches_done.connect(self._on_test_done)
-        w.signals.error.connect(self._handle_error)
-        w.signals.finished.connect(self._on_worker_finished)
-        w.start()
+    def _on_open_test(self):
+        """打开测试工具对话框"""
+        from src.ui.dialogs import TestDialog
+        dlg = TestDialog(self)
+        dlg.test_abstract.connect(self._on_test_abstract)
+        dlg.test_detail.connect(self._on_test_detail)
+        dlg.lookup_patent.connect(self._on_lookup_patent)
+        dlg.exec()
 
     def _on_test_abstract(self, query: str, count: int):
         """测试摘要：仅搜索摘要"""
         if not query.strip():
-            QMessageBox.warning(self, "提示", "请输入测试检索式")
             return
         self.log_panel.append_log("INFO", "=" * 50)
-        self.log_panel.append_log("INFO", f"PATENTSCOPE 摘要测试: {query} ({count}条)")
+        self.log_panel.append_log("INFO", f"测试摘要: {query} ({count}条)")
         self.input_panel.set_running_state(True)
         self.status_label.setText(f"测试摘要 ({count}条)...")
         self._current_worker = PatentscopeAbstractTestWorker(
@@ -181,9 +176,27 @@ class MainWindow(QMainWindow):
         w.signals.finished.connect(self._on_worker_finished)
         w.start()
 
-    @Slot(str)
-    def _on_lookup(self, doc_id: str):
-        """公布号直查"""
+    def _on_test_detail(self, query: str, count: int):
+        """测试详情：搜索 → 抓全文"""
+        if not query.strip():
+            return
+        self.log_panel.append_log("INFO", "=" * 50)
+        self.log_panel.append_log("INFO", f"测试详情: {query} ({count}条)")
+        self.input_panel.set_running_state(True)
+        self.status_label.setText(f"测试详情 ({count}条)...")
+        self._current_worker = PatentscopeTestWorker(
+            query, self.settings, max_results=count)
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.query_complete.connect(self.result_panel.add_query_results)
+        w.signals.all_searches_done.connect(self._on_test_done)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.start()
+
+    def _on_lookup_patent(self, doc_id: str):
+        """公布号直查（从测试对话框触发）"""
         if not doc_id.strip():
             return
         self.log_panel.append_log("INFO", f"公布号查询: {doc_id}")
@@ -198,21 +211,9 @@ class MainWindow(QMainWindow):
         w.lookup_done.connect(self._on_lookup_done)
         w.start()
 
-    def _on_search_abstract(self):
-        """「检索摘要」按钮 — 仅搜索+生成摘要，不下载全文"""
-        pdf_path = self.input_panel.get_pdf_path()
-        if not pdf_path:
-            QMessageBox.warning(self, "提示", "请先选择专利PDF文件")
-            return
-        if not Path(pdf_path).exists():
-            QMessageBox.warning(self, "提示", f"文件不存在:\n{pdf_path}")
-            return
-        self._force_debug_search = True
-        self._on_start()
-
     @Slot(dict)
     def _on_lookup_done(self, patent: dict):
-        """直查结果返回 → 显示在左侧表格 + 右侧详情"""
+        """直查结果返回"""
         self.result_panel.show_dedup_results([patent])
         self.report_panel.show_patent_detail(patent)
         self.input_panel.set_running_state(False)
@@ -248,14 +249,17 @@ class MainWindow(QMainWindow):
         dlg.settings_saved.connect(self._on_settings_saved)
         dlg.exec()
 
-    def _on_settings_saved(self, provider: str, model: str, temperature: float):
+    def _on_settings_saved(self, provider: str, model: str, temperature: float,
+                            params: dict):
         """设置保存后的回调"""
         self._user_params["ai_provider"] = provider
         self._user_params["ai_model"] = model
         self._user_params["temperature"] = temperature
+        self._user_params.update(params)
         self.input_panel.set_ai_provider(provider)
         self.log_panel.append_log("INFO",
-            f"AI设置已更新: {provider} / {model} / temp={temperature}")
+            f"设置已更新: {provider} / {model} / temp={temperature} "
+            f"| 参数: {params}")
 
     def _menu_open_pdf(self):
         self.input_panel._on_browse()
@@ -318,19 +322,49 @@ class MainWindow(QMainWindow):
             self.log_panel.append_log("INFO",
                 f"发现 {len(runs)} 次历史运行")
 
+    def _on_open_history(self):
+        """打开历史记录浏览对话框"""
+        from src.ui.history_dialog import HistoryDialog
+        dlg = HistoryDialog(parent=self)
+        dlg.run_selected.connect(self._on_open_existing)
+        dlg.exec()
+
+    def _on_open_prompt_editor(self):
+        """打开提示词编辑器"""
+        from src.ui.dialogs import PromptEditorDialog
+        dlg = PromptEditorDialog(self.settings, self)
+        dlg.prompt_saved.connect(self._on_prompts_saved)
+        dlg.exec()
+
+    def _on_prompts_saved(self, profile: str):
+        """提示词保存后的回调"""
+        self.log_panel.append_log("INFO", f"提示词方案「{profile}」已保存，下次检索生效")
+
     @Slot(str)
     def _on_open_existing(self, run_path: str):
-        """打开已有运行结果"""
+        """打开已有运行结果，完整重建状态（结果列表 + 报告 + 对比缓存）"""
         import json
         from pathlib import Path
         rp = Path(run_path)
         self.log_panel.append_log("INFO", f"打开已有结果: {rp.name}")
+        self._output_dir = rp  # 设置输出目录，确保后续保存走对路径
 
-        # 加载各阶段 JSON
+        # ── 加载对比缓存 ──────────────────────────────────────────
+        self._comparison_cache = {}
+        cache_path = rp / "comparison_cache.json"
+        if cache_path.exists():
+            try:
+                self._comparison_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+                self.log_panel.append_log("INFO",
+                    f"  已加载对比缓存: {len(self._comparison_cache)} 篇")
+            except Exception:
+                pass
+
+        # ── 加载各阶段 JSON ────────────────────────────────────────
         loaded = {}
         stage_files = [
             ("01_search_abstracts.json", "abstracts"),
-            ("02_ai_screened.json", "screened"),
+            ("03_ai_screened.json", "screened"),
             ("03_full_details.json", "details"),
             ("03.5_fulltext_scored.json", "scored"),
         ]
@@ -343,7 +377,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # 显示结果
+        # ── 显示结果列表 ───────────────────────────────────────────
         results = []
         if "screened" in loaded and "results" in loaded["screened"]:
             results = loaded["screened"]["results"]
@@ -352,29 +386,43 @@ class MainWindow(QMainWindow):
 
         if results:
             self.result_panel.show_results(results)
+            self.log_panel.append_log("INFO", f"  已加载 {len(results)} 篇专利结果")
 
-        # 显示分析报告
+        # ── 显示分析报告 ───────────────────────────────────────────
         md_path = rp / "04_analysis_report.md"
         if md_path.exists():
             md_text = md_path.read_text(encoding="utf-8")
-            # 模拟一个 report 对象
             class FakeReport:
                 pass
             report = FakeReport()
             report.markdown_content = md_text
             report.html_content = (rp / "04_analysis_report.html").read_text(
                 encoding="utf-8") if (rp / "04_analysis_report.html").exists() else ""
+            report.comparisons = []  # 对比缓存已单独加载
             self._analysis_report = report
             self.report_panel.show_report(report)
+            self.log_panel.append_log("INFO", "  已加载分析报告")
 
-        # 读取 OA
+        # ── 显示日志文件 ───────────────────────────────────────────
+        log_path = rp / "run.log"
+        if log_path.exists():
+            self.log_panel.append_log("INFO", f"  运行日志: {log_path}")
+            # 可选：加载历史日志到 UI（追加方式）
+            try:
+                for line in log_path.read_text(encoding="utf-8").splitlines()[-20:]:
+                    self.log_panel.append_log("DEBUG", line.split("] ", 1)[-1] if "] " in line else line)
+            except Exception:
+                pass
+
+        # ── OA 通知书 ──────────────────────────────────────────────
         oa_path = rp / "05_审查意见通知书.md"
         if oa_path.exists():
             self.log_panel.append_log("INFO",
-                f"审查意见通知书: {oa_path}")
+                f"  审查意见通知书: {oa_path}")
 
         self.log_panel.append_log("SUCCESS",
-            f"已加载 {len(results)} 篇专利结果")
+            f"已加载完整运行记录: {len(results)} 篇结果, "
+            f"{len(self._comparison_cache)} 篇对比缓存")
 
     def _on_stop(self):
         """点击「停止」"""
@@ -397,6 +445,9 @@ class MainWindow(QMainWindow):
         self._all_raw_results = None
         self._dedup_results = None
         self._current_worker = None
+        self._comparison_cache = {}
+        self._analysis_report = None
+        self._output_dir = None
         # 注意: _force_debug_search 不在此重置，它由 _on_search_abstract 设置，
         # 在 _on_all_searches_done 或 _run_search 中消费后重置。
 
@@ -429,6 +480,8 @@ class MainWindow(QMainWindow):
         self._output_dir = get_output_dir(self._pdf_path, patent_doc)
         self.log_panel.append_log("INFO",
             f"输出目录: {self._output_dir}")
+        # 设置日志文件，所有日志同步落盘
+        self.log_panel.set_log_file(str(self._output_dir / "run.log"))
 
         if pub_num:
             force_refresh = self._user_params.get("force_refresh", False)
@@ -551,10 +604,8 @@ class MainWindow(QMainWindow):
                         self.settings.patentscope_max_results)
         fetch_detail = self._user_params.get("fetch_detail",
                         self.settings.analysis_top_n)
-        debug_search_only = (
-            self._user_params.get("debug_search_only", False)
-            or self._force_debug_search
-        )
+        debug_search_only = self._user_params.get("debug_search_only", False)
+        self._debug_search_only = debug_search_only
         max_queries = len(queries)
         self.status_label.setText(
             f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条, "
@@ -598,12 +649,9 @@ class MainWindow(QMainWindow):
         self._all_raw_results = all_enriched
 
         # 仅搜索模式：显示摘要列表，不进入分析
-        if self._force_debug_search:
-            self._force_debug_search = False
+        if getattr(self, "_debug_search_only", False):
+            self._debug_search_only = False
             from src.result_collector.deduplicator import Deduplicator
-            flat = []
-            for batch in all_enriched:
-                flat.extend(batch)
             deduper = Deduplicator(self.settings)
             deduped, removed = deduper.deduplicate(all_enriched)
             self._dedup_results = deduped
@@ -665,29 +713,84 @@ class MainWindow(QMainWindow):
         self.report_panel.show_report(report)
         self._analysis_report = report
 
-        # 构建对比缓存：{公布号: markdown}，点击专利时秒开
+        # 构建对比缓存：{公布号: markdown}，点击专利时秒开（不调AI）
         self._comparison_cache = {}
         for c in (report.comparisons or []):
             pub = c.get("publication_number", "")
             if not pub:
                 continue
-            # 把结构化对比结果转成简单 markdown
-            md = c.get("markdown") or c.get("comparison") or ""
-            if not md:
-                md = f"""# 对比分析: {pub}
+            # 把 _detailed_comparison() 的 JSON 结果转成丰富的 Markdown
+            title = c.get("title", "")
+            score = c.get("relevance_score", "?")
+            novelty = c.get("novelty_impact", "?")
+            inventive = c.get("inventive_step_impact", "?")
+            same_features = c.get("key_features_same", [])
+            diff_features = c.get("key_features_different", [])
+            conclusion = c.get("conclusion", "")
 
-**标题**: {c.get('title', '')}
-**相关度**: {c.get('relevance_score', '')}
+            src = c.get("source_raw", {})
+            cand_title = src.get("title", title)
+            cand_ipc = src.get("ipc", "")
+            cand_applicant = src.get("applicant", "")
+            cand_date = src.get("publication_date", "")
 
-**新颖性影响**: {c.get('novelty_impact', '')}
-**创造性影响**: {c.get('inventive_step_impact', '')}
+            # 新颖性/创造性中文标签
+            def impact_label(v):
+                m = {"high": "⚠️ 高（可能影响授权）", "moderate": "⚡ 中（需要关注）",
+                     "low": "✅ 低（影响有限）"}
+                return m.get(str(v).lower(), str(v))
 
-**相同特征**: {', '.join(c.get('key_features_same', []))}
-**不同特征**: {', '.join(c.get('key_features_different', []))}
+            same_lines = "\n".join(f"- {f}" for f in same_features) if same_features else "- *(AI 未列出)*"
+            diff_lines = "\n".join(f"- {f}" for f in diff_features) if diff_features else "- *(AI 未列出)*"
 
-**结论**: {c.get('conclusion', '')}
+            md = f"""# 对比分析: {pub} vs 本申请
+
+## 1. 基本信息对比
+
+| 项目 | 本申请 | 对比文献 |
+|------|--------|----------|
+| 标题 | {self._patent_doc.title if self._patent_doc else '?'} | {cand_title} |
+| IPC | {', '.join(self._patent_doc.ipc_classifications[:3]) if self._patent_doc else '?'} | {cand_ipc} |
+| 申请人 | - | {cand_applicant} |
+| 公开日 | - | {cand_date} |
+
+## 2. 相关度评分
+
+**{score}/100** — {impact_label(score)}
+
+## 3. 新颖性影响
+
+{impact_label(novelty)}
+
+## 4. 创造性影响
+
+{impact_label(inventive)}
+
+## 5. 技术特征对比
+
+### 相同特征
+{same_lines}
+
+### 不同特征
+{diff_lines}
+
+## 6. 综合结论
+
+{conclusion or '*(无)*'}
 """
             self._comparison_cache[pub] = md
+
+        # 持久化对比缓存到磁盘
+        cache_path = self._output_dir / "comparison_cache.json"
+        try:
+            import json as _json
+            cache_path.write_text(
+                _json.dumps(self._comparison_cache, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+            self.log_panel.append_log("INFO",
+                f"  对比缓存已保存: {cache_path} ({len(self._comparison_cache)} 篇)")
+        except Exception as e:
+            self.log_panel.append_log("WARN", f"  对比缓存保存失败: {e}")
 
         # 确保输出目录存在（正常流程 _on_pdf_done 已创建）
         if not self._output_dir:
@@ -790,37 +893,17 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
 
     @Slot(dict)
     def _on_patent_clicked(self, patent: dict):
-        """点击专利 → 先展示详情，再触发/获取 AI 对比"""
-        # 立即展示专利详情（无需等待 AI）
-        self.report_panel.show_patent_detail(patent)
-
+        """点击专利 → 展示详情 + 缓存的 AI 对比结果（不额外调 AI）"""
         pub = patent.get("publication_number", "?")
-        # 检查预计算缓存
+        # 先展示专利原始详情
+        self.report_panel.show_patent_detail(patent)
+        # 检查缓存：有对比结果就展示，没有就仅展示详情
         if self._comparison_cache and pub in self._comparison_cache:
             self.report_panel.show_single_comparison(
                 pub, self._comparison_cache[pub])
-            return
-        # 缓存未命中，触发 AI 对比（结果通过 show_single_comparison 异步更新）
-        if not self._patent_doc:
-            # 测试模式或无本申请，仅显示详情即可
-            return
-        ai_provider = self._user_params.get("ai_provider", "deepseek")
-        self._current_worker = SingleCompareWorker(
-            self._patent_doc, patent, self.settings,
-            ai_provider=ai_provider)
-        w = self._current_worker
-        w.signals.log.connect(self.log_panel.append_log)
-        w.signals.analysis_done.connect(self._on_single_compare_done)
-        w.signals.error.connect(self._handle_error)
-        w.signals.finished.connect(self._on_worker_finished)
-        w.start()
-
-    @Slot(object)
-    def _on_single_compare_done(self, result: dict):
-        """单篇对比完成，在报告面板显示"""
-        pub = result.get("publication_number", "?")
-        md = result.get("markdown", "")
-        self.report_panel.show_single_comparison(pub, md)
+        else:
+            self.log_panel.append_log("INFO",
+                f"  {pub}: 暂无非AI对比缓存，显示原始详情")
 
     @Slot(str)
     def _handle_error(self, error_msg: str):

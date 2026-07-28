@@ -28,8 +28,8 @@ class QueryGenerator:
         """生成检索式列表"""
         client = self._get_client()
 
-        system_prompt = build_system_prompt()
-        user_prompt = build_user_prompt(patent, max_queries)
+        system_prompt = build_system_prompt(self.settings)
+        user_prompt = build_user_prompt(patent, max_queries, self.settings)
 
         content = client.chat(
             system_prompt=system_prompt,
@@ -108,4 +108,4 @@ class QueryGenerator:
         if not validated:
             raise ValueError(f"JSON解析成功但无有效检索式: {content[:300]}")
 
-        return validated[:max_queries]
+        return validated[:max_queries + 3]  # +3 为宽泛兜底检索式预留

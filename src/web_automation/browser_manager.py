@@ -83,7 +83,7 @@ class BrowserManager:
 
         self._context = await self._browser.new_context(**ctx_opts)
         self._page = await self._context.new_page()
-        self._page.set_default_timeout(30000)
+        self._page.set_default_timeout(60000)
         self._page.on("dialog", lambda d: d.accept() if d.type != "prompt" else d.accept(""))
 
         return self._context, self._page

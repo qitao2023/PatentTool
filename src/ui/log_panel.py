@@ -75,12 +75,24 @@ class LogPanel(QWidget):
         """)
         layout.addWidget(self.log_text, 1)
 
+    def set_log_file(self, path):
+        """设置日志文件路径，之后每条日志都会同步写入"""
+        self._log_file = path
+
     @Slot(str, str)
     def append_log(self, level: str, message: str):
-        """添加一条日志"""
+        """添加一条日志（同时写入 UI 和文件）"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         icon = {"INFO": "i", "WARN": "!", "ERROR": "X", "SUCCESS": "V", "DEBUG": "."}.get(level, ".")
-        self.log_text.appendPlainText(f"[{timestamp}] {icon} {message}")
+        line = f"[{timestamp}] {icon} {message}"
+        self.log_text.appendPlainText(line)
+        # 同步写入日志文件
+        if getattr(self, "_log_file", None):
+            try:
+                with open(self._log_file, "a", encoding="utf-8") as f:
+                    f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}\n")
+            except Exception:
+                pass
 
     @Slot(int, str)
     def update_progress(self, percent: int, status: str):

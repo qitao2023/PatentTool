@@ -6,7 +6,7 @@ import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSlider, QTabWidget, QWidget, QMessageBox,
-    QGroupBox,
+    QGroupBox, QPlainTextEdit, QSpinBox, QCheckBox,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -15,10 +15,10 @@ from src.ai_client import PROVIDER_CONFIG, get_provider_models
 
 
 class SettingsDialog(QDialog):
-    """设置对话框 - AI引擎、API Key等全局配置"""
+    """设置对话框 - Tab 页: 大模型设置 + 检索参数"""
 
-    # 保存时发射信号，带 (provider, model, temperature)
-    settings_saved = Signal(str, str, float)
+    # 保存时发射信号，带 (provider, model, temperature, params_dict)
+    settings_saved = Signal(str, str, float, dict)
 
     # 提供商显示名 -> 内部名 映射
     PROVIDER_NAMES = {
@@ -32,18 +32,25 @@ class SettingsDialog(QDialog):
         self.settings = settings
         self._current_provider = settings.ai_provider
         self.setWindowTitle("设置")
-        self.setMinimumWidth(520)
+        self.setMinimumSize(540, 500)
         self._setup_ui()
         self._load_settings()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
+        self.tab_widget = QTabWidget()
+
+        # ================================================================
+        # Tab 1: 大模型设置
+        # ================================================================
+        tab_ai = QWidget()
+        ai_layout = QVBoxLayout(tab_ai)
+
         # --- AI 全局设置 ---
         ai_group = QGroupBox("AI 引擎设置")
-        ai_layout = QFormLayout(ai_group)
+        ai_form = QFormLayout(ai_group)
 
-        # 提供商
         provider_row = QHBoxLayout()
         self.provider_combo = QComboBox()
         for display_name, internal_name in self.PROVIDER_NAMES.items():
@@ -51,13 +58,11 @@ class SettingsDialog(QDialog):
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         provider_row.addWidget(self.provider_combo)
         provider_row.addStretch(1)
-        ai_layout.addRow("AI 提供商:", provider_row)
+        ai_form.addRow("AI 提供商:", provider_row)
 
-        # 默认模型
         self.model_combo = QComboBox()
-        ai_layout.addRow("默认模型:", self.model_combo)
+        ai_form.addRow("默认模型:", self.model_combo)
 
-        # API Key
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_input.setPlaceholderText("输入 API Key...")
@@ -67,9 +72,8 @@ class SettingsDialog(QDialog):
         self.show_key_btn.setCheckable(True)
         self.show_key_btn.toggled.connect(self._toggle_key_visibility)
         api_key_row.addWidget(self.show_key_btn)
-        ai_layout.addRow("API Key:", api_key_row)
+        ai_form.addRow("API Key:", api_key_row)
 
-        # 温度
         temp_row = QHBoxLayout()
         self.temp_slider = QSlider(Qt.Orientation.Horizontal)
         self.temp_slider.setRange(0, 100)
@@ -80,37 +84,69 @@ class SettingsDialog(QDialog):
         )
         temp_row.addWidget(self.temp_slider, 1)
         temp_row.addWidget(self.temp_label)
-        ai_layout.addRow("温度 (Temperature):", temp_row)
+        ai_form.addRow("温度 (Temperature):", temp_row)
 
-        layout.addWidget(ai_group)
+        ai_layout.addWidget(ai_group)
 
         # --- 各阶段专用模型 ---
         stage_group = QGroupBox("各阶段专用模型（为空则用默认模型）")
-        stage_layout = QFormLayout(stage_group)
+        stage_form = QFormLayout(stage_group)
 
         self.query_model_combo = QComboBox()
         self.query_model_combo.setToolTip("生成 PATENTSCOPE 检索式时使用的模型")
-        stage_layout.addRow("检索式生成:", self.query_model_combo)
+        stage_form.addRow("检索式生成:", self.query_model_combo)
 
         self.screen_model_combo = QComboBox()
         self.screen_model_combo.setToolTip("AI 筛选/评分对比文件时使用的模型")
-        stage_layout.addRow("筛选评分:", self.screen_model_combo)
+        stage_form.addRow("筛选评分:", self.screen_model_combo)
 
         self.analysis_model_combo = QComboBox()
         self.analysis_model_combo.setToolTip("逐篇对比分析时使用的模型")
-        stage_layout.addRow("对比分析:", self.analysis_model_combo)
+        stage_form.addRow("对比分析:", self.analysis_model_combo)
 
-        layout.addWidget(stage_group)
+        ai_layout.addWidget(stage_group)
+        ai_layout.addStretch(1)
+        self.tab_widget.addTab(tab_ai, "🤖 大模型设置")
+
+        # ================================================================
+        # Tab 2: 参数设置
+        # ================================================================
+        tab_params = QWidget()
+        params_layout = QVBoxLayout(tab_params)
+
+        search_group = QGroupBox("检索参数")
+        search_form = QFormLayout(search_group)
+
+        self.include_citations_cb = QCheckBox("从说明书中提取引用专利号")
+        self.include_citations_cb.setChecked(True)
+        self.include_citations_cb.setToolTip(
+            "自动提取说明书中引用的专利号，一并下载加入对比文件")
+        search_form.addRow(self.include_citations_cb)
+
+        self.force_refresh_cb = QCheckBox("强制重新获取本申请")
+        self.force_refresh_cb.setToolTip(
+            "勾选后忽略本地缓存，重新从 PATENTSCOPE 获取本申请完整信息")
+        search_form.addRow(self.force_refresh_cb)
+
+        self.debug_search_only_cb = QCheckBox("仅搜索摘要（不下载全文、不AI评分）")
+        self.debug_search_only_cb.setToolTip(
+            "勾选后全部检索式搜索完就停止，仅生成摘要列表")
+        search_form.addRow(self.debug_search_only_cb)
+
+        params_layout.addWidget(search_group)
+        params_layout.addStretch(1)
+        self.tab_widget.addTab(tab_params, "⚙ 检索参数")
+
+        # ================================================================
+        layout.addWidget(self.tab_widget)
 
         # --- 提示 ---
         hint = QLabel(
-            "💡 保存设置时，API Key 和模型选择将写入 config/.env 文件。"
+            "💡 API Key 和模型选择写入 config/.env，参数设置写入 config/settings.yaml。"
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
         layout.addWidget(hint)
-
-        layout.addStretch(1)
 
         # --- 按钮 ---
         btn_row = QHBoxLayout()
@@ -280,7 +316,12 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "写入配置失败",
                 f"无法更新设置文件:\n{e}")
 
-        self.settings_saved.emit(provider, model, temperature)
+        params = {
+            "include_citations": self.include_citations_cb.isChecked(),
+            "force_refresh": self.force_refresh_cb.isChecked(),
+            "debug_search_only": self.debug_search_only_cb.isChecked(),
+        }
+        self.settings_saved.emit(provider, model, temperature, params)
         self.accept()
         stages = []
         for label, combo in [
@@ -295,4 +336,283 @@ class SettingsDialog(QDialog):
             f"默认模型: {model}\n"
             f"温度: {temperature:.2f}\n\n"
             f"各阶段模型:\n" + "\n".join(stages) + "\n\n"
+            f"检索参数:\n"
+            f"  提取引用专利: {'是' if params['include_citations'] else '否'}\n"
+            f"  强制重新获取: {'是' if params['force_refresh'] else '否'}\n"
+            f"  仅搜索摘要: {'是' if params['debug_search_only'] else '否'}\n\n"
             "设置已写入 config/.env 和 config/settings.yaml，持续生效。")
+
+
+class PromptEditorDialog(QDialog):
+    """提示词模板编辑器 — 编辑 System/User Prompt 模板"""
+
+    prompt_saved = Signal(str)  # 发射当前活跃的 profile 名称
+
+    def __init__(self, settings: Settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self._current_profile = settings.prompts_active_profile
+        self._profiles = self._scan_profiles()
+        self._modified = False
+
+        self.setWindowTitle("提示词配置")
+        self.setMinimumSize(800, 600)
+        self._setup_ui()
+        self._load_current_profile()
+
+    def _scan_profiles(self) -> list[str]:
+        """扫描 prompts 目录下所有子文件夹作为 profile 列表"""
+        prompts_dir = self.settings.prompts_dir
+        if not prompts_dir.exists():
+            return ["default"]
+        profiles = sorted([
+            p.name for p in prompts_dir.iterdir()
+            if p.is_dir() and (p / "system.txt").exists()
+        ])
+        return profiles if profiles else ["default"]
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ── 顶部：方案选择 ──
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel("提示词方案:"))
+        self.profile_combo = QComboBox()
+        for name in self._profiles:
+            label = f"{name}（半导体专利）" if name == "semiconductor" else f"{name}（通用专利）"
+            self.profile_combo.addItem(label, name)
+        idx = self.profile_combo.findData(self._current_profile)
+        if idx >= 0:
+            self.profile_combo.setCurrentIndex(idx)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
+        top_bar.addWidget(self.profile_combo, 1)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        # ── 提示信息 ──
+        hint = QLabel("💡 修改提示词会影响检索式生成质量。保存后下次检索生效。")
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # ── 编辑区（Tab 切换 System / User） ──
+        self.tab_widget = QTabWidget()
+        font = self.font()
+        font.setFamily("Consolas, Microsoft YaHei")
+        font.setPointSize(10)
+
+        self.system_edit = QPlainTextEdit()
+        self.system_edit.setFont(font)
+        self.system_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.tab_widget.addTab(self.system_edit, "System Prompt")
+
+        self.user_edit = QPlainTextEdit()
+        self.user_edit.setFont(font)
+        self.user_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.tab_widget.addTab(self.user_edit, "User Prompt")
+
+        layout.addWidget(self.tab_widget, 1)
+
+        # ── 变量说明 ──
+        var_label = QLabel(
+            "可用变量: {patent_markdown}（专利全文Markdown）  "
+            "{max_queries}（检索式数量）"
+        )
+        var_label.setWordWrap(True)
+        var_label.setStyleSheet("color: #666; font-size: 11px; padding: 4px;")
+        layout.addWidget(var_label)
+
+        # ── 底部按钮 ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        reset_btn = QPushButton("恢复默认")
+        reset_btn.setToolTip("恢复当前方案的提示词为出厂默认")
+        reset_btn.clicked.connect(self._on_reset)
+        btn_row.addWidget(reset_btn)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("保存")
+        save_btn.setObjectName("saveBtn")
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def _load_current_profile(self):
+        """加载当前选中方案的提示词到编辑器"""
+        profile = self.profile_combo.currentData()
+        if not profile:
+            return
+        self._current_profile = profile
+
+        system_text = self.settings.get_prompt_text(profile, "system")
+        user_text = self.settings.get_prompt_text(profile, "user")
+
+        # 如果文件不存在，从 fallback 常量获取
+        if not system_text:
+            from src.query_generator.prompts import FALLBACK_SYSTEM_PROMPT
+            system_text = FALLBACK_SYSTEM_PROMPT
+        if not user_text:
+            from src.query_generator.prompts import FALLBACK_USER_PROMPT
+            user_text = FALLBACK_USER_PROMPT
+
+        self.system_edit.setPlainText(system_text)
+        self.user_edit.setPlainText(user_text)
+
+    def _on_profile_changed(self):
+        """切换方案 → 加载对应内容"""
+        self._load_current_profile()
+
+    def _on_reset(self):
+        """恢复当前方案为出厂默认"""
+        profile = self.profile_combo.currentData()
+        if not profile:
+            return
+
+        reply = QMessageBox.question(
+            self, "确认恢复",
+            f"将「{profile}」方案的提示词恢复为出厂默认设置？\n当前修改将丢失。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        from src.query_generator.prompts import FALLBACK_SYSTEM_PROMPT, FALLBACK_USER_PROMPT
+        # 如果是 semiconductor 方案，没有代码级 fallback（只有文件级），
+        # 恢复 = 删除文件让它重新从默认状态创建
+        # 这里直接清空编辑器让用户重新保存
+        if profile == "semiconductor":
+            self.system_edit.setPlainText(FALLBACK_SYSTEM_PROMPT)
+            self.user_edit.setPlainText(FALLBACK_USER_PROMPT)
+        else:
+            self.system_edit.setPlainText(FALLBACK_SYSTEM_PROMPT)
+            self.user_edit.setPlainText(FALLBACK_USER_PROMPT)
+
+    def _on_save(self):
+        """保存当前编辑内容到磁盘"""
+        profile = self.profile_combo.currentData()
+        if not profile:
+            return
+
+        # 确保目录存在
+        profile_dir = self.settings.prompts_dir / profile
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        # 写入 system.txt
+        system_path = profile_dir / "system.txt"
+        system_path.write_text(self.system_edit.toPlainText(), encoding="utf-8")
+
+        # 写入 user.txt
+        user_path = profile_dir / "user.txt"
+        user_path.write_text(self.user_edit.toPlainText(), encoding="utf-8")
+
+        # 更新活跃方案
+        yaml_path = self.settings.config_dir / "settings.yaml"
+        if yaml_path.exists():
+            content = yaml_path.read_text(encoding="utf-8")
+            import re
+            if re.search(r'prompt_profile:\s*"[^"]*"', content):
+                content = re.sub(
+                    r'prompt_profile:\s*"[^"]*"',
+                    f'prompt_profile: "{profile}"',
+                    content)
+            else:
+                content = re.sub(
+                    r'(max_tokens:\s*\d+)',
+                    f'\\1\n  prompt_profile: "{profile}"',
+                    content)
+            yaml_path.write_text(content, encoding="utf-8")
+
+        self.prompt_saved.emit(profile)
+        QMessageBox.information(self, "已保存",
+            f"提示词方案「{profile}」已保存到:\n{profile_dir}\n\n下次检索生效。")
+        self.accept()
+
+
+class TestDialog(QDialog):
+    """测试工具对话框 — 检索式测试、公布号查询等"""
+
+    test_abstract = Signal(str, int)   # query, max_results
+    test_detail = Signal(str, int)     # query, max_results
+    lookup_patent = Signal(str)        # doc_id
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("测试工具")
+        self.setMinimumWidth(480)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ── 检索式测试 ──
+        search_group = QGroupBox("检索式测试")
+        search_layout = QVBoxLayout(search_group)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("检索式:"))
+        self.test_query_edit = QLineEdit()
+        self.test_query_edit.setPlaceholderText("输入 PATENTSCOPE 检索式...")
+        self.test_query_edit.setText("掉电")
+        row1.addWidget(self.test_query_edit, 1)
+        search_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("数量上限:"))
+        self.test_count_spin = QSpinBox()
+        self.test_count_spin.setRange(1, 500)
+        self.test_count_spin.setValue(10)
+        row2.addWidget(self.test_count_spin)
+        row2.addStretch(1)
+
+        self.test_abstract_btn = QPushButton("🔍 测试摘要")
+        self.test_abstract_btn.setToolTip("仅搜索摘要（快，验证检索式）")
+        self.test_abstract_btn.clicked.connect(self._on_test_abstract)
+        row2.addWidget(self.test_abstract_btn)
+
+        self.test_detail_btn = QPushButton("📄 测试详情")
+        self.test_detail_btn.setToolTip("搜索摘要 + 抓取全文详情")
+        self.test_detail_btn.clicked.connect(self._on_test_detail)
+        row2.addWidget(self.test_detail_btn)
+        search_layout.addLayout(row2)
+
+        layout.addWidget(search_group)
+
+        # ── 公布号直查 ──
+        lookup_group = QGroupBox("公布号直查")
+        lookup_layout = QHBoxLayout(lookup_group)
+
+        self.lookup_combo = QComboBox()
+        self.lookup_combo.setEditable(True)
+        self.lookup_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.lookup_combo.setMinimumWidth(200)
+        self.lookup_combo.lineEdit().setPlaceholderText("输入公布号，如 WO2019006821...")
+        lookup_layout.addWidget(self.lookup_combo, 1)
+
+        self.lookup_btn = QPushButton("🔎 查看专利")
+        self.lookup_btn.setToolTip("直接抓取专利详情并显示")
+        self.lookup_btn.clicked.connect(self._on_lookup)
+        lookup_layout.addWidget(self.lookup_btn)
+
+        layout.addWidget(lookup_group)
+
+        # ── 关闭 ──
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def _on_test_abstract(self):
+        q = self.test_query_edit.text().strip()
+        if q:
+            self.test_abstract.emit(q, self.test_count_spin.value())
+
+    def _on_test_detail(self):
+        q = self.test_query_edit.text().strip()
+        if q:
+            self.test_detail.emit(q, self.test_count_spin.value())
+
+    def _on_lookup(self):
+        doc_id = self.lookup_combo.currentText().strip()
+        if doc_id:
+            self.lookup_patent.emit(doc_id)

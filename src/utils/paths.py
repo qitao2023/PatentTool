@@ -23,6 +23,8 @@ STAGE_FILES = {
     "screen":    "03_ai_screened.json",
     "analysis":  "04_analysis_report.md",
     "oa":        "05_审查意见通知书.md",
+    "cache":     "comparison_cache.json",       # AI 对比结果缓存
+    "log":       "run.log",                     # 运行日志
 }
 
 

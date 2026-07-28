@@ -72,231 +72,6 @@ class QueryGenerateWorker(QThread):
             self.signals.finished.emit(False, str(e))
 
 
-class SearchWorker(QThread):
-    """检索执行后台线程（浏览器自动化）"""
-
-    def __init__(self, queries: list, settings: Settings, parent=None):
-        super().__init__(parent)
-        self.queries = queries
-        self.settings = settings
-        self.signals = WorkerSignals()
-        self._is_running = True
-
-    def stop(self):
-        self._is_running = False
-
-    def run(self):
-        import asyncio
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._run_async())
-            loop.close()
-        except Exception as e:
-            self.signals.error.emit(f"检索执行失败: {e}")
-            self.signals.log.emit("ERROR", f"检索执行失败: {e}")
-            self.signals.finished.emit(False, str(e))
-
-    async def _run_async(self):
-        from src.web_automation.browser_manager import BrowserManager
-        from src.web_automation.authenticator import Authenticator
-        from src.web_automation.searcher import Searcher
-        from src.web_automation.human_behavior import HumanBehavior
-
-        self.signals.log.emit("INFO", "启动浏览器...")
-        self.signals.progress.emit(45, "启动浏览器...")
-
-        browser_mgr = BrowserManager(self.settings)
-        context, page = await browser_mgr.launch_with_retry(max_retries=2)
-
-        # 登录
-        auth = Authenticator(page, self.settings)
-        self.signals.log.emit("INFO", "检查登录状态...")
-        logged_in = await auth.check_login()
-        if not logged_in:
-            # 根据配置选择自动或手动登录
-            if self.settings.himmpat_login_mode == "auto":
-                self.signals.log.emit("INFO", "尝试自动登录...")
-                logged_in = await auth.auto_login()
-            if not logged_in:
-                self.signals.log.emit("WARN", "未登录，引导用户登录...")
-                self.signals.progress.emit(50, "等待用户登录HimmPat...")
-                await auth.manual_login(self.signals)
-
-        self.signals.log.emit("SUCCESS", "HimmPat 登录成功")
-        self.signals.progress.emit(55, "开始执行检索...")
-        self.signals.login_done.emit(True, "")
-
-        # 逐条检索
-        all_results = []
-        human = HumanBehavior(self.settings)
-        searcher = Searcher(page, self.settings, human)
-
-        for idx, query in enumerate(self.queries):
-            if not self._is_running:
-                self.signals.log.emit("WARN", "用户停止检索")
-                break
-
-            q_str = query.get("query_string", "")
-            self.signals.log.emit("INFO",
-                f"执行检索式 {idx+1}/{len(self.queries)}: {q_str}")
-
-            # 更新进度
-            progress = 55 + int((idx + 1) / len(self.queries) * 25)
-            self.signals.progress.emit(progress,
-                f"检索式 {idx+1}/{len(self.queries)}")
-
-            himmpat_count, results = await searcher.execute_search(q_str, idx + 1)
-            all_results.append(results)
-
-            # 显示HimmPat上的结果数量和实际提取数量
-            count_info = f"{himmpat_count}条" if himmpat_count >= 0 else "未知"
-            self.signals.log.emit("SUCCESS",
-                f"检索式{idx+1}完成: HimmPat显示{count_info}, 提取{len(results)}条")
-            self.signals.query_complete.emit(idx + 1, len(self.queries), results)
-
-            # 非最后一次查询时等待间隔
-            if idx < len(self.queries) - 1 and self._is_running:
-                await human.inter_search_delay(idx + 1)
-
-        # 关闭浏览器
-        await browser_mgr.close()
-
-        if self._is_running:
-            self.signals.progress.emit(80, "检索全部完成")
-            self.signals.log.emit("SUCCESS", f"全部检索完成，共收集 {sum(len(r) for r in all_results)} 条结果")
-            self.signals.all_searches_done.emit(all_results)
-        else:
-            self.signals.finished.emit(True, "用户停止")
-
-
-class SearchAndFetchWorker(QThread):
-    """
-    统一检索+抓取 Worker — 使用 HimmPatScraper 一体化流程
-
-    流程（每条检索式独立完成）:
-      1. 输入检索式 → 点击检索
-      2. 对结果页每个专利: 点击链接 → 进入详情页 → 提取全文 → 返回结果列表
-      3. 翻页 → 重复步骤2
-      4. 满50条/全部结束 → 下一条检索式
-      5. 全部检索式完成后 → 合并去重 → 发出结果
-
-    每条检索式的结果会实时通过 query_complete 信号发出，
-    主线程在每条检索式完成后更新 UI。
-    """
-
-    def __init__(self, queries: list, settings: Settings,
-                 max_fetch: int = 15, parent=None):
-        super().__init__(parent)
-        self.queries = queries
-        self.settings = settings
-        self.max_fetch = max_fetch
-        self.signals = WorkerSignals()
-        self._is_running = True
-
-    def stop(self):
-        self._is_running = False
-
-    def run(self):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._run_async())
-            loop.close()
-        except Exception as e:
-            self.signals.error.emit(f"检索分析失败: {e}")
-            self.signals.log.emit("ERROR", f"检索分析失败: {e}")
-            self.signals.finished.emit(False, str(e))
-
-    async def _run_async(self):
-        from src.web_automation.browser_manager import BrowserManager
-        from src.web_automation.authenticator import Authenticator
-        from src.web_automation.human_behavior import HumanBehavior
-        from src.web_automation.scraper import HimmPatScraper
-
-        # ============ 启动浏览器 + 登录 ============
-        self.signals.log.emit("INFO", "启动浏览器...")
-        self.signals.progress.emit(45, "启动浏览器...")
-
-        browser_mgr = BrowserManager(self.settings)
-        context, page = await browser_mgr.launch_with_retry(max_retries=2)
-
-        auth = Authenticator(page, self.settings)
-        self.signals.log.emit("INFO", "检查登录状态...")
-        logged_in = await auth.check_login()
-        if not logged_in:
-            if self.settings.himmpat_login_mode == "auto":
-                self.signals.log.emit("INFO", "尝试自动登录...")
-                logged_in = await auth.auto_login()
-            if not logged_in:
-                self.signals.log.emit("WARN", "未登录，引导用户登录...")
-                self.signals.progress.emit(50, "等待用户登录HimmPat...")
-                await auth.manual_login(self.signals)
-
-        self.signals.log.emit("SUCCESS", "HimmPat 登录成功")
-        self.signals.progress.emit(55, "开始执行检索与抓取...")
-        self.signals.login_done.emit(True, "")
-
-        # ============ 逐条检索 + 逐条抓取详情（一体化） ============
-        human = HumanBehavior(self.settings)
-        scraper = HimmPatScraper(page, self.settings, human)
-
-        all_enriched = []  # 每条检索式的 enriched results
-
-        for idx, query in enumerate(self.queries):
-            if not self._is_running:
-                self.signals.log.emit("WARN", "用户停止检索")
-                break
-
-            q_str = query.get("query_string", "")
-            angle = query.get("search_angle", "")
-            self.signals.log.emit("INFO",
-                f"🔍 检索式 {idx+1}/{len(self.queries)} [{angle}]: {q_str}")
-
-            progress = 55 + int((idx + 1) / len(self.queries) * 20)
-            self.signals.progress.emit(progress,
-                f"检索式 {idx+1}/{len(self.queries)}: 检索+抓取中...")
-
-            # 一体化执行：检索 → 分页 → 逐条点击提取 → 返回 → 翻页
-            enriched = await scraper.execute_query(
-                q_str,
-                query_index=idx + 1,
-                max_results=self.settings.himmpat_max_results,
-                signals=self.signals,
-            )
-
-            all_enriched.append(enriched)
-
-            self.signals.log.emit("SUCCESS",
-                f"检索式{idx+1}完成: 获取 {len(enriched)} 篇专利全文")
-
-            # 发出该检索式的结果（用于实时更新 UI）
-            self.signals.query_complete.emit(idx + 1, len(self.queries), enriched)
-
-            if idx < len(self.queries) - 1 and self._is_running:
-                await human.inter_search_delay(idx + 1)
-
-        # 保存登录态
-        try:
-            await browser_mgr.save_storage()
-        except Exception:
-            pass
-
-        # 关闭浏览器
-        await browser_mgr.close()
-
-        # ============ 发出全部结果（主线程会做去重 + 分析） ============
-        if self._is_running:
-            total = sum(len(r) for r in all_enriched)
-            self.signals.log.emit("SUCCESS",
-                f"全部检索+抓取完成: 共 {total} 篇专利（含重复）")
-            self.signals.progress.emit(82, "检索与抓取全部完成")
-            self.signals.all_searches_done.emit(all_enriched)
-            self.signals.finished.emit(True, "")
-        else:
-            self.signals.finished.emit(True, "用户停止")
-
-
 class PatentscopeSearchAndFetchWorker(QThread):
     """
     PATENTSCOPE 检索 + 智能筛选 Worker。
@@ -384,18 +159,32 @@ class PatentscopeSearchAndFetchWorker(QThread):
         human = HumanBehavior(self.settings)
         scraper = PatentscopeScraper(page, self.settings, human)
 
+        # ── 分离精准检索式与宽泛兜底检索式 ──
+        # 宽泛兜底仅在精准检索结果为零时才执行
+        def _is_fallback(q: dict) -> bool:
+            return (q.get("priority") == 99 or
+                    str(q.get("search_angle", "")).startswith("【宽泛兜底】"))
+
+        normal_queries = [q for q in self.queries if not _is_fallback(q)]
+        fallback_queries = [q for q in self.queries if _is_fallback(q)]
+
+        if fallback_queries:
+            self.signals.log.emit("INFO",
+                f"检索式: {len(normal_queries)} 个精准 + "
+                f"{len(fallback_queries)} 个宽泛兜底（仅零结果时触发）")
+
         all_abstracts = []
-        for idx, query in enumerate(self.queries):
+        for idx, query in enumerate(normal_queries):
             if not self._is_running:
                 break
             q_str = query.get("query_string", "")
             angle = query.get("search_angle", "")
             self.signals.log.emit("INFO",
-                f"检索式 {idx+1}/{len(self.queries)} [{angle}]: {q_str}")
+                f"检索式 {idx+1}/{len(normal_queries)} [{angle}]: {q_str}")
 
-            progress = 5 + int((idx + 1) / len(self.queries) * 15)
+            progress = 5 + int((idx + 1) / len(normal_queries) * 15)
             self.signals.progress.emit(progress,
-                f"阶段1: 搜索 {idx+1}/{len(self.queries)}")
+                f"阶段1: 搜索 {idx+1}/{len(normal_queries)}")
 
             abstracts = await scraper.search_abstracts(
                 q_str, max_results=self.settings.patentscope_max_results,
@@ -412,7 +201,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 {"query": q_str, "search_angle": angle,
                  "count": len(abstracts), "results": abstracts})
 
-            if idx < len(self.queries) - 1 and self._is_running:
+            if idx < len(normal_queries) - 1 and self._is_running:
                 await human.inter_search_delay(idx + 1)
 
         # 轮询合并去重：从每个检索式轮流取，保证各检索式均匀贡献
@@ -451,65 +240,44 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
         await browser_mgr.close()
 
-        # ── 0结果重试 ──────────────────────────────────────────────
-        retry_count = 0
-        while total_abstracts == 0 and retry_count < 3:
-            retry_count += 1
-            self.signals.log.emit("WARN",
-                f"未找到结果，AI 简化检索式并重试 (第{retry_count}/3次)...")
-            self.signals.progress.emit(5, f"简化检索式重试 {retry_count}/3...")
-
-            from src.ai_client import AIClient
-            client = AIClient(self.settings)
-            simplified = []
-            for q in self.queries:
-                q_str = q.get("query_string", "")
-                resp = client.chat(
-                    system_prompt="将以下 PATENTSCOPE 检索式简化为更短更宽泛的版本，只返回简化后的检索式，不要其他内容。",
-                    user_prompt=f"原检索式无结果，请简化：{q_str}",
-                    model=self.settings.ai_query_model,
-                    max_tokens=256, temperature=0.3)
-                simplified_q = resp.strip().strip('"').strip("'")
-                simplified.append({"query_string": simplified_q, "search_angle": q.get("search_angle","重试"), "priority": q.get("priority",1)})
-                self.signals.log.emit("INFO", f"  简化: {q_str[:60]}... → {simplified_q[:60]}...")
-
-            all_abstracts = []
+        # ── 0结果兜底：使用 AI 预生成的宽泛检索式 ──────────────────
+        if total_abstracts == 0 and fallback_queries:
+            self.signals.log.emit("INFO",
+                f"精准检索式无结果，使用 {len(fallback_queries)} 个宽泛兜底检索式重试...")
+            self.signals.progress.emit(5, "宽泛兜底检索...")
+            fallback_abstracts = []
             browser_mgr = BrowserManager(self.settings)
             context, page = await browser_mgr.launch_with_retry(max_retries=1)
             human = HumanBehavior(self.settings)
             scraper = PatentscopeScraper(page, self.settings, human)
-            for idx, q in enumerate(simplified):
+            for fq in fallback_queries:
                 if not self._is_running:
                     break
-                q_str = q.get("query_string", "")
+                fq_str = fq.get("query_string", "")
                 abstracts = await scraper.search_abstracts(
-                    q_str, max_results=self.settings.patentscope_max_results,
+                    fq_str, max_results=self.settings.patentscope_max_results,
                     signals=self.signals)
                 for a in abstracts:
-                    a["source_query"] = q_str
-                all_abstracts.append(abstracts)
-                self._save_json(
-                    output_dir / f"01_query_retry{retry_count}_{idx+1:02d}_abstracts.json",
-                    {"query": q_str, "count": len(abstracts), "results": abstracts})
-                if idx < len(simplified) - 1:
-                    await human.inter_search_delay(idx + 1)
+                    a["source_query"] = fq_str
+                fallback_abstracts.append(abstracts)
+                self.signals.log.emit("INFO",
+                    f"  兜底: {fq_str[:60]}... → {len(abstracts)} 篇")
             await browser_mgr.close()
-
             seen = set()
             unique_abstracts = []
-            for batch in all_abstracts:
+            for batch in fallback_abstracts:
                 for a in batch:
                     key = a.get("doc_id") or a.get("publication_number", "")
                     if key and key not in seen:
                         seen.add(key)
                         unique_abstracts.append(a)
-            # 过滤掉目标专利自身
             unique_abstracts, _ = self._filter_self_patent(unique_abstracts)
             total_abstracts = len(unique_abstracts)
-            self.signals.log.emit("INFO", f"  重试结果: {total_abstracts} 篇摘要")
+            self.signals.log.emit("INFO",
+                f"  兜底结果: {total_abstracts} 篇摘要")
 
         if total_abstracts == 0:
-            self.signals.log.emit("WARN", "3次重试仍未找到结果，停止检索")
+            self.signals.log.emit("WARN", "所有检索式（含宽泛兜底）均未找到结果，停止检索")
             self.signals.finished.emit(True, "无结果")
             return
 
@@ -860,77 +628,6 @@ def _extract_cited_patent_numbers(text: str) -> list[str]:
                 results.append(pn)
     return results
 
-
-class PatentFetchWorker(QThread):
-    """专利详情抓取后台线程"""
-
-    def __init__(self, dedup_results: list, settings: Settings,
-                 max_fetch: int = 15, parent=None):
-        super().__init__(parent)
-        self.dedup_results = dedup_results
-        self.settings = settings
-        self.max_fetch = max_fetch
-        self.signals = WorkerSignals()
-        self._is_running = True
-
-    def stop(self):
-        self._is_running = False
-
-    def run(self):
-        import asyncio
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._run_async())
-            loop.close()
-        except Exception as e:
-            self.signals.error.emit(f"专利详情抓取失败: {e}")
-            self.signals.log.emit("ERROR", f"专利详情抓取失败: {e}")
-            # 即使失败也继续（用已有数据）
-            self.signals.fetch_done.emit(self.dedup_results)
-
-    async def _run_async(self):
-        from src.web_automation.browser_manager import BrowserManager
-        from src.web_automation.authenticator import Authenticator
-        from src.web_automation.patent_fetcher import PatentFetcher
-        from src.web_automation.human_behavior import HumanBehavior
-
-        self.signals.log.emit("INFO", f"启动浏览器，准备抓取专利详情（最多{self.max_fetch}篇）...")
-        self.signals.progress.emit(78, "抓取专利详情中...")
-
-        browser_mgr = BrowserManager(self.settings)
-        context, page = await browser_mgr.launch_with_retry()
-
-        # 检查登录
-        auth = Authenticator(page, self.settings)
-        logged_in = await auth.check_login()
-        if not logged_in:
-            if self.settings.himmpat_login_mode == "auto":
-                logged_in = await auth.auto_login()
-            if not logged_in:
-                self.signals.log.emit("WARN", "需要登录HimmPat...")
-                await auth.manual_login(self.signals)
-
-        # 抓取详情
-        human = HumanBehavior(self.settings)
-        fetcher = PatentFetcher(page, self.settings, human)
-        enriched = await fetcher.fetch_batch(
-            self.dedup_results,
-            signals=self.signals,
-            max_count=self.max_fetch,
-        )
-
-        await browser_mgr.close()
-
-        self.signals.log.emit("SUCCESS",
-            f"专利详情抓取完成: {sum(1 for r in enriched if r.get('full_text'))} 篇获取到全文")
-        self.signals.progress.emit(82, "详情抓取完成")
-        self.signals.fetch_done.emit(enriched)
-
-        if not self._is_running:
-            self.signals.finished.emit(True, "用户停止")
-
-
 class AnalysisWorker(QThread):
     """对比分析后台线程"""
 
@@ -1144,39 +841,6 @@ class PatentscopeAbstractTestWorker(QThread):
         self.signals.progress.emit(100, "摘要测试完成")
         self.signals.all_searches_done.emit([abstracts])
         self.signals.finished.emit(True, "")
-
-
-class SingleCompareWorker(QThread):
-    """单篇专利对比 Worker — 点击左侧专利时触发，在右侧显示详细对比"""
-
-    def __init__(self, patent_doc, candidate: dict, settings: Settings,
-                 ai_provider: str | None = None, parent=None):
-        super().__init__(parent)
-        self.patent_doc = patent_doc
-        self.candidate = candidate
-        self.settings = settings
-        self.ai_provider = ai_provider
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            pub = self.candidate.get("publication_number", "?")
-            self.signals.log.emit("INFO", f"🔄 AI 正在对比 {pub} vs 本申请...")
-
-            from src.analysis.comparator import PatentComparator
-            comparator = PatentComparator(
-                self.settings, provider=self.ai_provider)
-            result = comparator.compare_single_fulltext(
-                self.patent_doc, self.candidate)
-
-            self.signals.log.emit("SUCCESS", f"对比完成: {pub}")
-            # 用 analysis_done 传结果给主线程
-            self.signals.analysis_done.emit(result)
-            self.signals.finished.emit(True, "")
-        except Exception as e:
-            self.signals.error.emit(f"对比失败: {e}")
-            self.signals.log.emit("ERROR", f"对比失败: {e}")
-            self.signals.finished.emit(False, str(e))
 
 
 class PatentLookupWorker(QThread):

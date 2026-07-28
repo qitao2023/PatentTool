@@ -96,14 +96,6 @@ class Settings:
         ai = self._raw.get("ai", {})
         return ai.get("analysis_model", self.ai_model)
 
-    @property
-    def himmpat_username(self) -> str | None:
-        return os.getenv("HIMMPAT_USERNAME")
-
-    @property
-    def himmpat_password(self) -> str | None:
-        return os.getenv("HIMMPAT_PASSWORD")
-
     # --- PDF ---
     @property
     def pdf_max_pages(self) -> int:
@@ -125,6 +117,36 @@ class Settings:
     @property
     def query_max_tokens(self) -> int:
         return self._raw.get("query_generation", {}).get("max_tokens", 8192)
+
+    @property
+    def query_max_description_chars(self) -> int:
+        """说明书截断长度（保留发明内容 + 实施方式前段），默认 5000"""
+        return self._raw.get("query_generation", {}).get("max_description_chars", 5000)
+
+    # --- 提示词模板 ---
+    @property
+    def prompts_dir(self) -> Path:
+        """提示词模板目录"""
+        return self.config_dir / "prompts"
+
+    @property
+    def prompts_active_profile(self) -> str:
+        """当前使用的提示词方案名称"""
+        return self._raw.get("query_generation", {}).get("prompt_profile", "default")
+
+    def get_prompt_text(self, profile: str, prompt_type: str) -> str:
+        """读取指定 profile 的 prompt 文本（system 或 user）
+
+        Args:
+            profile: 方案名称，如 "default" 或 "semiconductor"
+            prompt_type: "system" 或 "user"
+        Returns:
+            prompt 文本；文件不存在返回空字符串
+        """
+        path = self.prompts_dir / profile / f"{prompt_type}.txt"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
 
     # --- Web ---
     @property
@@ -184,37 +206,6 @@ class Settings:
     def patentscope_rate_limit(self) -> int:
         return self._raw.get("patentscope", {}).get("rate_limit_calls_per_hour", 1000)
 
-    # --- HimmPat（保留备用）---
-    @property
-    def himmpat_base_url(self) -> str:
-        return self._raw.get("himmpat", {}).get("base_url", "https://www.himmpat.com")
-
-    @property
-    def himmpat_search_url(self) -> str:
-        return self._raw.get("himmpat", {}).get("search_url",
-                                                 "https://www.himmpat.com/intelligence?active=6")
-
-    @property
-    def himmpat_login_url(self) -> str:
-        return self._raw.get("himmpat", {}).get("login_url",
-                                                 "https://rd.himmpat.com/login")
-
-    @property
-    def himmpat_login_mode(self) -> str:
-        return self._raw.get("himmpat", {}).get("login_mode", "manual")
-
-    @property
-    def himmpat_max_results(self) -> int:
-        return self._raw.get("himmpat", {}).get("max_results_per_query", 50)
-
-    @property
-    def himmpat_results_per_page(self) -> int:
-        return self._raw.get("himmpat", {}).get("results_per_page", 20)
-
-    @property
-    def himmpat_selectors(self) -> dict:
-        return self._raw.get("himmpat", {}).get("selectors", {})
-
     # --- 人类行为 ---
     @property
     def human_typing_min_ms(self) -> int:
@@ -269,7 +260,7 @@ class Settings:
 
     @property
     def session_profile_dir(self) -> str:
-        return self._raw.get("session", {}).get("profile_dir", "profiles/himmpat_browser")
+        return self._raw.get("session", {}).get("profile_dir", "profiles/patentscope_browser")
 
     # --- 输出 ---
     @property

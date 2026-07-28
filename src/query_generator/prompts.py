@@ -1,11 +1,13 @@
 """
-AI 检索式生成 Prompt 模板 — PATENTSCOPE 简单搜索，中英关键词
+AI 检索式生成 Prompt 模板 — 从 config/prompts/<profile>/*.txt 加载，支持多方案切换
 """
 from src.pdf_extractor.extractor import PatentDocument
 
+# ============================================================
+# Fallback 默认提示词（当配置文件中不存在时使用）
+# ============================================================
 
-def build_system_prompt() -> str:
-    return """你是一名中国专利审查员，需要在 PATENTSCOPE 中检索现有技术。
+FALLBACK_SYSTEM_PROMPT = """你是一名中国专利审查员，需要在 PATENTSCOPE 中检索现有技术。
 
 ## 检索语法（PATENTSCOPE 简单搜索）
 
@@ -53,27 +55,7 @@ def build_system_prompt() -> str:
 - 第1个检索式必须最简单、最宽泛、保证有结果
 """
 
-
-def build_user_prompt(patent: PatentDocument, max_queries: int = 10) -> str:
-    patent_sections = []
-    if patent.title:
-        patent_sections.append(f"## 发明名称\n{patent.title}")
-    if patent.abstract:
-        patent_sections.append(f"## 摘要\n{patent.abstract}")
-    if patent.claims:
-        patent_sections.append(f"## 权利要求书\n" + "\n".join(patent.claims))
-    if patent.ipc_classifications:
-        patent_sections.append(f"## IPC分类号\n" + ", ".join(patent.ipc_classifications))
-    if patent.applicants:
-        patent_sections.append(f"## 申请人\n" + ", ".join(patent.applicants))
-    if patent.inventors:
-        patent_sections.append(f"## 发明人\n" + ", ".join(patent.inventors))
-    if patent.description:
-        patent_sections.append(f"## 说明书\n{patent.description}")
-
-    patent_markdown = "\n\n".join(patent_sections)
-
-    return f"""# 专利技术方案分析
+FALLBACK_USER_PROMPT = """# 专利技术方案分析
 
 {patent_markdown}
 
@@ -125,3 +107,120 @@ def build_user_prompt(patent: PatentDocument, max_queries: int = 10) -> str:
 - priority: 1 = 最宽泛/最重要
 - 第1个检索式必须是最简单、最宽泛、保证有结果的
 """
+
+
+# ============================================================
+# 公共函数
+# ============================================================
+
+def _truncate_description(description: str, max_chars: int) -> str:
+    """智能截断说明书：优先保留"发明内容"，次选"具体实施方式"前段
+
+    中国专利说明书结构：
+      技术领域 → 背景技术 → 发明内容 → 附图说明 → 具体实施方式
+    其中"发明内容"与权利要求对应，是检索式生成最有价值的部分。
+    """
+    if not description or len(description) <= max_chars:
+        return description or ""
+
+    import re
+
+    # 策略1: 提取"发明内容"部分
+    invention_match = re.search(
+        r'(?:发明内容|发明概述).*?(?=\n(?:附图说明|具体实施方式|实施例|图\d|Brief Description|DETAILED DESCRIPTION|Detailed Description|附图中|以下结合))',
+        description, re.IGNORECASE | re.DOTALL
+    )
+
+    if invention_match and len(invention_match.group()) > 200:
+        invention_text = invention_match.group().strip()
+        remaining = max_chars - len(invention_text)
+
+        if remaining > 500:
+            # 策略2: 还有空间，追加"具体实施方式"前段
+            after_invention = description[invention_match.end():]
+            impl_match = re.search(
+                r'(?:具体实施方式|DETAILED DESCRIPTION|Detailed Description).*',
+                after_invention, re.IGNORECASE | re.DOTALL
+            )
+            if impl_match:
+                impl_text = impl_match.group()[:remaining].strip()
+                return (invention_text + "\n\n## 具体实施方式（前段）\n" +
+                        impl_text +
+                        f"\n\n---\n[说明书已智能截断，保留约 {max_chars} 字符]")
+        return invention_text + "\n\n---\n[说明书已截断]"
+
+    # 策略3（降级）: 未找到标准段落结构 → 取前 max_chars
+    return description[:max_chars] + "\n\n---\n[说明书已截断]"
+
+
+def build_patent_markdown(patent: PatentDocument,
+                          max_description_chars: int = 5000) -> str:
+    """从 PatentDocument 提取信息拼接为 Markdown
+
+    Args:
+        patent: 专利文档
+        max_description_chars: 说明书截断长度，0 表示不截断
+    """
+    sections = []
+    if patent.title:
+        sections.append(f"## 发明名称\n{patent.title}")
+    if patent.abstract:
+        sections.append(f"## 摘要\n{patent.abstract}")
+    if patent.claims:
+        # 权利要求1 单独标注，引导 AI 重点关注
+        claims_text = patent.claims.copy()
+        if claims_text:
+            claims_text[0] = f"【权利要求1 — 独立权利要求，本申请最核心保护范围】\n{claims_text[0]}"
+        sections.append("## 权利要求书\n" + "\n\n".join(claims_text))
+    if patent.ipc_classifications:
+        sections.append("## IPC分类号\n" + ", ".join(patent.ipc_classifications))
+    if patent.applicants:
+        sections.append("## 申请人\n" + ", ".join(patent.applicants))
+    if patent.inventors:
+        sections.append("## 发明人\n" + ", ".join(patent.inventors))
+    if patent.description:
+        desc = _truncate_description(patent.description, max_description_chars) \
+            if max_description_chars > 0 else patent.description
+        sections.append(f"## 说明书\n{desc}")
+    return "\n\n".join(sections)
+
+
+def load_prompt_templates(settings) -> dict:
+    """从 Settings 加载当前活跃 profile 的提示词模板
+
+    Returns:
+        {"system": str, "user": str}
+    """
+    profile = settings.prompts_active_profile
+    system = settings.get_prompt_text(profile, "system") or FALLBACK_SYSTEM_PROMPT
+    user = settings.get_prompt_text(profile, "user") or FALLBACK_USER_PROMPT
+    return {"system": system, "user": user}
+
+
+def build_system_prompt(settings=None) -> str:
+    """构建 System Prompt
+
+    Args:
+        settings: Settings 对象。为 None 时使用 fallback 默认值。
+    """
+    if settings:
+        return load_prompt_templates(settings)["system"]
+    return FALLBACK_SYSTEM_PROMPT
+
+
+def build_user_prompt(patent: PatentDocument, max_queries: int = 10,
+                      settings=None) -> str:
+    """构建 User Prompt（含专利信息和变量替换）
+
+    Args:
+        patent: 专利文档
+        max_queries: 最大检索式数量
+        settings: Settings 对象。为 None 时使用 fallback 默认值。
+    """
+    max_desc = settings.query_max_description_chars if settings else 5000
+    patent_md = build_patent_markdown(patent, max_description_chars=max_desc)
+    if settings:
+        template = load_prompt_templates(settings)["user"]
+    else:
+        template = FALLBACK_USER_PROMPT
+    return template.format(patent_markdown=patent_md, max_queries=max_queries)
