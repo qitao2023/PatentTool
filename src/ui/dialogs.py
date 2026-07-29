@@ -151,6 +151,13 @@ class SettingsDialog(QDialog):
         self.stop_after_combo.setToolTip("流程运行到选定步骤后自动停止")
         search_form.addRow("流程断点:", self.stop_after_combo)
 
+        self.prefer_cn_family_cb = QCheckBox("优先使用中国同族专利（下载全文时自动替换非CN专利）")
+        self.prefer_cn_family_cb.setChecked(True)
+        self.prefer_cn_family_cb.setToolTip(
+            "下载全文时，如遇非中文专利（WO/US/EP等），\n"
+            "自动在专利族标签页中查找 CN 开头专利并替换，同时记录替换日志")
+        search_form.addRow(self.prefer_cn_family_cb)
+
         params_layout.addWidget(search_group)
         params_layout.addStretch(1)
         self.tab_widget.addTab(tab_params, "⚙ 检索参数")
@@ -209,6 +216,8 @@ class SettingsDialog(QDialog):
             self.settings.search_include_citations)
         self.force_refresh_cb.setChecked(
             self.settings.search_force_refresh)
+        self.prefer_cn_family_cb.setChecked(
+            self.settings.search_prefer_cn_family)
         # 流程断点
         stop = self.settings.search_stop_after
         idx = self.stop_after_combo.findData(stop)
@@ -362,6 +371,7 @@ class SettingsDialog(QDialog):
             "include_citations": self.include_citations_cb.isChecked(),
             "force_refresh": self.force_refresh_cb.isChecked(),
             "stop_after": self.stop_after_combo.currentData(),
+            "prefer_cn_family": self.prefer_cn_family_cb.isChecked(),
         }
 
         # 写检索参数到 settings.yaml
@@ -374,6 +384,7 @@ class SettingsDialog(QDialog):
                     ("include_citations", params["include_citations"], False),
                     ("force_refresh", params["force_refresh"], False),
                     ("stop_after", params["stop_after"], True),
+                    ("prefer_cn_family", params["prefer_cn_family"], False),
                 ]:
                     if is_str:
                         val_str = f'"{value}"'
@@ -412,6 +423,7 @@ class SettingsDialog(QDialog):
             f"检索参数:\n"
             f"  提取引用专利: {'是' if params['include_citations'] else '否'}\n"
             f"  强制重新获取: {'是' if params['force_refresh'] else '否'}\n"
+            f"  优先使用中国同族: {'是' if params['prefer_cn_family'] else '否'}\n"
             f"  流程断点: {self.stop_after_combo.currentText()}\n\n"
             "设置已写入 config/.env 和 config/settings.yaml，持续生效。")
 

@@ -187,9 +187,43 @@ class PatentscopeSearchAndFetchWorker(QThread):
             self.signals.progress.emit(progress,
                 f"阶段1: 搜索 {idx+1}/{len(normal_queries)}")
 
-            abstracts = await scraper.search_abstracts(
-                q_str, max_results=self.settings.patentscope_max_results,
-                signals=self.signals)
+            # ── 带 403 重试的搜索 ──
+            MAX_SEARCH_RETRIES = 3
+            abstracts = []
+            for attempt in range(1, MAX_SEARCH_RETRIES + 1):
+                try:
+                    abstracts = await scraper.search_abstracts(
+                        q_str, max_results=self.settings.patentscope_max_results,
+                        signals=self.signals)
+                    break  # 成功，跳出重试循环
+                except Exception as e:
+                    err_msg = str(e)
+                    is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
+                    if is_403 and attempt < MAX_SEARCH_RETRIES and self._is_running:
+                        # 切换浏览器 + 冷却 + 重试
+                        from src.web_automation.browser_manager import BrowserManager
+                        new_browser = BrowserManager.switch_channel(on_403=True)
+                        cool = random.uniform(8, 20)
+                        self.signals.log.emit("WARN",
+                            f"  搜索遇到 403，切换至 {new_browser} + 冷却 {cool:.0f}s "
+                            f"(第 {attempt}/{MAX_SEARCH_RETRIES} 次重试)...")
+                        await browser_mgr.close()
+                        await asyncio.sleep(cool)
+                        try:
+                            context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                        except Exception:
+                            await asyncio.sleep(2)
+                            context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                        human = HumanBehavior(self.settings)
+                        scraper = PatentscopeScraper(page, self.settings, human)
+                    else:
+                        raise  # 非403或重试耗尽，向外抛出
+
+            if not abstracts and attempt >= MAX_SEARCH_RETRIES:
+                self.signals.log.emit("ERROR",
+                    f"  检索式{idx+1} 重试 {MAX_SEARCH_RETRIES} 次仍失败，跳过")
+                continue
+
             for a in abstracts:
                 a["source_query"] = q_str
             all_abstracts.append(abstracts)
@@ -255,9 +289,41 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 if not self._is_running:
                     break
                 fq_str = fq.get("query_string", "")
-                abstracts = await scraper.search_abstracts(
-                    fq_str, max_results=self.settings.patentscope_max_results,
-                    signals=self.signals)
+
+                # ── 带 403 重试的兜底搜索 ──
+                abstracts = []
+                for attempt in range(1, 4):
+                    try:
+                        abstracts = await scraper.search_abstracts(
+                            fq_str, max_results=self.settings.patentscope_max_results,
+                            signals=self.signals)
+                        break
+                    except Exception as e:
+                        err_msg = str(e)
+                        is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
+                        if is_403 and attempt < 3 and self._is_running:
+                            from src.web_automation.browser_manager import BrowserManager
+                            new_browser = BrowserManager.switch_channel(on_403=True)
+                            cool = random.uniform(8, 20)
+                            self.signals.log.emit("WARN",
+                                f"  兜底搜索 403，切换 {new_browser} + 冷却 {cool:.0f}s "
+                                f"(第 {attempt}/3 次重试)...")
+                            await browser_mgr.close()
+                            await asyncio.sleep(cool)
+                            try:
+                                context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                            except Exception:
+                                await asyncio.sleep(2)
+                                context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                            human = HumanBehavior(self.settings)
+                            scraper = PatentscopeScraper(page, self.settings, human)
+                        else:
+                            raise
+
+                if not abstracts and attempt >= 3:
+                    self.signals.log.emit("WARN",
+                        f"  兜底: {fq_str[:60]}... → 重试3次仍失败")
+                    continue
                 for a in abstracts:
                     a["source_query"] = fq_str
                 fallback_abstracts.append(abstracts)
@@ -317,6 +383,28 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
                 added = 0
                 _cite_failed = []
+                _consecutive_403 = 0
+
+                async def _restart_for_cite():
+                    """遇到403 → 切换浏览器 + 冷却 + 重启"""
+                    nonlocal context1, page1, scraper1, human1, browser_mgr1, _consecutive_403
+                    from src.web_automation.browser_manager import BrowserManager
+                    new_browser = BrowserManager.switch_channel(on_403=True)
+                    cool = random.uniform(8, 20)
+                    self.signals.log.emit("WARN",
+                        f"  引用下载 403，切换至 {new_browser} + 冷却 {cool:.0f}s...")
+                    await browser_mgr1.close()
+                    await asyncio.sleep(cool)
+                    browser_mgr1 = BrowserManager(self.settings)
+                    try:
+                        context1, page1 = await browser_mgr1.launch_with_retry(max_retries=1)
+                    except Exception:
+                        await asyncio.sleep(2)
+                        context1, page1 = await browser_mgr1.launch_with_retry(max_retries=1)
+                    human1 = HumanBehavior(self.settings)
+                    scraper1 = PatentscopeScraper(page1, self.settings, human1)
+                    _consecutive_403 = 0
+
                 for i, pub in enumerate(new_pubs):
                     if not self._is_running:
                         break
@@ -342,47 +430,15 @@ class PatentscopeSearchAndFetchWorker(QThread):
                         except Exception:
                             pass
 
-                    # 缓存未命中 → 联网获取
+                    # 缓存未命中 → 联网获取（带403重试）
                     self.signals.log.emit("INFO",
                         f"  下载引用专利 [{i+1}/{len(new_pubs)}]: {pub}")
-                    try:
-                        detail = await scraper1.fetch_detail(pub)
-                        if detail:
-                            cache_path.write_text(
-                                json_module.dumps(detail, indent=2, ensure_ascii=False, default=str),
-                                encoding="utf-8")
-                            item = {
-                                "doc_id": detail.get("doc_id", pub),
-                                "publication_number": detail.get("publication_number", pub),
-                                "title": detail.get("title", ""),
-                                "abstract_snippet": (detail.get("abstract") or "")[:300],
-                                "ipc": detail.get("ipc", ""),
-                                "applicant": detail.get("applicant", ""),
-                                "source_query": f"说明书引用: {pub}",
-                            }
-                            unique_abstracts.append(item)
-                            added += 1
-                        else:
-                            _cite_failed.append(pub)
-                            self.signals.log.emit("WARN", f"    未能获取: {pub}")
-                    except Exception as e:
-                        _cite_failed.append(pub)
-                        self.signals.log.emit("WARN", f"    下载失败: {pub} - {e}")
-                    await asyncio.sleep(1.0)
-
-                # ── 引用专利补下载 ──
-                if _cite_failed and self._is_running:
-                    self.signals.log.emit("INFO",
-                        f"  === 补下载 {len(_cite_failed)} 篇引用专利 === ")
-                    await asyncio.sleep(3)
-                    for pub in _cite_failed:
-                        if not self._is_running:
-                            break
-                        self.signals.log.emit("INFO", f"  重试: {pub}")
+                    success = False
+                    for attempt in range(1, 4):
                         try:
+                            _consecutive_403 = 0
                             detail = await scraper1.fetch_detail(pub)
                             if detail:
-                                cache_path = cache_dir / f"{_safe_filename(pub)}.json"
                                 cache_path.write_text(
                                     json_module.dumps(detail, indent=2, ensure_ascii=False, default=str),
                                     encoding="utf-8")
@@ -397,10 +453,68 @@ class PatentscopeSearchAndFetchWorker(QThread):
                                 }
                                 unique_abstracts.append(item)
                                 added += 1
-                            else:
-                                self.signals.log.emit("WARN", f"    重试仍失败: {pub}")
+                                success = True
+                            break
                         except Exception as e:
-                            self.signals.log.emit("WARN", f"    重试失败: {pub} - {e}")
+                            err_msg = str(e)
+                            is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
+                            if is_403 and attempt < 3 and self._is_running:
+                                _consecutive_403 += 1
+                                await _restart_for_cite()
+                            else:
+                                if attempt >= 3:
+                                    self.signals.log.emit("WARN",
+                                        f"    下载失败(重试3次): {pub} - {e}")
+                                else:
+                                    self.signals.log.emit("WARN", f"    下载失败: {pub} - {e}")
+                                break
+                    if not success:
+                        _cite_failed.append(pub)
+                    await asyncio.sleep(1.0)
+
+                # ── 引用专利补下载 ──
+                if _cite_failed and self._is_running:
+                    self.signals.log.emit("INFO",
+                        f"  === 补下载 {len(_cite_failed)} 篇引用专利 === ")
+                    await _restart_for_cite()
+                    await asyncio.sleep(3)
+                    for pub in _cite_failed:
+                        if not self._is_running:
+                            break
+                        self.signals.log.emit("INFO", f"  重试: {pub}")
+                        success = False
+                        for attempt in range(1, 4):
+                            try:
+                                detail = await scraper1.fetch_detail(pub)
+                                if detail:
+                                    cache_path = cache_dir / f"{_safe_filename(pub)}.json"
+                                    cache_path.write_text(
+                                        json_module.dumps(detail, indent=2, ensure_ascii=False, default=str),
+                                        encoding="utf-8")
+                                    item = {
+                                        "doc_id": detail.get("doc_id", pub),
+                                        "publication_number": detail.get("publication_number", pub),
+                                        "title": detail.get("title", ""),
+                                        "abstract_snippet": (detail.get("abstract") or "")[:300],
+                                        "ipc": detail.get("ipc", ""),
+                                        "applicant": detail.get("applicant", ""),
+                                        "source_query": f"说明书引用: {pub}",
+                                    }
+                                    unique_abstracts.append(item)
+                                    added += 1
+                                    success = True
+                                break
+                            except Exception as e:
+                                err_msg = str(e)
+                                is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
+                                if is_403 and attempt < 3 and self._is_running:
+                                    await _restart_for_cite()
+                                else:
+                                    self.signals.log.emit("WARN",
+                                        f"    重试仍失败: {pub} - {e}")
+                                    break
+                        if not success:
+                            self.signals.log.emit("WARN", f"    最终失败: {pub}")
                         await asyncio.sleep(3.0)
 
                 await browser_mgr1.close()
@@ -456,6 +570,51 @@ class PatentscopeSearchAndFetchWorker(QThread):
             to_fetch, str(details_dir), concurrency=1, signals=self.signals)
 
         await browser_mgr2.close()
+
+        # ── CN同族替换去重：移除因CN替换产生的重复 ──
+        _cn_dup_removed = 0
+        _cn_pubs = {}  # publication_number → file_path
+        # 第一遍：收集所有 CN 专利（非替换的原始 CN 专利优先）
+        for f in sorted(Path(details_dir).glob("*.json")):
+            try:
+                d = json_module.loads(f.read_text(encoding="utf-8"))
+                if d.get("fetch_status") != "ok":
+                    continue
+                pub = (d.get("publication_number") or "").strip()
+                if not pub:
+                    continue
+                is_substituted = bool(d.get("_cn_family_original"))
+                if pub not in _cn_pubs:
+                    _cn_pubs[pub] = (f, is_substituted)
+                elif is_substituted and not _cn_pubs[pub][1]:
+                    # 当前是替换来的，已有的是原生CN → 删除当前
+                    f.unlink(missing_ok=True)
+                    cn_orig = d.get("_cn_family_original", "?")
+                    self.signals.log.emit("INFO",
+                        f"  🗑 去重: CN同族替换 {cn_orig} → {pub}，"
+                        f"已有原生CN专利，删除替换条目")
+                    _cn_dup_removed += 1
+                elif not is_substituted and _cn_pubs[pub][1]:
+                    # 当前是原生CN，已有的是替换来的 → 删除已有的
+                    old_f, _ = _cn_pubs[pub]
+                    cn_orig = "?"
+                    try:
+                        old_d = json_module.loads(old_f.read_text(encoding="utf-8"))
+                        cn_orig = old_d.get("_cn_family_original", cn_orig)
+                    except Exception:
+                        pass
+                    old_f.unlink(missing_ok=True)
+                    self.signals.log.emit("INFO",
+                        f"  🗑 去重: 原生CN {pub} 保留，移除 CN同族替换 {cn_orig} → {pub}")
+                    _cn_pubs[pub] = (f, False)
+                    _cn_dup_removed += 1
+            except Exception:
+                pass
+
+        if _cn_dup_removed > 0:
+            self.signals.log.emit("SUCCESS",
+                f"  CN同族去重完成: 移除 {_cn_dup_removed} 篇重复专利")
+        # ── CN同族去重结束 ──
 
         # ── 断点：下载后 ──
         if self.stop_after == "download":
@@ -1116,29 +1275,45 @@ class PatentLookupWorker(QThread):
         from src.web_automation.patentscope_scraper import PatentscopeScraper
         from src.web_automation.human_behavior import HumanBehavior
 
-        mgr = BrowserManager(self.settings)
-        context, page = await mgr.launch_with_retry(max_retries=1)
+        # 清洗查询词
+        import re as _re
+        q = self.query.strip()
+        q = _re.sub(r'\s+', '', q)
+        q = _re.sub(r'[ABU]\d?$', '', q)
+        self.signals.log.emit("INFO", f"查询: {q}")
 
-        try:
-            human = HumanBehavior(page)
-            scraper = PatentscopeScraper(page, self.settings, human)
+        MAX_RETRIES = 3
+        for attempt in range(1, MAX_RETRIES + 1):
+            mgr = BrowserManager(self.settings)
+            try:
+                context, page = await mgr.launch_with_retry(max_retries=1)
+                human = HumanBehavior(page)
+                scraper = PatentscopeScraper(page, self.settings, human)
 
-            # 清洗查询词
-            q = self.query.strip()
-            import re as _re
-            q = _re.sub(r'\s+', '', q)           # 去空格
-            q = _re.sub(r'[ABU]\d?$', '', q)      # 去末尾种类码
-            self.signals.log.emit("INFO", f"查询: {q}")
+                result = await scraper.fetch_detail_via_search(q, signals=self.signals)
 
-            # 用搜索方式获取详情
-            result = await scraper.fetch_detail_via_search(q, signals=self.signals)
+                if result:
+                    self.signals.log.emit("SUCCESS",
+                        f"查询完成: claims={len(result.get('claims',''))} "
+                        f"desc={len(result.get('description',''))}")
+                    return result
+                else:
+                    self.signals.log.emit("WARN", f"未找到: {q}")
+                    return None
+            except Exception as e:
+                err_msg = str(e)
+                is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
+                if is_403 and attempt < MAX_RETRIES:
+                    new_browser = BrowserManager.switch_channel(on_403=True)
+                    cool = random.uniform(8, 20)
+                    self.signals.log.emit("WARN",
+                        f"  查询遇到 403，切换至 {new_browser} + 冷却 {cool:.0f}s "
+                        f"(第 {attempt}/{MAX_RETRIES} 次重试)...")
+                    await asyncio.sleep(cool)
+                else:
+                    self.signals.log.emit("ERROR", f"查询失败: {e}")
+                    return None
+            finally:
+                await BrowserManager.shutdown()
 
-            if not result:
-                self.signals.log.emit("WARN", f"未找到: {q}")
-                return None
-
-            self.signals.log.emit("SUCCESS",
-                f"查询完成: claims={len(result.get('claims',''))} desc={len(result.get('description',''))}")
-            return result
-        finally:
-            await BrowserManager.shutdown()
+        return None

@@ -30,7 +30,9 @@ query_generation:
 
 # Web自动化
 web:
-  browser: "firefox"                 # chrome 或 msedge
+  browser: "firefox"                # chrome / msedge / firefox
+  use_cdp: false                    # true=连已有浏览器(需先开 --remote-debugging-port)
+  cdp_port: 9222                    # CDP 远程调试端口
   viewport_width: 1920
   viewport_height: 1080
   locale: "zh-CN"
@@ -43,6 +45,7 @@ search:
   include_citations: true       # 从说明书提取引用专利号
   force_refresh: false          # 强制重新获取本申请
   stop_after: "download"            # 流程断点: abstracts | screen | download | score | full
+  prefer_cn_family: true        # 优先使用中国同族专利：下载全文时若遇非CN专利，自动查专利族中的CN专利替换
 
 # PATENTSCOPE 配置
 patentscope:

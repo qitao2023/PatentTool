@@ -219,6 +219,11 @@ class Settings:
         return self._raw.get("search", {}).get("force_refresh", False)
 
     @property
+    def search_prefer_cn_family(self) -> bool:
+        """优先使用中国同族专利：下载全文时若遇非CN专利，自动查专利族中的CN专利替换"""
+        return self._raw.get("search", {}).get("prefer_cn_family", True)
+
+    @property
     def search_stop_after(self) -> str:
         """流程断点: abstracts | screen | download | score | full"""
         v = self._raw.get("search", {}).get("stop_after", "full")
