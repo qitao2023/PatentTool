@@ -922,17 +922,41 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
 
     @Slot(dict)
     def _on_patent_clicked(self, patent: dict):
-        """点击专利 → 展示详情 + 缓存的 AI 对比结果（不额外调 AI）"""
+        """点击专利 → 优先从缓存加载完整详情（含权利要求/说明书）"""
         pub = patent.get("publication_number", "?")
-        # 先展示专利原始详情
+        # 尝试从缓存加载完整详情
+        full = self._load_cached_detail(patent)
+        if full:
+            patent = full
         self.report_panel.show_patent_detail(patent)
-        # 检查缓存：有对比结果就展示，没有就仅展示详情
         if self._comparison_cache and pub in self._comparison_cache:
             self.report_panel.show_single_comparison(
                 pub, self._comparison_cache[pub])
         else:
             self.log_panel.append_log("INFO",
                 f"  {pub}: 暂无非AI对比缓存，显示原始详情")
+
+    def _load_cached_detail(self, patent: dict) -> dict | None:
+        """从缓存文件加载完整专利详情"""
+        import json as _json
+        from src.web_automation.patentscope_scraper import is_cached_patent_valid, _safe_filename
+        pub = patent.get("publication_number", "")
+        doc_id = patent.get("doc_id", "")
+        if not self._pdf_path:
+            return None
+        cache_dir = Path(self._pdf_path).parent / "patent_cache"
+        for key in (pub, doc_id):
+            if not key:
+                continue
+            fpath = cache_dir / f"{_safe_filename(key)}.json"
+            if fpath.exists():
+                try:
+                    data = _json.loads(fpath.read_text(encoding="utf-8"))
+                    if is_cached_patent_valid(data):
+                        return data
+                except Exception:
+                    pass
+        return None
 
     @Slot(str)
     def _handle_error(self, error_msg: str):

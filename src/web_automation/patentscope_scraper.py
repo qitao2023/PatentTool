@@ -448,8 +448,8 @@ class PatentscopeScraper:
 
                     detail = await self._extract_detail_page(doc_id, page=pg)
 
-                    # 直连失败 → 搜索方式兜底
-                    if not detail:
+                    # 有链接的直接用，没链接的才搜——绝不多搜一次
+                    if not detail and not stored_url:
                         self.page = pg
                         detail = await self.fetch_detail_via_search(
                             doc_id, signals=signals)
@@ -710,8 +710,11 @@ class PatentscopeScraper:
                 if (titleEl) item.title = titleEl.textContent.trim();
                 var linkEl = row.querySelector("a[href*='detail']");
                 if (linkEl) {
-                    item.detail_url = linkEl.href;
-                    var m = linkEl.href.match(/docId=([^&]+)/);
+                    var href = linkEl.href;
+                    // 去掉 _cid 等 session 参数，只保留 docId
+                    href = href.replace(/[&?]_cid=[^&]*/g, '');
+                    item.detail_url = href;
+                    var m = href.match(/docId=([^&]+)/);
                     item.doc_id = m ? m[1] : "";
                     if (!item.patent_number) item.patent_number = linkEl.textContent.trim();
                 }
@@ -731,7 +734,7 @@ class PatentscopeScraper:
 
                 // 申请号
                 var rowText = row.textContent || "";
-                var appMatch = rowText.match(/申请号\s*([\d.X]+)/);
+                var appMatch = rowText.match(/申请号\\s*([\\d.X]+)/);
                 if (appMatch) item.application_number = appMatch[1];
 
                 if (item.publication_number || item.title) { results.push(item); }
@@ -806,7 +809,7 @@ class PatentscopeScraper:
             "publication_number": "", "title": "", "abstract": "",
             "claims": "", "description": "", "ipc": "",
             "applicant": "", "inventor": "", "publication_date": "",
-            "application_number": "", "full_text": "",
+            "application_number": "",
         }
 
         # 书目数据
@@ -831,15 +834,12 @@ class PatentscopeScraper:
         }''')
         ft = biblio.get("full_text", "")
         import re as _re
-        # 去掉 PATENTSCOPE 页面顶部导航栏
         ft = _re.sub(
             r'^(?:(?:反馈|检索|浏览|工具|设置|登录|PATENTSCOPE)\s*\n?)+',
             '', ft)
-        # 去掉 WIPO Translate 语言工具栏和 OCR 声明
         ft = _re.sub(
             r'(?:永久链接\s*)?机器翻译WIPO\s*Translate[\s\S]*?PDF\s*版本为准\s*',
             '', ft)
-        result["full_text"] = ft
         result["title"] = biblio.get("title", "")
         result["application_number"] = biblio.get("app_number", "")
         result["publication_date"] = biblio.get("pub_date", "")
@@ -902,16 +902,11 @@ class PatentscopeScraper:
         if desc_text:
             result["description"] = desc_text[:20000]
 
-        # 严格校验：摘要、权利要求、说明书 三者缺一不可
-        if not (result["abstract"] and result["claims"] and result["description"]):
-            missing = []
-            if not result["abstract"]: missing.append("摘要")
-            if not result["claims"]: missing.append("权利要求")
-            if not result["description"]: missing.append("说明书")
-            return None  # 缺失字段下次重新下载
+        # 校验：权利要求和说明书都非空才算有效，摘要可缺
+        if not (result["claims"] and result["description"]):
+            return None
 
         # 纯摘要 — 摘要/Abstract 双模式，中文优先
-        ft = result.get("full_text", "")
         if ft:
             abstract = ""
             # 尝试中文摘要：摘要 ... (ZH) ...
@@ -929,8 +924,18 @@ class PatentscopeScraper:
                 if m:
                     abstract = m.group(1).strip()
             if not abstract:
-                # 最后降级：任意 Abstract/摘要 开头内容
-                m = re.search(r'(?:摘要|Abstract)\s*[\s\S]*?(?=Claims|Description|$)', ft)
+                # 降级4: 摘要/Abstract 到下一个字段标题之前
+                m = re.search(
+                    r'(?:摘要|Abstract)\s*\n+([\s\S]*?)'
+                    r'(?=\n(?:申请号|公布号|IPC|申请人|发明人'
+                    r'|权利要求|说明书|Claims?|Description'
+                    r'|附图|图式|Drawings)\b)',
+                    ft)
+                if m:
+                    abstract = m.group(1).strip()
+            if not abstract:
+                # 兜底: 任意 摘要/Abstract 开头直到结束
+                m = re.search(r'(?:摘要|Abstract)\s*[\s\S]*?(?=Claims?|Description|权利要求|说明书|\Z)', ft)
                 if m:
                     abstract = m.group(0)
                     abstract = re.sub(r'^(?:摘要|Abstract)\s*', '', abstract).strip()
