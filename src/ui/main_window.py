@@ -935,9 +935,6 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
         if self._comparison_cache and pub in self._comparison_cache:
             self.report_panel.show_single_comparison(
                 pub, self._comparison_cache[pub])
-        else:
-            self.log_panel.append_log("INFO",
-                f"  {pub}: 暂无非AI对比缓存，显示原始详情")
 
     def _load_cached_detail(self, patent: dict) -> dict | None:
         """从缓存文件加载完整专利详情"""
