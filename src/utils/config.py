@@ -171,6 +171,16 @@ class Settings:
     def web_proxy(self) -> str | None:
         return self._raw.get("web", {}).get("proxy")
 
+    @property
+    def web_use_cdp(self) -> bool:
+        """是否连接到用户已打开的浏览器（CDP 模式）"""
+        return self._raw.get("web", {}).get("use_cdp", False)
+
+    @property
+    def web_cdp_port(self) -> int:
+        """CDP 模式连接端口"""
+        return self._raw.get("web", {}).get("cdp_port", 9222)
+
     # --- PATENTSCOPE ---
     @property
     def patentscope_base_url(self) -> str:

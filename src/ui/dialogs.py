@@ -1,7 +1,9 @@
 """
 对话框 - 设置、关于等弹出窗口
 """
+import json
 import os
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
@@ -535,13 +537,18 @@ class TestDialog(QDialog):
 
     test_abstract = Signal(str, int)   # query, max_results
     test_detail = Signal(str, int)     # query, max_results
+    test_pagesize = Signal(str, int)   # query, max_results (切换200条测试)
     lookup_patent = Signal(str)        # doc_id
+
+    _HISTORY_FILE = Path(__file__).parent.parent.parent / "data" / "lookup_history.json"
+    _MAX_HISTORY = 20
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("测试工具")
         self.setMinimumWidth(480)
         self._setup_ui()
+        self._load_lookup_history()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -575,6 +582,11 @@ class TestDialog(QDialog):
         self.test_detail_btn.setToolTip("搜索摘要 + 抓取全文详情")
         self.test_detail_btn.clicked.connect(self._on_test_detail)
         row2.addWidget(self.test_detail_btn)
+
+        self.test_pagesize_btn = QPushButton("📐 测试200条")
+        self.test_pagesize_btn.setToolTip("测试切换每页200条是否生效")
+        self.test_pagesize_btn.clicked.connect(self._on_test_pagesize)
+        row2.addWidget(self.test_pagesize_btn)
         search_layout.addLayout(row2)
 
         layout.addWidget(search_group)
@@ -602,6 +614,42 @@ class TestDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
+    # ── 公布号查询历史 ──────────────────────────────────────────────────
+
+    def _load_lookup_history(self):
+        """从文件加载公布号查询历史到下拉框"""
+        try:
+            if self._HISTORY_FILE.exists():
+                data = json.loads(self._HISTORY_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    for item in data:
+                        self.lookup_combo.addItem(str(item))
+        except Exception:
+            pass
+
+    def _save_lookup_history(self):
+        """保存公布号查询历史到文件（最多 _MAX_HISTORY 条）"""
+        items = []
+        for i in range(self.lookup_combo.count()):
+            items.append(self.lookup_combo.itemText(i))
+        # 去重保序
+        seen = set()
+        unique = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        unique = unique[:self._MAX_HISTORY]
+        try:
+            self._HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._HISTORY_FILE.write_text(
+                json.dumps(unique, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
+
+    # ── 按钮事件 ────────────────────────────────────────────────────────
+
     def _on_test_abstract(self):
         q = self.test_query_edit.text().strip()
         if q:
@@ -612,7 +660,19 @@ class TestDialog(QDialog):
         if q:
             self.test_detail.emit(q, self.test_count_spin.value())
 
+    def _on_test_pagesize(self):
+        q = self.test_query_edit.text().strip()
+        if q:
+            self.test_pagesize.emit(q, self.test_count_spin.value())
+
     def _on_lookup(self):
         doc_id = self.lookup_combo.currentText().strip()
         if doc_id:
+            # 移到最前（去重）
+            idx = self.lookup_combo.findText(doc_id)
+            if idx >= 0:
+                self.lookup_combo.removeItem(idx)
+            self.lookup_combo.insertItem(0, doc_id)
+            self.lookup_combo.setCurrentIndex(0)
+            self._save_lookup_history()
             self.lookup_patent.emit(doc_id)

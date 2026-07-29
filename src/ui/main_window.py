@@ -20,7 +20,7 @@ from src.ui.workers import (
     PatentscopeSearchAndFetchWorker,
     AnalysisWorker, OAWriterWorker,
     PatentscopeTestWorker, PatentscopeAbstractTestWorker,
-    PatentLookupWorker,
+    PatentscopePageSizeTestWorker, PatentLookupWorker,
 )
 from src.utils.config import Settings
 from src.utils.signals import WorkerSignals
@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
         dlg = TestDialog(self)
         dlg.test_abstract.connect(self._on_test_abstract)
         dlg.test_detail.connect(self._on_test_detail)
+        dlg.test_pagesize.connect(self._on_test_pagesize)
         dlg.lookup_patent.connect(self._on_lookup_patent)
         dlg.exec()
 
@@ -190,6 +191,24 @@ class MainWindow(QMainWindow):
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
         w.signals.query_complete.connect(self.result_panel.add_query_results)
+        w.signals.all_searches_done.connect(self._on_test_done)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.start()
+
+    def _on_test_pagesize(self, query: str, count: int):
+        """测试每页200条切换"""
+        if not query.strip():
+            return
+        self.log_panel.append_log("INFO", "=" * 50)
+        self.log_panel.append_log("INFO", f"每页200条测试: {query}")
+        self.input_panel.set_running_state(True)
+        self.status_label.setText("每页200条测试...")
+        self._current_worker = PatentscopePageSizeTestWorker(
+            query, self.settings, max_results=count)
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
         w.signals.all_searches_done.connect(self._on_test_done)
         w.signals.error.connect(self._handle_error)
         w.signals.finished.connect(self._on_worker_finished)
@@ -926,4 +945,11 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
                 self._current_worker.stop()
             self._current_worker.quit()
             self._current_worker.wait(3000)
+        # 断开浏览器连接
+        import asyncio as _asyncio
+        from src.web_automation.browser_manager import BrowserManager
+        try:
+            _asyncio.get_event_loop().run_until_complete(BrowserManager.shutdown())
+        except Exception:
+            pass
         event.accept()

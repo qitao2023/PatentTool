@@ -28,14 +28,14 @@ query_generation:
   max_description_chars: 5000      # 说明书截断长度（保留发明内容 + 实施方式前段）
   prompt_profile: "semiconductor"    # 提示词方案: "default" 或 "semiconductor"
 
-# Web自动化
+# Web自动化（连接真实Edge浏览器）
 web:
-  headless: false                 # 有头模式（无头会被 PATENTSCOPE 403）
   viewport_width: 1920
   viewport_height: 1080
   locale: "zh-CN"
   timezone: "Asia/Shanghai"
   proxy: "http://127.0.0.1:7892"    # 代理地址（国内访问WIPO需要）
+  cdp_port: 9222                    # Edge 远程调试端口
 
 # PATENTSCOPE 配置
 patentscope:

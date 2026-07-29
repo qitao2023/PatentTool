@@ -153,16 +153,106 @@ class PatentscopeScraper:
     # ================================================================
 
     async def fetch_detail(self, doc_id: str) -> Optional[dict]:
+        """获取专利详情（直接URL导航，快速但可能被PATENTSCOPE拦截403）。
+
+        测试场景建议使用 fetch_detail_via_search() 更可靠。
+        """
         detail_url = f"https://patentscope2.wipo.int/search/zh/detail.jsf?docId={doc_id}"
         try:
-            await self.page.goto(detail_url, timeout=30000, wait_until="domcontentloaded")
+            await self.page.goto(detail_url, timeout=60000, wait_until="commit")
             try:
                 await self.page.wait_for_selector("h1", timeout=10000)
             except Exception:
                 pass
             await asyncio.sleep(1)
+            # 检测 403
+            body_start = await self.page.evaluate(
+                "() => document.body?.innerText?.substring(0, 200) || ''")
+            if "403" in body_start and "FORBIDDEN" in body_start:
+                # 直接URL被拦截，降级为搜索方式
+                return await self.fetch_detail_via_search(doc_id)
             return await self._extract_detail_page(doc_id)
         except Exception:
+            # 网络错误等，也尝试降级
+            try:
+                return await self.fetch_detail_via_search(doc_id)
+            except Exception:
+                return None
+
+    async def fetch_detail_via_search(self, search_term: str,
+                                       signals=None) -> Optional[dict]:
+        """通过搜索公布号获取专利详情（可靠方法，利用单结果自动跳转特性）。
+
+        PATENTSCOPE 对于唯一匹配的结果会自动重定向到 detail.jsf 详情页，
+        无需直接访问 detail URL，避免 403 Forbidden 拦截。
+
+        用于测试详情和公布号直查等需要可靠获取全文的场景。
+        """
+        try:
+            # 导航到搜索页（用 JS 跳转代替 page.goto，更像真实用户行为）
+            await self.page.evaluate(
+                f'window.location.href = "{self.settings.patentscope_search_url}"')
+            # 等搜索框出现
+            try:
+                await self.page.wait_for_selector(
+                    "#simpleSearchForm\\:fpSearch\\:input",
+                    timeout=15000)
+            except Exception:
+                await asyncio.sleep(2)
+
+            # 填入公布号并提交搜索
+            inp = self.page.locator(
+                "#simpleSearchForm\\:fpSearch\\:input")
+            if await inp.count() > 0:
+                await inp.wait_for(state="visible", timeout=15000)
+                await inp.fill(search_term)
+                await asyncio.sleep(random.uniform(0.3, 0.6))
+                btn = self.page.locator("button[id*='fpSearch']").first
+                if await btn.count() > 0:
+                    await btn.click()
+                    # 公布号查询通常是单条结果→直接跳详情页，等URL变化即可
+                    try:
+                        await self.page.wait_for_url(
+                            "**/detail.jsf*", timeout=20000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.5)
+
+            cur = self.page.url
+
+            # 单条结果 → PATENTSCOPE 自动跳转到详情页
+            if "detail.jsf" in cur:
+                import re as _re
+                m = _re.search(r'docId=([^&]+)', cur)
+                doc_id = m.group(1) if m else search_term
+                if signals:
+                    signals.log.emit("INFO",
+                        f"    搜索 {search_term} → 详情页（单结果）")
+                return await self._extract_detail_page(doc_id)
+
+            # 多条结果 → 点击第一条
+            link = self.page.locator("a[href*='detail.jsf']").first
+            if await link.count() > 0:
+                await link.click()
+                await self.page.wait_for_url(
+                    "**/detail.jsf*", timeout=15000)
+                await asyncio.sleep(1)
+                import re as _re
+                m = _re.search(r'docId=([^&]+)', self.page.url)
+                doc_id = m.group(1) if m else search_term
+                if signals:
+                    signals.log.emit("INFO",
+                        f"    搜索 {search_term} → 点击第一条结果")
+                return await self._extract_detail_page(doc_id)
+
+            if signals:
+                signals.log.emit("WARN",
+                    f"    搜索 {search_term} 未找到结果")
+            return None
+        except Exception as e:
+            if signals:
+                signals.log.emit("WARN",
+                    f"    搜索 {search_term} 失败: {e}")
             return None
 
     async def fetch_details_batch(self, patents: list[dict], signals=None) -> list[dict]:
@@ -260,8 +350,8 @@ class PatentscopeScraper:
                         f"https://patentscope2.wipo.int/search/zh/detail.jsf"
                         f"?docId={doc_id}"
                     )
-                    await pg.goto(detail_url, timeout=30000,
-                                  wait_until="domcontentloaded")
+                    await pg.goto(detail_url, timeout=60000,
+                                  wait_until="commit")
                     try:
                         await pg.wait_for_selector("h1", timeout=10000)
                     except Exception:
@@ -330,9 +420,14 @@ class PatentscopeScraper:
         if signals:
             signals.log.emit("INFO", "  正在访问 PATENTSCOPE...")
         search_url = self.settings.patentscope_search_url
-        await self.page.goto(search_url, timeout=60000, wait_until="load")
-        # JSF 页面可能需要额外时间初始化组件
-        await asyncio.sleep(3)
+        await self.page.goto(search_url, timeout=60000, wait_until="commit")
+        # JSF 页面需要时间初始化组件，等输入框可见即可
+        try:
+            await self.page.wait_for_selector(
+                "#simpleSearchForm\\:fpSearch\\:input",
+                timeout=8000)
+        except Exception:
+            await asyncio.sleep(2)
 
         if signals:
             signals.log.emit("INFO", "  正在提交检索式...")
@@ -340,100 +435,81 @@ class PatentscopeScraper:
 
         if signals:
             signals.log.emit("INFO", "  等待搜索结果...")
-        # 先等 URL 跳到结果页（快），再等结果表格出现
+        # 等 URL 跳到结果页
         try:
             await self.page.wait_for_url("**/result.jsf*", timeout=60000)
         except Exception:
             pass
-        try:
-            await self.page.wait_for_selector(
-                ".ps-patent-result, .trans-result-list-row, table.patent-result-list",
-                timeout=10000)
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-        if signals:
-            signals.log.emit("INFO", "  搜索结果已返回")
+        # 等结果行出现且稳定（不用 networkidle，CDP 下会卡住）
+        await self._wait_for_results_stable(signals, label="初始加载", max_wait=15.0)
 
     async def _set_max_page_size(self, signals=None):
         """切到每页最多条数（200）。
 
-        页面布局: 「相关性」<select> | 「每页:」<select> | 「查看:」
-        找到包含选项"200"的 select 即目标。
-
-        切换后 PATENTSCOPE 通过 JSF AJAX 重新加载结果表格。
-        使用轮询 DOM 行数稳定的方式确认加载完成，不依赖页面文本正则。
+        用 JS 找到包含"200"选项的 select（一次 page.evaluate，快到飞起），
+        不依赖 DOM 顺序（视觉位置和 DOM 顺序可能不一致）。
         """
         try:
-            all_selects = await self.page.locator("select").all()
-            for loc in all_selects:
-                try:
-                    options = await loc.locator("option").all()
-                    vals = []
-                    for opt in options:
-                        try:
-                            v_text = (await opt.text_content()).strip()
-                            v_num = int(v_text) if v_text.isdigit() else 0
-                            if v_num > 0:
-                                vals.append(v_num)
-                        except Exception:
-                            continue
-                    # 包含 200 就是分页下拉框
-                    if 200 not in vals:
-                        continue
+            # 单次 JS：找包含选项"200"的 select，返回索引和当前值
+            info = await self.page.evaluate('''() => {
+                var selects = document.querySelectorAll("select");
+                for (var i = 0; i < selects.length; i++) {
+                    var s = selects[i];
+                    // 跳过不可见的
+                    if (s.offsetParent === null) continue;
+                    var opts = s.querySelectorAll("option");
+                    for (var j = 0; j < opts.length; j++) {
+                        if (opts[j].value === "200") {
+                            return {index: i, current: s.value, visible: true};
+                        }
+                    }
+                }
+                // 没找到可见的，返回第一个有200选项的（可能被遮挡）
+                for (var i = 0; i < selects.length; i++) {
+                    var s = selects[i];
+                    var opts = s.querySelectorAll("option");
+                    for (var j = 0; j < opts.length; j++) {
+                        if (opts[j].value === "200") {
+                            return {index: i, current: s.value, visible: false};
+                        }
+                    }
+                }
+                return null;
+            }''')
 
-                    # 检查是否需要切换
-                    need_switch = True
-                    try:
-                        current_val = await loc.input_value()
-                        if current_val == "200":
-                            need_switch = False
-                    except Exception:
-                        pass
+            if not info:
+                if signals:
+                    signals.log.emit("WARN", "  未找到包含200选项的下拉框")
+                return
 
-                    if not need_switch:
-                        if signals:
-                            signals.log.emit("INFO",
-                                "  每页已是 200 条，等待数据稳定...")
-                        stable_count = await self._wait_for_results_stable(
-                            signals, label="已是200")
-                        if signals:
-                            signals.log.emit("INFO",
-                                f"  数据已稳定: {stable_count} 行")
-                        return
+            if info["current"] == "200":
+                if signals:
+                    signals.log.emit("INFO", "  每页已是 200 条")
+                return
 
-                    # 切换前先记录旧行数，用于判断是否真的刷新了
-                    old_count = await self._count_result_rows()
+            # 用找到的索引定位并切换
+            loc = self.page.locator("select").nth(info["index"])
+            # 如果被遮挡，强制显示
+            if not info["visible"]:
+                await loc.evaluate("el => el.style.display = 'inline-block'")
+                await asyncio.sleep(0.3)
 
-                    await loc.select_option(value="200")
-                    if signals:
-                        signals.log.emit("INFO", "  切换每页条数: 200 条")
+            await asyncio.sleep(random.uniform(0.3, 0.6))
+            await loc.select_option(value="200")
+            if signals:
+                signals.log.emit("INFO", "  切换每页条数 → 200")
 
-                    # 等待 JSF AJAX 完成
-                    try:
-                        await self.page.wait_for_load_state(
-                            "networkidle", timeout=15000)
-                    except Exception:
-                        await asyncio.sleep(3)
-
-                    # 等待数据稳定
-                    stable_count = await self._wait_for_results_stable(
-                        signals, label="切换200")
-
-                    if signals:
-                        signals.log.emit("INFO",
-                            f"  页面刷新完成: {old_count} → "
-                            f"{stable_count} 行")
-                    return
-
-                except Exception:
-                    continue
+            # 等待行数变化
+            stable_count = await self._wait_for_results_stable(signals, label="切200")
+            if stable_count < 200:
+                await asyncio.sleep(1.0)
+                stable_count = await self._wait_for_results_stable(signals, label="切200r")
 
             if signals:
-                signals.log.emit("WARN", "  未找到包含200的分页下拉框")
-        except Exception:
+                signals.log.emit("INFO", f"  当前页: {stable_count} 行")
+        except Exception as e:
             if signals:
-                signals.log.emit("WARN", "  未找到分页下拉框")
+                signals.log.emit("WARN", f"  切换每页条数失败: {e}")
 
     # ── DOM 稳定性轮询 ─────────────────────────────────────────────
 
@@ -449,29 +525,34 @@ class PatentscopeScraper:
 
     async def _wait_for_results_stable(self, signals=None,
                                         label: str = "",
-                                        max_wait: float = 12.0,
-                                        poll_interval: float = 0.6) -> int:
+                                        max_wait: float = 5.0,
+                                        poll_interval: float = 0.3) -> int:
         """轮询 DOM 直到结果行数稳定。
 
         每 poll_interval 秒检查一次行数，连续 2 次相同即认为稳定。
+        count==0 时不重置计数器（AJAX 刷新期间行数会短暂归零）。
         最长等待 max_wait 秒，超时返回当前行数。
-
-        同时缓存总结果数到 _total_from_page_text。
         """
         prev_count = -1
         stable_hits = 0
+        zero_streak = 0          # 连续为0的次数
         max_polls = int(max_wait / poll_interval)
 
         for attempt in range(max_polls):
             await asyncio.sleep(poll_interval)
 
             count = await self._count_result_rows()
-            if count == 0:
-                prev_count = -1
-                stable_hits = 0
-                continue
 
-            # 同时尝试提取总结果数（best-effort）
+            # 行数为0：不计入 stable，但也不重置（容忍 AJAX 刷新闪烁）
+            if count == 0:
+                zero_streak += 1
+                # 连续 3 秒都是 0 → 可能是真没结果
+                if zero_streak >= 10:
+                    return 0
+                continue
+            zero_streak = 0
+
+            # 缓存总结果数
             if self._total_from_page_text <= 0:
                 total = await self._get_total_result_count()
                 if total:
@@ -480,25 +561,12 @@ class PatentscopeScraper:
             if count == prev_count and count > 0:
                 stable_hits += 1
                 if stable_hits >= 2:
-                    if signals:
-                        signals.log.emit("DEBUG",
-                            f"  _wait_stable{label}: 稳定在 {count} 行 "
-                            f"(总={self._total_from_page_text or '?'}, "
-                            f"第{attempt+1}次轮询)")
                     return count
             else:
                 stable_hits = 0
                 prev_count = count
 
-            if signals and attempt == 0:
-                signals.log.emit("DEBUG",
-                    f"  _wait_stable{label}: 轮询中... 当前 {count} 行")
-
-        # 超时：返回最后的行数
-        if signals:
-            signals.log.emit("WARN",
-                f"  _wait_stable{label}: {max_wait}s 超时, "
-                f"最终 {prev_count} 行")
+        # 超时：返回最后的非零行数
         return max(prev_count, 0)
 
     async def _fill_and_submit(self, query: str):

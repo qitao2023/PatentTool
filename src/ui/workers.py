@@ -2,6 +2,7 @@
 后台工作线程 - 所有耗时操作在 QThread 中执行
 """
 import asyncio
+import random
 
 from PySide6.QtCore import QThread, Signal
 
@@ -706,7 +707,13 @@ class OAWriterWorker(QThread):
 
 
 class PatentscopeTestWorker(QThread):
-    """PATENTSCOPE 快速测试 Worker：搜索N条摘要 → 抓全文 → 返回"""
+    """PATENTSCOPE 快速测试 Worker：搜索N条摘要 → 逐条点开→提取→回退 → 返回。
+
+    流程模拟真人操作：搜索一次 → 点开第1条看详情 → 回退 → 点开第2条 → ...
+    全程走正常浏览路径，不会被 PATENTSCOPE 拦截。
+
+    注意：测试Worker不取硬盘缓存数据，始终直接从 PATENTSCOPE 网站获取。
+    """
 
     def __init__(self, query: str, settings: Settings,
                  max_results: int = 5, parent=None):
@@ -741,25 +748,100 @@ class PatentscopeTestWorker(QThread):
         human = HumanBehavior(self.settings)
         scraper = PatentscopeScraper(page, self.settings, human)
 
-        # 阶段1: 搜索摘要
+        # 阶段1: 搜索摘要（直接从网站获取，不使用硬盘缓存）
         self.signals.log.emit("INFO", f"搜索: {self.query}")
         self.signals.progress.emit(30, "搜索摘要...")
         abstracts = await scraper.search_abstracts(
             self.query, max_results=self.max_results, signals=self.signals)
 
         if not abstracts:
-            self.signals.log.emit("WARN", "未找到结果，尝试用简单关键词")
+            self.signals.log.emit("WARN", "未找到结果")
             await browser_mgr.close()
             self.signals.finished.emit(True, "0 条结果")
             return
 
         self.signals.log.emit("SUCCESS",
-            f"找到 {len(abstracts)} 条，开始获取全文...")
-        self.signals.progress.emit(50, "获取全文...")
+            f"找到 {len(abstracts)} 条摘要")
 
-        # 阶段2: 抓全部摘要对应的全文
-        self.signals.log.emit("INFO", f"获取全部 {len(abstracts)} 篇全文...")
-        enriched = await scraper.fetch_details_batch(abstracts, signals=self.signals)
+        # 阶段2: 从结果页逐条点开→提取→回退（模拟真人操作）
+        self.signals.log.emit("INFO",
+            f"逐条点开详情（点开→提取→回退，共 {len(abstracts)} 条）...")
+
+        enriched = []
+        for i, p in enumerate(abstracts):
+            doc_id = p.get("doc_id", "")
+            pub = p.get("publication_number", "?")
+            if not doc_id:
+                p["_no_detail"] = True
+                enriched.append(p)
+                continue
+
+            self.signals.progress.emit(
+                40 + int((i + 1) / len(abstracts) * 40),
+                f"详情 {i+1}/{len(abstracts)}")
+            self.signals.log.emit("INFO",
+                f"  [{i+1}/{len(abstracts)}] {pub}")
+
+            # 第2条开始：先回退到结果页
+            if i > 0:
+                try:
+                    await page.go_back()
+                    await asyncio.sleep(2)
+                    try:
+                        await page.wait_for_selector(
+                            ".ps-patent-result, .trans-result-list-row",
+                            timeout=10000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                except Exception:
+                    # go_back 失败则直接导航到结果页URL
+                    self.signals.log.emit("DEBUG", "    go_back 失败，导航到结果页")
+                    if scraper._results_url:
+                        await page.goto(scraper._results_url,
+                                        timeout=30000,
+                                        wait_until="domcontentloaded")
+                        await asyncio.sleep(2)
+
+            # 点击当前专利链接，进入详情页
+            try:
+                link = page.locator(
+                    f"a[href*='docId={doc_id}']").first
+                if await link.count() > 0:
+                    await link.click()
+                    await page.wait_for_url(
+                        "**/detail.jsf*", timeout=20000)
+                    await asyncio.sleep(1)
+
+                    detail = await scraper._extract_detail_page(doc_id)
+                    if detail:
+                        pub_num = p.get("publication_number", "")
+                        merged = {**p, **{k: v for k, v in detail.items()
+                                          if v}}
+                        if pub_num:
+                            merged["publication_number"] = pub_num
+                        enriched.append(merged)
+                        self.signals.log.emit("INFO",
+                            f"    ✓ 权利要求:{len(detail.get('claims',''))}字 "
+                            f"说明书:{len(detail.get('description',''))}字")
+                    else:
+                        p["_no_detail"] = True
+                        enriched.append(p)
+                        self.signals.log.emit("WARN",
+                            "    ✗ 详情提取失败")
+                else:
+                    p["_no_detail"] = True
+                    enriched.append(p)
+                    self.signals.log.emit("WARN",
+                        f"    ✗ 当前页未找到该专利链接")
+            except Exception as e:
+                p["_no_detail"] = True
+                enriched.append(p)
+                self.signals.log.emit("WARN", f"    ✗ 失败: {e}")
+
+            # 请求间微小延迟
+            if i < len(abstracts) - 1:
+                await asyncio.sleep(0.8)
 
         await browser_mgr.close()
 
@@ -770,21 +852,23 @@ class PatentscopeTestWorker(QThread):
         # 输出摘要
         for i, r in enumerate(enriched):
             pub = r.get("publication_number", "?")
-            title = r.get("title", "?")
+            title = str(r.get("title", ""))[:60]
             claims_len = len(r.get("claims", "") or "")
             desc_len = len(r.get("description", "") or "")
             self.signals.log.emit("INFO",
-                f"  [{i+1}] {pub} | {title[:60]} | "
+                f"  [{i+1}] {pub} | {title} | "
                 f"权利要求:{claims_len}字 说明书:{desc_len}字")
 
         self.signals.progress.emit(100, "测试完成")
-        # 用 all_searches_done 传结果
         self.signals.all_searches_done.emit([enriched])
         self.signals.finished.emit(True, "")
 
 
 class PatentscopeAbstractTestWorker(QThread):
-    """PATENTSCOPE 快速摘要测试 Worker：只搜索N条摘要，不抓详情"""
+    """PATENTSCOPE 快速摘要测试 Worker：只搜索N条摘要，不抓详情。
+
+    注意：始终直接从 PATENTSCOPE 网站搜索，不使用硬盘缓存数据。
+    """
 
     def __init__(self, query: str, settings: Settings,
                  max_results: int = 5, parent=None):
@@ -843,8 +927,112 @@ class PatentscopeAbstractTestWorker(QThread):
         self.signals.finished.emit(True, "")
 
 
+class PatentscopePageSizeTestWorker(QThread):
+    """PATENTSCOPE 每页条数测试 Worker：搜索 → 切换200条 → 验证结果行数。
+
+    用于诊断"搜索结果只有10条"的问题——确认 _set_max_page_size 是否生效。
+    """
+
+    def __init__(self, query: str, settings: Settings,
+                 max_results: int = 10, parent=None):
+        super().__init__(parent)
+        self.query = query
+        self.settings = settings
+        self.max_results = max_results
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._run_async())
+            loop.close()
+        except Exception as e:
+            self.signals.error.emit(f"每页条数测试失败: {e}")
+            self.signals.log.emit("ERROR", f"测试失败: {e}")
+            self.signals.finished.emit(False, str(e))
+
+    async def _run_async(self):
+        from src.web_automation.browser_manager import BrowserManager
+        from src.web_automation.human_behavior import HumanBehavior
+        from src.web_automation.patentscope_scraper import PatentscopeScraper
+
+        self.signals.log.emit("INFO", "=" * 50)
+        self.signals.log.emit("INFO", "每页条数切换测试")
+        self.signals.progress.emit(10, "启动浏览器...")
+
+        browser_mgr = BrowserManager(self.settings)
+        context, page = await browser_mgr.launch_with_retry(max_retries=2)
+
+        human = HumanBehavior(self.settings)
+        scraper = PatentscopeScraper(page, self.settings, human)
+
+        # ── 步骤1: 搜索 ──
+        self.signals.log.emit("INFO", f"检索式: {self.query}")
+        self.signals.progress.emit(20, "搜索中...")
+        await scraper._navigate_and_search(self.query, signals=self.signals)
+
+        # ── 步骤2: 切换前统计 ──
+        rows_before = await scraper._count_result_rows()
+        total_text = await scraper._get_total_result_count()
+        self.signals.log.emit("INFO",
+            f"切换前: {rows_before} 行可见, "
+            f"检索总结果: {total_text or '?'} 条")
+
+        # ── 步骤3: 执行切换 ──
+        self.signals.log.emit("INFO", "执行 _set_max_page_size(200)...")
+        self.signals.progress.emit(40, "切换每页200条...")
+        await scraper._set_max_page_size(signals=self.signals)
+
+        # ── 步骤4: 切换后统计 ──
+        await asyncio.sleep(1)
+        rows_after = await scraper._count_result_rows()
+        self.signals.log.emit("INFO",
+            f"切换后: {rows_after} 行可见")
+
+        # ── 步骤5: 判断结果 ──
+        if rows_after > rows_before:
+            self.signals.log.emit("SUCCESS",
+                f"切换成功: {rows_before} → {rows_after} 行 (+{rows_after - rows_before})")
+        elif rows_after == rows_before and rows_before >= 200:
+            self.signals.log.emit("SUCCESS",
+                f"切换后行数不变 ({rows_before})，但已达到200条上限，切换可能已生效")
+        elif rows_after == rows_before:
+            total_after = await scraper._get_total_result_count()
+            if total_after and total_after <= rows_after:
+                self.signals.log.emit("SUCCESS",
+                    f"切换后行数不变 ({rows_before})，总结果 {total_after} ≤ 每页条数，无需翻页")
+            else:
+                self.signals.log.emit("WARN",
+                    f"切换后行数未变 ({rows_before} → {rows_after})，"
+                    f"可能切换失败或总结果不足200")
+        else:
+            self.signals.log.emit("WARN",
+                f"行数反而减少了: {rows_before} → {rows_after}")
+
+        # ── 步骤6: 尝试解析结果 ──
+        self.signals.progress.emit(60, "解析结果...")
+        abstracts = await scraper._parse_results_table()
+        self.signals.log.emit("INFO",
+            f"当前页解析到: {len(abstracts)} 条")
+
+        if abstracts:
+            self.signals.log.emit("INFO", "前5条:")
+            for a in abstracts[:5]:
+                self.signals.log.emit("INFO",
+                    f"  {a.get('publication_number','?')} | "
+                    f"{str(a.get('title',''))[:60]}")
+
+        await browser_mgr.close()
+
+        self.signals.log.emit("SUCCESS", "每页条数测试完成")
+        self.signals.progress.emit(100, "完成")
+        self.signals.all_searches_done.emit([abstracts])
+        self.signals.finished.emit(True, "")
+
+
 class PatentLookupWorker(QThread):
-    """公布号直查 Worker：先搜索拿到 docId，再抓详情"""
+    """公布号直查 Worker：每次查询用完即关浏览器，下次再开新的，永不被限流。"""
 
     lookup_done = Signal(dict)
 
@@ -882,49 +1070,15 @@ class PatentLookupWorker(QThread):
             human = HumanBehavior(page)
             scraper = PatentscopeScraper(page, self.settings, human)
 
-            q = self.query.replace(" ", "")
+            # 清洗查询词
+            q = self.query.strip()
+            import re as _re
+            q = _re.sub(r'\s+', '', q)           # 去空格
+            q = _re.sub(r'[ABU]\d?$', '', q)      # 去末尾种类码
             self.signals.log.emit("INFO", f"查询: {q}")
 
-            # 访问搜索页，等表单渲染
-            await page.goto(
-                self.settings.patentscope_search_url,
-                timeout=30000, wait_until="domcontentloaded")
-            await asyncio.sleep(5)
-
-            # 填表提交
-            inp = page.locator("#simpleSearchForm\\:fpSearch\\:input")
-            if await inp.count() > 0:
-                await inp.fill(self.query)
-                btn = page.locator("button[id*='fpSearch']").first
-                if await btn.count() > 0:
-                    await btn.click()
-                    await asyncio.sleep(5)
-                    try:
-                        await page.wait_for_load_state("load", timeout=15000)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(2)
-
-            # 检查是否跳转到详情页
-            cur = page.url
-            import re as _re
-            m = _re.search(r'docId=([^&]+)', cur)
-            if m and "detail.jsf" in cur:
-                doc_id = m.group(1)
-                self.signals.log.emit("INFO", "搜索命中，正在加载详情...")
-                result = await scraper._extract_detail_page(doc_id)
-            else:
-                # 先尝试直连
-                result = await scraper.fetch_detail(q)
-                if not result:
-                    # 最后尝试解析搜索结果
-                    try:
-                        abstracts = await scraper._parse_results_table()
-                        if abstracts:
-                            doc_id = abstracts[0].get("doc_id", "")
-                            result = await scraper.fetch_detail(doc_id)
-                    except Exception:
-                        pass
+            # 用搜索方式获取详情
+            result = await scraper.fetch_detail_via_search(q, signals=self.signals)
 
             if not result:
                 self.signals.log.emit("WARN", f"未找到: {q}")
@@ -934,4 +1088,4 @@ class PatentLookupWorker(QThread):
                 f"查询完成: claims={len(result.get('claims',''))} desc={len(result.get('description',''))}")
             return result
         finally:
-            await context.close()
+            await BrowserManager.shutdown()
