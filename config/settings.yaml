@@ -28,14 +28,21 @@ query_generation:
   max_description_chars: 5000      # 说明书截断长度（保留发明内容 + 实施方式前段）
   prompt_profile: "semiconductor"    # 提示词方案: "default" 或 "semiconductor"
 
-# Web自动化（连接真实Edge浏览器）
+# Web自动化
 web:
+  browser: "firefox"                 # chrome 或 msedge
   viewport_width: 1920
   viewport_height: 1080
   locale: "zh-CN"
   timezone: "Asia/Shanghai"
-  proxy: "http://127.0.0.1:7892"    # 代理地址（国内访问WIPO需要）
-  cdp_port: 9222                    # Edge 远程调试端口
+  proxy: "http://127.0.0.1:7892"
+  clash_api: "http://127.0.0.1:9090"  # Clash API（可选，遇403自动换节点）
+
+# 检索参数（GUI 设置对话框可修改）
+search:
+  include_citations: true       # 从说明书提取引用专利号
+  force_refresh: false          # 强制重新获取本申请
+  stop_after: "download"            # 流程断点: abstracts | screen | download | score | full
 
 # PATENTSCOPE 配置
 patentscope:

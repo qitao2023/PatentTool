@@ -302,12 +302,22 @@ class MainWindow(QMainWindow):
 
         self._pdf_path = pdf_path  # 存储，后续建输出目录用
 
-        # 保存界面参数（max_queries, max_results, ai_provider 等）
+        # 合并参数：界面数值 + 设置对话框的复选框状态
         self._user_params = self.input_panel.get_params()
+        self._user_params.update({
+            "include_citations": self.settings.search_include_citations,
+            "force_refresh": self.settings.search_force_refresh,
+            "stop_after": self.settings.search_stop_after,
+        })
+        stop_labels = {
+            "abstracts": "搜完摘要", "screen": "粗筛后", "download": "下载后",
+            "score": "评分后", "full": "全程"
+        }
         self.log_panel.append_log("INFO",
             f"检索设置: {self._user_params.get('max_queries', 3)}个检索式 "
             f"× {self._user_params.get('max_results', 200)}条/检索式 "
-            f"| AI: {self._user_params.get('ai_provider', 'deepseek')}")
+            f"| AI: {self._user_params.get('ai_provider', 'deepseek')} "
+            f"| 断点: {stop_labels.get(self._user_params.get('stop_after','full'), '全程')}")
 
         # 保存界面设置（reset 会清掉）
         saved_queries = self.input_panel.max_queries_spin.value()
@@ -623,12 +633,12 @@ class MainWindow(QMainWindow):
                         self.settings.patentscope_max_results)
         fetch_detail = self._user_params.get("fetch_detail",
                         self.settings.analysis_top_n)
-        debug_search_only = self._user_params.get("debug_search_only", False)
-        self._debug_search_only = debug_search_only
+        stop_after = self._user_params.get("stop_after", "full")
         max_queries = len(queries)
+        stop_labels = {"abstracts":"搜摘要", "screen":"粗筛", "download":"下载", "score":"评分", "full":"全程"}
         self.status_label.setText(
             f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条, "
-            f"下载上限{fetch_detail}篇)...")
+            f"下载上限{fetch_detail}篇, 断点:{stop_labels.get(stop_after,'?')})...")
         # 共享缓存目录（PDF 同级，多次运行共用）
         cache_dir = None
         if self._pdf_path:
@@ -640,7 +650,7 @@ class MainWindow(QMainWindow):
             max_fetch=fetch_detail,           # 全文下载上限（UI控制）
             output_dir=self._output_dir,
             cache_dir=str(cache_dir) if cache_dir else None,
-            debug_search_only=debug_search_only,
+            stop_after=stop_after,
             include_citations=self._user_params.get("include_citations", True))
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
@@ -667,19 +677,19 @@ class MainWindow(QMainWindow):
         """
         self._all_raw_results = all_enriched
 
-        # 仅搜索模式：显示摘要列表，不进入分析
-        if getattr(self, "_debug_search_only", False):
-            self._debug_search_only = False
+        # 断点模式：结果已在 Worker 中处理好，直接显示
+        stop_after = self._user_params.get("stop_after", "full")
+        if stop_after != "full":
             from src.result_collector.deduplicator import Deduplicator
             deduper = Deduplicator(self.settings)
             deduped, removed = deduper.deduplicate(all_enriched)
             self._dedup_results = deduped
             total_raw = sum(len(r) for r in all_enriched)
             self.log_panel.append_log("SUCCESS",
-                f"检索摘要: 原始 {total_raw} 条 → 去重后 {len(deduped)} 条")
+                f"断点结果: 原始 {total_raw} 条 → 去重后 {len(deduped)} 条")
             self.result_panel.show_dedup_results(deduped)
             self.status_label.setText(
-                f"检索摘要完成 — {len(deduped)} 篇，结果已保存")
+                f"断点完成 — {len(deduped)} 篇")
             self.input_panel.set_running_state(False)
             return
 

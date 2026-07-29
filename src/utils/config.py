@@ -150,6 +150,11 @@ class Settings:
 
     # --- Web ---
     @property
+    def web_browser(self) -> str:
+        """浏览器: chrome 或 msedge"""
+        return self._raw.get("web", {}).get("browser", "chrome")
+
+    @property
     def web_headless(self) -> bool:
         return self._raw.get("web", {}).get("headless", False)
 
@@ -178,8 +183,17 @@ class Settings:
 
     @property
     def web_cdp_port(self) -> int:
-        """CDP 模式连接端口"""
         return self._raw.get("web", {}).get("cdp_port", 9222)
+
+    @property
+    def web_clash_api(self) -> str | None:
+        """Clash API 地址，用于切换代理节点"""
+        return self._raw.get("web", {}).get("clash_api")
+
+    @property
+    def web_proxy_rotate(self) -> list[str]:
+        """备用代理列表"""
+        return self._raw.get("web", {}).get("proxy_rotate", [])
 
     # --- PATENTSCOPE ---
     @property
@@ -195,6 +209,22 @@ class Settings:
     def patentscope_advanced_search_url(self) -> str:
         return self._raw.get("patentscope", {}).get("advanced_search_url",
             "https://patentscope.wipo.int/search/en/advancedSearch.jsf")
+
+    @property
+    def search_include_citations(self) -> bool:
+        return self._raw.get("search", {}).get("include_citations", True)
+
+    @property
+    def search_force_refresh(self) -> bool:
+        return self._raw.get("search", {}).get("force_refresh", False)
+
+    @property
+    def search_stop_after(self) -> str:
+        """流程断点: abstracts | screen | download | score | full"""
+        v = self._raw.get("search", {}).get("stop_after", "full")
+        if isinstance(v, bool) or str(v) not in ("abstracts", "screen", "download", "score", "full"):
+            return "full"
+        return str(v)
 
     @property
     def patentscope_max_results(self) -> int:

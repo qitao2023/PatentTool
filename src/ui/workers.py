@@ -88,16 +88,16 @@ class PatentscopeSearchAndFetchWorker(QThread):
                  patent_doc=None, max_fetch: int = 200,
                  top_n: int = 25, output_dir=None,
                  cache_dir: str | None = None,
-                 debug_search_only: bool = False,
+                 stop_after: str = "full",
                  include_citations: bool = True, parent=None):
         super().__init__(parent)
         self.queries = queries
         self.settings = settings
         self.patent_doc = patent_doc
-        self.max_fetch = max_fetch          # 全文下载上限
+        self.max_fetch = max_fetch
         self._given_output_dir = output_dir
-        self._cache_dir = cache_dir         # 共享专利缓存目录
-        self.debug_search_only = debug_search_only
+        self._cache_dir = cache_dir
+        self.stop_after = stop_after
         self.include_citations = include_citations
         self.signals = WorkerSignals()
         self._is_running = True
@@ -213,7 +213,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
             for batch in all_abstracts:
                 if i < len(batch):
                     a = batch[i]
-                    key = a.get("doc_id") or a.get("publication_number", "")
+                    key = a.get("publication_number") or a.get("doc_id", "")
                     if key and key not in seen:
                         seen.add(key)
                         unique_abstracts.append(a)
@@ -268,7 +268,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
             unique_abstracts = []
             for batch in fallback_abstracts:
                 for a in batch:
-                    key = a.get("doc_id") or a.get("publication_number", "")
+                    key = a.get("publication_number") or a.get("doc_id", "")
                     if key and key not in seen:
                         seen.add(key)
                         unique_abstracts.append(a)
@@ -284,18 +284,9 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
         self.signals.query_complete.emit(1, 1, unique_abstracts)
 
-        # ── 调试断点：仅搜索模式 ──────────────────────────────────────
-        if self.debug_search_only:
-            self.signals.log.emit("WARN",
-                "🔧 仅搜索模式：阶段1完成，停止（不下载全文）")
-            self.signals.log.emit("SUCCESS",
-                f"共 {total_abstracts} 篇摘要，已保存到 {stage1_path}")
-            # 生成可读摘要文件
-            self._write_summary_txt(unique_abstracts, output_dir)
-            self.signals.progress.emit(100, "检索摘要完成")
-            # 发射实际结果，让 UI 显示
-            self.signals.all_searches_done.emit([unique_abstracts])
-            self.signals.finished.emit(True, "检索摘要完成")
+        # ── 断点：搜索完摘要就停 ──────────────────────────────────────
+        if self.stop_after == "abstracts":
+            self._stop_here("搜索摘要", [unique_abstracts], stage1_path)
             return
 
         # ── 从说明书提取引用专利 ─────────────────────────────────────
@@ -325,6 +316,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 scraper1 = PatentscopeScraper(page1, self.settings, human1)
 
                 added = 0
+                _cite_failed = []
                 for i, pub in enumerate(new_pubs):
                     if not self._is_running:
                         break
@@ -356,7 +348,6 @@ class PatentscopeSearchAndFetchWorker(QThread):
                     try:
                         detail = await scraper1.fetch_detail(pub)
                         if detail:
-                            # 保存到缓存
                             cache_path.write_text(
                                 json_module.dumps(detail, indent=2, ensure_ascii=False, default=str),
                                 encoding="utf-8")
@@ -372,10 +363,45 @@ class PatentscopeSearchAndFetchWorker(QThread):
                             unique_abstracts.append(item)
                             added += 1
                         else:
+                            _cite_failed.append(pub)
                             self.signals.log.emit("WARN", f"    未能获取: {pub}")
                     except Exception as e:
+                        _cite_failed.append(pub)
                         self.signals.log.emit("WARN", f"    下载失败: {pub} - {e}")
-                    await asyncio.sleep(1.0)  # 串行，避免限流
+                    await asyncio.sleep(1.0)
+
+                # ── 引用专利补下载 ──
+                if _cite_failed and self._is_running:
+                    self.signals.log.emit("INFO",
+                        f"  === 补下载 {len(_cite_failed)} 篇引用专利 === ")
+                    await asyncio.sleep(3)
+                    for pub in _cite_failed:
+                        if not self._is_running:
+                            break
+                        self.signals.log.emit("INFO", f"  重试: {pub}")
+                        try:
+                            detail = await scraper1.fetch_detail(pub)
+                            if detail:
+                                cache_path = cache_dir / f"{_safe_filename(pub)}.json"
+                                cache_path.write_text(
+                                    json_module.dumps(detail, indent=2, ensure_ascii=False, default=str),
+                                    encoding="utf-8")
+                                item = {
+                                    "doc_id": detail.get("doc_id", pub),
+                                    "publication_number": detail.get("publication_number", pub),
+                                    "title": detail.get("title", ""),
+                                    "abstract_snippet": (detail.get("abstract") or "")[:300],
+                                    "ipc": detail.get("ipc", ""),
+                                    "applicant": detail.get("applicant", ""),
+                                    "source_query": f"说明书引用: {pub}",
+                                }
+                                unique_abstracts.append(item)
+                                added += 1
+                            else:
+                                self.signals.log.emit("WARN", f"    重试仍失败: {pub}")
+                        except Exception as e:
+                            self.signals.log.emit("WARN", f"    重试失败: {pub} - {e}")
+                        await asyncio.sleep(3.0)
 
                 await browser_mgr1.close()
                 self.signals.log.emit("SUCCESS",
@@ -406,6 +432,11 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 f"阶段2: 结果数 {total_abstracts} ≤ 上限 {max_detail}，全部下载全文")
             to_fetch = unique_abstracts
 
+        # ── 断点：粗筛后 ──
+        if self.stop_after == "screen":
+            self._stop_here("AI粗筛", [to_fetch])
+            return
+
         # ================================================================
         # 阶段3: 串行下载完整详情 → 共享缓存
         # ================================================================
@@ -425,6 +456,11 @@ class PatentscopeSearchAndFetchWorker(QThread):
             to_fetch, str(details_dir), concurrency=1, signals=self.signals)
 
         await browser_mgr2.close()
+
+        # ── 断点：下载后 ──
+        if self.stop_after == "download":
+            self._stop_here("下载对比文件", [to_fetch])
+            return
 
         # ================================================================
         # 阶段4: AI 全文精选（全部评分排序）
@@ -500,14 +536,33 @@ class PatentscopeSearchAndFetchWorker(QThread):
         if self._is_running:
             self.signals.log.emit("SUCCESS",
                 f"PATENTSCOPE 检索完成: 下载 {len(to_fetch)} 篇全文, "
-                f"评分 {len(all_scored)} 篇, 传 {len(top_for_compare)} 篇进入详细对比")
+                f"评分 {len(all_scored)} 篇")
             self.signals.log.emit("INFO",
                 f"所有结果已保存到: {output_dir}")
+
+            # ── 断点：评分后 ──
+            if self.stop_after == "score":
+                self._stop_here("AI评分", [all_scored])
+                return
+
+            self.signals.log.emit("INFO",
+                f"传 {len(top_for_compare)} 篇进入详细对比")
             self.signals.progress.emit(55, "检索完成，准备分析...")
             self.signals.all_searches_done.emit([top_for_compare])
             self.signals.finished.emit(True, "")
         else:
             self.signals.finished.emit(True, "用户停止")
+
+    def _stop_here(self, label: str, results: list, saved_path=None):
+        """断点停止，发射结果到 UI"""
+        total = sum(len(r) for r in results)
+        self.signals.log.emit("WARN",
+            f"🔧 流程断点: {label} ({total} 篇)")
+        if saved_path:
+            self.signals.log.emit("INFO", f"  已保存: {saved_path}")
+        self.signals.progress.emit(100, f"断点: {label}")
+        self.signals.all_searches_done.emit(results)
+        self.signals.finished.emit(True, f"断点: {label}")
 
     @staticmethod
     def _save_json(path, data):
@@ -580,11 +635,9 @@ class PatentscopeSearchAndFetchWorker(QThread):
             doc_id = _normalize_pn(a.get("doc_id", ""))
             pn_digits = _strip_country_prefix(pn)
             doc_digits = _strip_country_prefix(doc_id)
-            # 公布号或 doc_id 任一匹配即视为自身（匹配含/不含CN前缀）
+            # 公布号或 doc_id 任一匹配即视为自身（仅精确匹配+数字匹配）
             if (pn == target_pn or doc_id == target_pn
-                    or pn_digits == target_digits or doc_digits == target_digits
-                    or pn in target_pn or target_pn in pn
-                    or pn_digits in target_pn or target_pn in pn_digits):
+                    or pn_digits == target_digits or doc_digits == target_digits):
                 removed += 1
             else:
                 filtered.append(a)

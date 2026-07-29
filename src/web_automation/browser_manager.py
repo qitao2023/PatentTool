@@ -63,26 +63,56 @@ class BrowserManager:
                     raise
 
     async def close(self):
-        """Worker 结束时关闭浏览器。"""
+        """关闭浏览器。"""
         await BrowserManager.shutdown()
 
     @classmethod
+    async def rotate_proxy(cls, settings=None):
+        """尝试切换 Clash 代理节点换 IP。返回 True 表示已切换。"""
+        if not settings:
+            return False
+        clash_api = getattr(settings, 'web_clash_api', None)
+        if not clash_api:
+            return False
+        try:
+            import urllib.request as _req
+            # 获取所有代理节点
+            resp = _req.urlopen(f"{clash_api}/proxies", timeout=5)
+            import json as _json
+            data = _json.loads(resp.read())
+            proxies = data.get("proxies", {})
+            # 找可切换的节点组
+            for group_name, group_info in proxies.items():
+                if group_info.get("type") == "Selector" and group_info.get("now"):
+                    nodes = group_info.get("all", [])
+                    if len(nodes) > 1:
+                        # 随机选一个不同于当前的节点
+                        import random as _rnd
+                        current = group_info["now"]
+                        others = [n for n in nodes if n != current]
+                        if others:
+                            new_node = _rnd.choice(others)
+                            put_req = _req.Request(
+                                f"{clash_api}/proxies/{group_name}",
+                                data=_json.dumps({"name": new_node}).encode(),
+                                method="PUT",
+                                headers={"Content-Type": "application/json"})
+                            _req.urlopen(put_req, timeout=5)
+                            print(f"[BrowserManager] Clash 切换节点: {current} → {new_node}")
+                            return True
+        except Exception:
+            pass
+        return False
+
+    @classmethod
     async def shutdown(cls):
-        """关闭浏览器——先优雅关闭，再强杀进程确保窗口消失。"""
-        import subprocess as _sp
+        """关闭浏览器。"""
         try:
             if cls._browser:
                 await cls._browser.close()
-                await asyncio.sleep(0.5)
         except Exception:
             pass
         await cls._cleanup()
-        # 确保 Edge 进程彻底退出
-        try:
-            _sp.run(["taskkill", "/F", "/IM", "msedge.exe"],
-                    capture_output=True, timeout=5)
-        except Exception:
-            pass
 
     # ================================================================
     # 内部
@@ -99,28 +129,55 @@ class BrowserManager:
         cls._playwright = None
         cls._context = None
 
+    _channel_index = 0
+    _CHANNELS = ["chrome", "msedge", "firefox"]
+    _force_channel = None     # 轮换时强制指定的浏览器，优先级最高
+
+    @classmethod
+    def switch_channel(cls):
+        """切换到另一个浏览器，返回新浏览器名"""
+        cls._channel_index = (cls._channel_index + 1) % len(cls._CHANNELS)
+        name = cls._CHANNELS[cls._channel_index]
+        cls._force_channel = name  # 强制下一次启动用这个
+        print(f"[BrowserManager] 切换到: {name}")
+        return name
+
     async def _start_browser(self):
-        """用 Playwright 启动系统 Edge（非 CDP），能正常关闭。"""
+        """启动浏览器，支持 Chrome/Edge/Firefox 轮换。"""
         from playwright.async_api import async_playwright
 
         BrowserManager._playwright = await async_playwright().start()
 
         proxy = self.settings.web_proxy if self.settings else None
-        args = [
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-session-crashed-bubble",
-        ]
-        if proxy:
-            args.append(f"--proxy-server={proxy}")
-            args.append("--proxy-bypass-list=<-loopback>")
 
-        BrowserManager._browser = await BrowserManager._playwright.chromium.launch(
-            channel="msedge",
-            headless=False,
-            args=args,
-        )
+        # 优先级：轮换强制 > 用户配置
+        if BrowserManager._force_channel:
+            channel = BrowserManager._force_channel
+            BrowserManager._force_channel = None  # 只用一次
+        else:
+            configured = self.settings.web_browser if self.settings else "chrome"
+            channel = configured if configured in BrowserManager._CHANNELS else "chrome"
+
+        if channel == "firefox":
+            launch_opts = {"headless": False}
+            if proxy:
+                launch_opts["proxy"] = {"server": proxy}
+            BrowserManager._browser = await BrowserManager._playwright.firefox.launch(**launch_opts)
+        else:
+            args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-session-crashed-bubble",
+            ]
+            if proxy:
+                args.append(f"--proxy-server={proxy}")
+                args.append("--proxy-bypass-list=<-loopback>")
+            BrowserManager._browser = await BrowserManager._playwright.chromium.launch(
+                channel=channel,
+                headless=False,
+                args=args,
+            )
 
         ctx_opts = {
             "viewport": {"width": 1920, "height": 1080},

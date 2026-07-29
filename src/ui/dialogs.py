@@ -116,6 +116,18 @@ class SettingsDialog(QDialog):
         tab_params = QWidget()
         params_layout = QVBoxLayout(tab_params)
 
+        # ── 浏览器选择 ──
+        browser_group = QGroupBox("浏览器")
+        browser_layout = QHBoxLayout(browser_group)
+        browser_layout.addWidget(QLabel("使用浏览器:"))
+        self.browser_combo = QComboBox()
+        self.browser_combo.addItem("Chrome", "chrome")
+        self.browser_combo.addItem("Edge", "msedge")
+        self.browser_combo.addItem("Firefox", "firefox")
+        browser_layout.addWidget(self.browser_combo)
+        browser_layout.addStretch(1)
+        params_layout.addWidget(browser_group)
+
         search_group = QGroupBox("检索参数")
         search_form = QFormLayout(search_group)
 
@@ -130,10 +142,14 @@ class SettingsDialog(QDialog):
             "勾选后忽略本地缓存，重新从 PATENTSCOPE 获取本申请完整信息")
         search_form.addRow(self.force_refresh_cb)
 
-        self.debug_search_only_cb = QCheckBox("仅搜索摘要（不下载全文、不AI评分）")
-        self.debug_search_only_cb.setToolTip(
-            "勾选后全部检索式搜索完就停止，仅生成摘要列表")
-        search_form.addRow(self.debug_search_only_cb)
+        self.stop_after_combo = QComboBox()
+        self.stop_after_combo.addItem("跑完全程（撰写通知书）", "full")
+        self.stop_after_combo.addItem("AI评分后停止", "score")
+        self.stop_after_combo.addItem("下载对比文件后停止", "download")
+        self.stop_after_combo.addItem("粗筛摘要后停止", "screen")
+        self.stop_after_combo.addItem("搜索摘要后停止", "abstracts")
+        self.stop_after_combo.setToolTip("流程运行到选定步骤后自动停止")
+        search_form.addRow("流程断点:", self.stop_after_combo)
 
         params_layout.addWidget(search_group)
         params_layout.addStretch(1)
@@ -181,6 +197,23 @@ class SettingsDialog(QDialog):
         # 温度
         temp = self.settings.ai_temperature
         self.temp_slider.setValue(int(temp * 100))
+
+        # 浏览器
+        browser = self.settings.web_browser
+        idx = self.browser_combo.findData(browser)
+        if idx >= 0:
+            self.browser_combo.setCurrentIndex(idx)
+
+        # 检索参数复选框
+        self.include_citations_cb.setChecked(
+            self.settings.search_include_citations)
+        self.force_refresh_cb.setChecked(
+            self.settings.search_force_refresh)
+        # 流程断点
+        stop = self.settings.search_stop_after
+        idx = self.stop_after_combo.findData(stop)
+        if idx >= 0:
+            self.stop_after_combo.setCurrentIndex(idx)
 
     def _populate_models(self):
         """根据当前提供商填充所有模型下拉框"""
@@ -272,6 +305,13 @@ class SettingsDialog(QDialog):
             if yaml_path.exists():
                 content = yaml_path.read_text(encoding="utf-8")
                 import re
+                # 浏览器
+                browser = self.browser_combo.currentData()
+                content = re.sub(
+                    r'browser:\s*"[^"]*"',
+                    f'browser: "{browser}"',
+                    content
+                )
                 content = re.sub(
                     r'provider:\s*"[^"]*"',
                     f'provider: "{provider}"',
@@ -321,8 +361,39 @@ class SettingsDialog(QDialog):
         params = {
             "include_citations": self.include_citations_cb.isChecked(),
             "force_refresh": self.force_refresh_cb.isChecked(),
-            "debug_search_only": self.debug_search_only_cb.isChecked(),
+            "stop_after": self.stop_after_combo.currentData(),
         }
+
+        # 写检索参数到 settings.yaml
+        try:
+            yaml_path = self.settings.config_dir / "settings.yaml"
+            if yaml_path.exists():
+                content = yaml_path.read_text(encoding="utf-8")
+                import re
+                for key, value, is_str in [
+                    ("include_citations", params["include_citations"], False),
+                    ("force_refresh", params["force_refresh"], False),
+                    ("stop_after", params["stop_after"], True),
+                ]:
+                    if is_str:
+                        val_str = f'"{value}"'
+                    else:
+                        val_str = "true" if value else "false"
+                    if re.search(fr'{key}:\s*\S+', content):
+                        content = re.sub(fr'{key}:\s*\S+', f'{key}: {val_str}', content)
+                    else:
+                        content = re.sub(
+                            r'(search:\s*\n)',
+                            f'\\1  {key}: {val_str}\n',
+                            content)
+                yaml_path.write_text(content, encoding="utf-8")
+                # 强制刷新 Settings 内存缓存
+                import yaml as _yaml
+                with open(yaml_path, "r", encoding="utf-8") as _f:
+                    self.settings._raw = _yaml.safe_load(_f)
+        except Exception as e:
+            print(f"[Settings] 写入 yaml 失败: {e}")
+
         self.settings_saved.emit(provider, model, temperature, params)
         self.accept()
         stages = []
@@ -341,7 +412,7 @@ class SettingsDialog(QDialog):
             f"检索参数:\n"
             f"  提取引用专利: {'是' if params['include_citations'] else '否'}\n"
             f"  强制重新获取: {'是' if params['force_refresh'] else '否'}\n"
-            f"  仅搜索摘要: {'是' if params['debug_search_only'] else '否'}\n\n"
+            f"  流程断点: {self.stop_after_combo.currentText()}\n\n"
             "设置已写入 config/.env 和 config/settings.yaml，持续生效。")
 
 

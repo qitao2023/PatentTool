@@ -32,7 +32,7 @@ class InputPanel(QWidget):
         self._set_default_test_path()
 
     def _set_default_test_path(self):
-        test_path = r"E:\01-claudecode\00-patent\01-20260724\本申请.PDF"
+        test_path = r"E:\01-claudecode\00-patent\03-20260727\本申请.PDF"
         if Path(test_path).exists():
             self.path_edit.setText(test_path)
             self.path_edit.home(False)
