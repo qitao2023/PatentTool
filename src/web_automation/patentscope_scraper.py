@@ -180,20 +180,46 @@ class PatentscopeScraper:
     # ================================================================
 
     async def fetch_detail(self, doc_id: str) -> Optional[dict]:
-        """获取专利详情（直连优先，失败/403/空内容自动切搜索方式）。"""
+        """获取专利详情（直连优先，失败/403/空内容自动切搜索方式）。
+
+        当 prefer_cn_family 开启时：若当前专利为非CN专利，
+        自动查找专利族中的 CN 专利并抓取之。
+        """
         # 先试直连（快）
         detail_url = f"https://patentscope2.wipo.int/search/zh/detail.jsf?docId={doc_id}"
         try:
             await self.page.goto(detail_url, timeout=60000, wait_until="commit")
+            # ⚠️ 第一时间检测 403，不让 h1 白白等 10s
+            if await self._check_blocked(self.page):
+                raise RuntimeError("403 Forbidden")
             try:
                 await self.page.wait_for_selector("h1", timeout=10000)
             except Exception:
                 pass
             await asyncio.sleep(1)
-            body_start = await self.page.evaluate(
-                "() => document.body?.innerText?.substring(0, 200) || ''")
-            if "403" in body_start and "FORBIDDEN" in body_start:
-                raise Exception("403")
+
+            # ── 优先使用中国同族专利 ──
+            if self.settings.search_prefer_cn_family:
+                cn_family = await self._find_cn_in_patent_family(doc_id)
+                if cn_family:
+                    # 导航到 CN 同族专利页面
+                    cn_url = (
+                        f"https://patentscope2.wipo.int/search/zh"
+                        f"/detail.jsf?docId={cn_family}"
+                    )
+                    await self.page.goto(cn_url, timeout=60000,
+                                         wait_until="commit")
+                    try:
+                        await self.page.wait_for_selector("h1", timeout=10000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    result = await self._extract_detail_page(cn_family)
+                    if result:
+                        result["_cn_family_original"] = doc_id
+                        result["_cn_family_replaced_by"] = cn_family
+                        return result
+
             result = await self._extract_detail_page(doc_id)
             if result:
                 return result
@@ -220,11 +246,22 @@ class PatentscopeScraper:
                 # 导航到搜索页（用 JS 跳转代替 page.goto，更像真实用户行为）
                 await self.page.evaluate(
                     f'window.location.href = "{self.settings.patentscope_search_url}"')
+                # ⚠️ 先快速检测是否403，不等输入框超时
+                for _ in range(5):  # 最多等 ~10s
+                    await asyncio.sleep(2)
+                    if await PatentscopeScraper._check_blocked(self.page):
+                        raise RuntimeError(
+                            "PATENTSCOPE 返回 403 Forbidden — 当前IP已被限流")
+                    # 输入框出现了就继续
+                    inp_check = self.page.locator(
+                        "#simpleSearchForm\\:fpSearch\\:input")
+                    if await inp_check.count() > 0:
+                        break
                 # 等搜索框出现
                 try:
                     await self.page.wait_for_selector(
                         "#simpleSearchForm\\:fpSearch\\:input",
-                        timeout=15000)
+                        timeout=5000)
                 except Exception:
                     await asyncio.sleep(2)
 
@@ -232,7 +269,7 @@ class PatentscopeScraper:
                 inp = self.page.locator(
                     "#simpleSearchForm\\:fpSearch\\:input")
                 if await inp.count() > 0:
-                    await inp.wait_for(state="visible", timeout=15000)
+                    await inp.wait_for(state="visible", timeout=5000)
                     await inp.fill(term)
                     await asyncio.sleep(random.uniform(0.3, 0.6))
                     btn = self.page.locator("button[id*='fpSearch']").first
@@ -372,6 +409,8 @@ class PatentscopeScraper:
         consecutive_403 = 0
         batch_count = 0
         failed_ids = []           # 本轮失败的 doc_id，供重试用
+        # 记录每个 doc_id 在第一轮的原始位置（1-based），重试时保持原编号
+        _orig_idx = {did: i + 1 for i, did in enumerate(remaining)}
         BATCH_SIZE = 15
         current_context = self.page.context
         current_page = self.page
@@ -406,7 +445,7 @@ class PatentscopeScraper:
                 # 遇到403：切浏览器 + 冷却
                 if consecutive_403 >= 1:
                     from src.web_automation.browser_manager import BrowserManager
-                    new_browser = BrowserManager.switch_channel()
+                    new_browser = BrowserManager.switch_channel(on_403=True)
                     await _restart_browser()
                     cool = random.uniform(5, 15)
                     if signals:
@@ -433,26 +472,54 @@ class PatentscopeScraper:
                     )
                     await pg.goto(detail_url, timeout=60000,
                                   wait_until="commit")
+                    # ⚠️ 第一时间检测 403
+                    if await self._check_blocked(pg):
+                        is_403 = True
+                        raise RuntimeError("403 Forbidden")
                     try:
                         await pg.wait_for_selector("h1", timeout=8000)
                     except Exception:
                         pass
                     await asyncio.sleep(1)
 
-                    # 检测真403
-                    body = await pg.evaluate(
-                        "() => document.body?.innerText?.substring(0, 200) || ''")
-                    if "403" in body and "FORBIDDEN" in body:
-                        is_403 = True
-                        raise RuntimeError("403 Forbidden")
+                    # ── 优先使用中国同族专利 ──
+                    actual_doc_id = doc_id
+                    cn_family_note = None
+                    if self.settings.search_prefer_cn_family:
+                        cn_family = await self._find_cn_in_patent_family(
+                            doc_id, page=pg)
+                        if cn_family:
+                            # 导航到 CN 同族专利页面
+                            cn_url = (
+                                f"https://patentscope2.wipo.int/search/zh"
+                                f"/detail.jsf?docId={cn_family}"
+                            )
+                            await pg.goto(cn_url, timeout=60000,
+                                          wait_until="commit")
+                            try:
+                                await pg.wait_for_selector("h1", timeout=8000)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1)
+                            actual_doc_id = cn_family
+                            cn_family_note = cn_family
+                            if signals:
+                                signals.log.emit("INFO",
+                                    f"    🔄 专利族替换: {doc_id} → CN {cn_family}")
 
-                    detail = await self._extract_detail_page(doc_id, page=pg)
+                    detail = await self._extract_detail_page(
+                        actual_doc_id, page=pg)
+
+                    # 记录专利族替换信息
+                    if detail and cn_family_note:
+                        detail["_cn_family_original"] = doc_id
+                        detail["_cn_family_replaced_by"] = cn_family_note
 
                     # 有链接的直接用，没链接的才搜——绝不多搜一次
                     if not detail and not stored_url:
                         self.page = pg
                         detail = await self.fetch_detail_via_search(
-                            doc_id, signals=signals)
+                            actual_doc_id, signals=signals)
 
                     if not detail:
                         raise RuntimeError("内容无效（缺摘要/权利要求/说明书）")
@@ -462,7 +529,13 @@ class PatentscopeScraper:
 
                     meta = meta_map.get(doc_id, {})
                     pub_from_search = meta.get("publication_number", "")
-                    if pub_from_search:
+                    # CN同族替换后：文件用原始doc_id命名（避免与CN专利自身缓存冲突），
+                    # 但标题/权利要求等保留CN专利的内容
+                    if cn_family_note:
+                        # 保留 CN 专利的 publication_number 作为主标识
+                        # 文件用原始 doc_id 命名，防止与已在列表中的 CN 专利文件冲突
+                        file_key = doc_id
+                    elif pub_from_search:
                         detail["publication_number"] = pub_from_search
                         detail["patent_number"] = pub_from_search
                         file_key = pub_from_search
@@ -477,8 +550,9 @@ class PatentscopeScraper:
                         encoding="utf-8")
                     success_count += 1
                     if signals:
+                        idx = _orig_idx.get(doc_id, success_count + fail_count)
                         signals.log.emit("INFO",
-                            f"    ✓ [{success_count+fail_count}/{len(remaining)}] "
+                            f"    ✓ [{idx}/{len(remaining)}] "
                             f"{detail.get('publication_number', doc_id)}")
                 except Exception as e:
                     fail_count += 1
@@ -498,8 +572,9 @@ class PatentscopeScraper:
                         meta = meta_map.get(doc_id, {})
                         label = meta.get("publication_number", doc_id)
                         reason = "403" if is_403 else "内容无效"
+                        idx = _orig_idx.get(doc_id, success_count + fail_count)
                         signals.log.emit("WARN",
-                            f"    ✗ [{success_count+fail_count}/{len(remaining)}] "
+                            f"    ✗ [{idx}/{len(remaining)}] "
                             f"{label}: {reason}")
                 finally:
                     await pg.close()
@@ -538,11 +613,49 @@ class PatentscopeScraper:
     # 搜索表单
     # ================================================================
 
+    # 403 / 被封标记
+    _BLOCKED_MARKERS = (
+        "403", "FORBIDDEN", "Access Denied", "Request Rejected",
+        "访问被拒绝", "ERROR 403",
+    )
+
+    @staticmethod
+    async def _check_blocked(page, timeout: float = 3.0) -> bool:
+        """快速检测页面是否为 403/被封页面。
+
+        取 body 前 500 字符检查，比等某个 DOM 元素超时快得多。
+        返回 True 表示已被封。
+        """
+        try:
+            body = await page.evaluate(
+                "() => (document.body && document.body.innerText || '').substring(0, 500)")
+            return any(m in body for m in PatentscopeScraper._BLOCKED_MARKERS)
+        except Exception:
+            return False
+
+    # ================================================================
+    # 搜索表单
+    # ================================================================
+
     async def _navigate_and_search(self, query: str, signals=None):
         if signals:
             signals.log.emit("INFO", "  正在访问 PATENTSCOPE...")
         search_url = self.settings.patentscope_search_url
-        await self.page.goto(search_url, timeout=60000, wait_until="commit")
+        # domcontentloaded: 等 DOM 解析完 + JS 初始执行完再继续
+        # commit 太早，JSF 组件还没初始化，导致结果行数不对、下拉组件不可交互
+        await self.page.goto(search_url, timeout=60000, wait_until="domcontentloaded")
+        # 等 JSF 把页面跑起来
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        # 403 检测
+        if await self._check_blocked(self.page):
+            raise RuntimeError(
+                "PATENTSCOPE 返回 403 Forbidden — 当前IP已被限流，"
+                "请切换代理节点或等待冷却后重试")
+
         # JSF 页面需要时间初始化组件，等输入框可见即可
         try:
             await self.page.wait_for_selector(
@@ -563,36 +676,86 @@ class PatentscopeScraper:
     async def _set_max_page_size(self, signals=None):
         """切到每页最多条数（200）。
 
-        用 JS 找到包含"200"选项的 select（一次 page.evaluate，快到飞起），
-        不依赖 DOM 顺序（视觉位置和 DOM 顺序可能不一致）。
+        优先用配置中的精确选择器定位页面条数下拉框；
+        兜底用 JS 查找所有 select 中包含"200"选项的那个。
+        不再依赖 querySelectorAll 索引与 Playwright locator 索引的一致性。
         """
+        PAGE_SIZE = "200"
+        # 已知的页面条数选择器（按优先级）
+        KNOWN_SELECTORS = [
+            "select[id*='listLength']",
+            "select[id*='resultList']",
+            "select[id*='pageSize']",
+            "select[id*='jumpTo']",
+        ]
+
         try:
-            # JS 找包含"200"选项的 select
-            info = await self.page.evaluate('''() => {
-                var selects = document.querySelectorAll("select");
-                for (var i = 0; i < selects.length; i++) {
-                    var opts = selects[i].querySelectorAll("option");
-                    for (var j = 0; j < opts.length; j++) {
-                        if (opts[j].value === "200") {
-                            return {index: i, current: selects[i].value};
-                        }
-                    }
-                }
-                return null;
-            }''')
+            loc = None
 
-            if not info:
-                return  # 无结果页
+            # ── 策略1: 用精确选择器定位 ──
+            for sel in KNOWN_SELECTORS:
+                candidate = self.page.locator(sel).first
+                if await candidate.count() > 0:
+                    # 确认它有 "200" 选项
+                    opts = await candidate.locator("option").all()
+                    values = []
+                    for o in opts:
+                        v = await o.get_attribute("value")
+                        if v:
+                            values.append(v)
+                    if PAGE_SIZE in values:
+                        loc = candidate
+                        break
 
-            if info["current"] == "200":
+            # ── 策略2: JS 兜底 —— 在 JS 里直接改值，不靠索引回传 ──
+            if loc is None:
+                changed = await self.page.evaluate(f'''(pageSize) => {{
+                    var selects = document.querySelectorAll("select");
+                    for (var i = 0; i < selects.length; i++) {{
+                        var s = selects[i];
+                        var opts = s.querySelectorAll("option");
+                        for (var j = 0; j < opts.length; j++) {{
+                            if (opts[j].value === pageSize) {{
+                                if (s.value === pageSize) return "already";
+                                s.value = pageSize;
+                                s.dispatchEvent(new Event("change", {{bubbles: true}}));
+                                s.dispatchEvent(new Event("input", {{bubbles: true}}));
+                                return "ok";
+                            }}
+                        }}
+                    }}
+                    return null;
+                }}''', PAGE_SIZE)
+
+                if changed == "already":
+                    if signals:
+                        signals.log.emit("INFO", "  每页已是 200 条")
+                    return
+                elif changed == "ok":
+                    if signals:
+                        signals.log.emit("INFO", "  切换每页条数 → 200 (JS)")
+                    # 等待行数变化
+                    stable_count = await self._wait_for_results_stable(signals, label="切200")
+                    if stable_count < 200:
+                        await asyncio.sleep(1.0)
+                        stable_count = await self._wait_for_results_stable(signals, label="切200r")
+                    if signals:
+                        signals.log.emit("INFO", f"  当前页: {stable_count} 行")
+                    return
+                else:
+                    if signals:
+                        signals.log.emit("WARN", "  未找到包含200选项的下拉框")
+                    return
+
+            # ── 策略1 命中：Playwright 操作 ──
+            current_val = await loc.input_value()
+            if current_val == PAGE_SIZE:
                 if signals:
                     signals.log.emit("INFO", "  每页已是 200 条")
                 return
 
-            # 直接切，不管可见性（JSF 组件可能 offsetParent 为 null）
-            loc = self.page.locator("select").nth(info["index"])
             await asyncio.sleep(random.uniform(0.3, 0.6))
-            await loc.select_option(value="200", timeout=5000)
+            await loc.select_option(value=PAGE_SIZE)
             if signals:
                 signals.log.emit("INFO", "  切换每页条数 → 200")
 
@@ -669,8 +832,17 @@ class PatentscopeScraper:
     async def _fill_and_submit(self, query: str):
         # 步骤1: 使用 Playwright locator 填入检索式（自动等待元素、防导航中断）
         try:
-            input_locator = self.page.locator("#simpleSearchForm\\:fpSearch\\:input").first
-            await input_locator.wait_for(state="visible", timeout=30000)
+            input_locator = self.page.locator(
+                "#simpleSearchForm\\:fpSearch\\:input").first
+            # 等输入框前先快速检查是否已被封，避免白等 30s
+            for _ in range(6):  # 最多等 ~18s，每 3s 检查一次是否被封
+                if await input_locator.count() > 0:
+                    break
+                if await self._check_blocked(self.page):
+                    raise RuntimeError(
+                        "PATENTSCOPE 返回 403 Forbidden — 当前IP已被限流")
+                await asyncio.sleep(3)
+            await input_locator.wait_for(state="visible", timeout=5000)
             await input_locator.fill(query)
             await asyncio.sleep(0.5)
         except Exception as e:
@@ -1053,6 +1225,80 @@ class PatentscopeScraper:
             return text or ""
         except Exception:
             return ""
+
+    # ── 辅助：专利族中查找 CN 专利 ─────────────────────────────────
+
+    @staticmethod
+    def _is_cn_patent(doc_id: str) -> bool:
+        """判断 doc_id 或公布号是否为中国专利（以 CN 开头）。"""
+        if not doc_id:
+            return False
+        return bool(re.match(r'^CN', doc_id.strip(), re.IGNORECASE))
+
+    async def _find_cn_in_patent_family(self, doc_id: str, page=None) -> str | None:
+        """在专利族标签页中查找 CN 开头的专利号。
+
+        仅当 doc_id 非 CN 专利时才执行查找。返回找到的第一个 CN 专利号
+        （docId 格式，如 CN116110953），未找到返回 None。
+
+        查找策略：
+        1. 先尝试点击「专利族」tab（尝试多种 href 关键词）
+        2. 在面板中查找 CN 开头的专利号文本
+        3. 同时尝试查找可点击的 CN 专利链接提取 docId
+        """
+        # 已经是 CN 专利，无需查找
+        if self._is_cn_patent(doc_id):
+            return None
+
+        pg = page or self.page
+
+        # 尝试多种专利族 tab 关键词
+        family_text = ""
+        for keyword in ("patentFamily", "family", "FAMILY", "simpleFamily",
+                         "PatentFamily", "PATENT_FAMILY"):
+            family_text = await self._click_and_extract_tab(keyword, page=pg)
+            if family_text:
+                break
+
+        if not family_text:
+            return None
+
+        # 从专利族文本中提取 CN 专利号
+        cn_matches = []
+        # 模式1: CN + 7-13位数字 + 可选字母数字后缀（如 CN116110953A）
+        for m in re.finditer(r'\b(CN\d{7,13}[A-Z]?\d*)\b', family_text, re.IGNORECASE):
+            cn_num = m.group(1).upper()
+            # 去掉末尾种类码（A/B/U等）得到 docId 格式
+            cn_doc_id = re.sub(r'[ABU]\d?$', '', cn_num)
+            if cn_doc_id not in cn_matches:
+                cn_matches.append(cn_doc_id)
+
+        if cn_matches:
+            return cn_matches[0]
+
+        # 模式2: 从链接中提取（兜底）
+        try:
+            cn_links = await pg.evaluate('''() => {
+                var results = [];
+                var links = document.querySelectorAll(
+                    ".ui-tabs-panel a[href*='docId=']");
+                for (var i = 0; i < links.length; i++) {
+                    var href = links[i].href || "";
+                    var m = href.match(/docId=(CN\\d+)/i);
+                    if (m) {
+                        // 去掉末尾种类码
+                        var cn = m[1].replace(/[ABU]\\d?$/, '');
+                        if (results.indexOf(cn) === -1) results.push(cn);
+                    }
+                }
+                return results;
+            }''')
+            if cn_links and len(cn_links) > 0:
+                return cn_links[0]
+        except Exception:
+            pass
+
+        return None
 
 
 # ── 缓存验证 ──────────────────────────────────────────────────────
