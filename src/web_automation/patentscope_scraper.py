@@ -359,6 +359,9 @@ class PatentscopeScraper:
                 merged = {**p, **{k: v for k, v in detail.items() if v}}
                 if pub_num:
                     merged["publication_number"] = pub_num
+                # 摘要回退：详情页提取不到摘要时，用搜索结果的 abstract_snippet
+                if not merged.get("abstract") and p.get("abstract_snippet"):
+                    merged["abstract"] = p["abstract_snippet"]
                 enriched.append(merged)
             else:
                 p["_no_detail"] = True
@@ -551,6 +554,9 @@ class PatentscopeScraper:
                     detail["fetch_status"] = "ok"
 
                     meta = meta_map.get(doc_id, {})
+                    # 摘要回退：详情页提取不到摘要时，用搜索结果的 abstract_snippet
+                    if not detail.get("abstract") and meta.get("abstract_snippet"):
+                        detail["abstract"] = meta["abstract_snippet"]
                     pub_from_search = meta.get("publication_number", "")
                     # CN同族替换后：文件用原始doc_id命名（避免与CN专利自身缓存冲突），
                     # 但标题/权利要求等保留CN专利的内容
@@ -723,6 +729,7 @@ class PatentscopeScraper:
         PAGE_SIZE = "200"
         # 已知的页面条数选择器（按优先级）
         KNOWN_SELECTORS = [
+            "select[id*='length']",       # Mojarra: settingsForm:lengthOption:input
             "select[id*='listLength']",
             "select[id*='resultList']",
             "select[id*='pageSize']",
@@ -787,7 +794,7 @@ class PatentscopeScraper:
                 return
 
             await asyncio.sleep(random.uniform(0.3, 0.6))
-            await loc.select_option(value=PAGE_SIZE, timeout=15000)
+            await loc.select_option(value=PAGE_SIZE, timeout=15000, force=True)
             if signals:
                 signals.log.emit("INFO", "  切换每页条数 → 200")
 
@@ -1025,7 +1032,8 @@ class PatentscopeScraper:
         # 书目数据
         biblio = await pg.evaluate('''() => {
             var data = {};
-            var body = (document.body && document.body.innerText) || "";
+            // 优先用 textContent（含隐藏文本），innerText 可能漏掉折叠区域
+            var body = (document.body && (document.body.textContent || document.body.innerText)) || "";
             data.full_text = body.substring(0, 80000);
             var h1 = document.querySelector("h1");
             if (h1) data.title = h1.textContent.trim();
@@ -1151,6 +1159,28 @@ class PatentscopeScraper:
                     abstract = re.sub(r'^(?:摘要|Abstract)\s*', '', abstract).strip()
             if abstract:
                 result["abstract"] = abstract[:5000]
+
+            # DOM 兜底：正则全失败时直接从页面元素提取
+            if not result.get("abstract"):
+                dom_abstract = await pg.evaluate('''() => {
+                    // 按 class 名查找摘要元素
+                    var selectors = [
+                        "[class*='abstract']", "[class*='Abstract']",
+                        ".ps-bibliographic-data--abstract",
+                    ];
+                    for (var i = 0; i < selectors.length; i++) {
+                        try {
+                            var els = document.querySelectorAll(selectors[i]);
+                            for (var j = 0; j < els.length; j++) {
+                                var t = els[j].textContent.trim();
+                                if (t.length > 10 && t.length < 10000) return t;
+                            }
+                        } catch(e) {}
+                    }
+                    return "";
+                }''')
+                if dom_abstract and len(dom_abstract) > 10:
+                    result["abstract"] = dom_abstract[:5000]
 
         return result
 
