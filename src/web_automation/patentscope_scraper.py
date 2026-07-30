@@ -707,9 +707,12 @@ class PatentscopeScraper:
                         loc = candidate
                         break
 
-            # ── 策略2: JS 兜底 —— 在 JS 里直接改值，不靠索引回传 ──
+            # ── 策略2: JS 兜底 —— 打标记后交给 Playwright 操作 ──
+            # JSF/PrimeFaces 的 onchange 是内联属性，dispatchEvent 触发不了，
+            # 必须由 Playwright 的 select_option 来驱动（它正确触发内联 handler）。
             if loc is None:
-                changed = await self.page.evaluate(f'''(pageSize) => {{
+                marker = "__ps_page_size_select__"
+                found = await self.page.evaluate(f'''(pageSize, marker) => {{
                     var selects = document.querySelectorAll("select");
                     for (var i = 0; i < selects.length; i++) {{
                         var s = selects[i];
@@ -717,31 +720,20 @@ class PatentscopeScraper:
                         for (var j = 0; j < opts.length; j++) {{
                             if (opts[j].value === pageSize) {{
                                 if (s.value === pageSize) return "already";
-                                s.value = pageSize;
-                                s.dispatchEvent(new Event("change", {{bubbles: true}}));
-                                s.dispatchEvent(new Event("input", {{bubbles: true}}));
-                                return "ok";
+                                s.setAttribute(marker, "true");
+                                return "found";
                             }}
                         }}
                     }}
                     return null;
-                }}''', PAGE_SIZE)
+                }}''', PAGE_SIZE, marker)
 
-                if changed == "already":
+                if found == "already":
                     if signals:
                         signals.log.emit("INFO", "  每页已是 200 条")
                     return
-                elif changed == "ok":
-                    if signals:
-                        signals.log.emit("INFO", "  切换每页条数 → 200 (JS)")
-                    # 等待行数变化
-                    stable_count = await self._wait_for_results_stable(signals, label="切200")
-                    if stable_count < 200:
-                        await asyncio.sleep(1.0)
-                        stable_count = await self._wait_for_results_stable(signals, label="切200r")
-                    if signals:
-                        signals.log.emit("INFO", f"  当前页: {stable_count} 行")
-                    return
+                elif found == "found":
+                    loc = self.page.locator(f"[{marker}]")
                 else:
                     if signals:
                         signals.log.emit("WARN", "  未找到包含200选项的下拉框")
