@@ -722,90 +722,56 @@ class PatentscopeScraper:
     async def _set_max_page_size(self, signals=None):
         """切到每页最多条数（200）。
 
-        优先用配置中的精确选择器定位页面条数下拉框；
-        兜底用 JS 查找所有 select 中包含"200"选项的那个。
-        不再依赖 querySelectorAll 索引与 Playwright locator 索引的一致性。
+        直接用 JS 查找包含"200"选项的 select，改值 + 触发 onchange
+        （Mojarra/JSF 的内联 onchange 必须直接调用 s.onchange() 才能触发 AJAX）。
+        不依赖 Playwright 的 select_option，避免可见性检查/事件兼容性问题。
         """
         PAGE_SIZE = "200"
-        # 已知的页面条数选择器（按优先级）
-        KNOWN_SELECTORS = [
-            "select[id*='length']",       # Mojarra: settingsForm:lengthOption:input
-            "select[id*='listLength']",
-            "select[id*='resultList']",
-            "select[id*='pageSize']",
-            "select[id*='jumpTo']",
-        ]
 
         try:
-            loc = None
-
-            # ── 策略1: 用精确选择器定位 ──
-            for sel in KNOWN_SELECTORS:
-                candidate = self.page.locator(sel).first
-                if await candidate.count() > 0:
-                    # 确认它有 "200" 选项
-                    opts = await candidate.locator("option").all()
-                    values = []
-                    for o in opts:
-                        v = await o.get_attribute("value")
-                        if v:
-                            values.append(v)
-                    if PAGE_SIZE in values:
-                        loc = candidate
-                        break
-
-            # ── 策略2: JS 兜底 —— 打标记后交给 Playwright 操作 ──
-            # JSF/PrimeFaces 的 onchange 是内联属性，dispatchEvent 触发不了，
-            # 必须由 Playwright 的 select_option 来驱动（它正确触发内联 handler）。
-            if loc is None:
-                marker = "__ps_page_size_select__"
-                found = await self.page.evaluate('''({pageSize, marker}) => {
-                    var selects = document.querySelectorAll("select");
-                    for (var i = 0; i < selects.length; i++) {
-                        var s = selects[i];
-                        var opts = s.querySelectorAll("option");
-                        for (var j = 0; j < opts.length; j++) {
-                            if (opts[j].value === pageSize) {
-                                if (s.value === pageSize) return "already";
-                                s.setAttribute(marker, "true");
-                                return "found";
-                            }
+            # 一步到位：JS 查找 → 改值 → 触发 onchange → 返回状态
+            result = await self.page.evaluate('''(pageSize) => {
+                var selects = document.querySelectorAll("select");
+                for (var i = 0; i < selects.length; i++) {
+                    var s = selects[i];
+                    var opts = s.querySelectorAll("option");
+                    for (var j = 0; j < opts.length; j++) {
+                        if (opts[j].value === pageSize) {
+                            if (s.value === pageSize) return "already";
+                            s.value = pageSize;
+                            // 直接调用内联 onchange（mojarra.ab），
+                            // dispatchEvent 同时触发 addEventListener 注册的监听器
+                            var fakeEvt = {type: 'change', target: s};
+                            if (s.onchange) s.onchange.call(s, fakeEvt);
+                            s.dispatchEvent(new Event('change', {bubbles: true}));
+                            return "ok";
                         }
                     }
-                    return null;
-                }''', {"pageSize": PAGE_SIZE, "marker": marker})
+                }
+                return null;
+            }''', PAGE_SIZE)
 
-                if found == "already":
-                    if signals:
-                        signals.log.emit("INFO", "  每页已是 200 条")
-                    return
-                elif found == "found":
-                    loc = self.page.locator(f"[{marker}]")
-                else:
-                    if signals:
-                        signals.log.emit("WARN", "  未找到包含200选项的下拉框")
-                    return
-
-            # ── 策略1 命中：Playwright 操作 ──
-            current_val = await loc.input_value()
-            if current_val == PAGE_SIZE:
+            if result == "already":
                 if signals:
                     signals.log.emit("INFO", "  每页已是 200 条")
                 return
-
-            await asyncio.sleep(random.uniform(0.3, 0.6))
-            await loc.select_option(value=PAGE_SIZE, timeout=15000, force=True)
-            if signals:
-                signals.log.emit("INFO", "  切换每页条数 → 200")
-
-            # 等待行数变化
-            stable_count = await self._wait_for_results_stable(signals, label="切200")
-            if stable_count < 200:
-                await asyncio.sleep(1.0)
-                stable_count = await self._wait_for_results_stable(signals, label="切200r")
-
-            if signals:
-                signals.log.emit("INFO", f"  当前页: {stable_count} 行")
+            elif result == "ok":
+                if signals:
+                    signals.log.emit("INFO", "  切换每页条数 → 200")
+                # 等待 AJAX 刷新完成（PATENTSCOPE 重新查询较慢，给足时间）
+                # max_zero_polls=100: 容忍最多 30s 的 DOM 空白期（AJAX 清空→加载）
+                stable_count = await self._wait_for_results_stable(
+                    signals, label="切200", max_wait=30.0, max_zero_polls=100)
+                if stable_count < 200:
+                    await asyncio.sleep(2.0)
+                    stable_count = await self._wait_for_results_stable(
+                        signals, label="切200r", max_wait=25.0,
+                        max_zero_polls=100)
+                if signals:
+                    signals.log.emit("INFO", f"  当前页: {stable_count} 行")
+            else:
+                if signals:
+                    signals.log.emit("WARN", "  未找到包含200选项的下拉框")
         except Exception as e:
             if signals:
                 signals.log.emit("WARN", f"  切换每页条数失败: {e}")
@@ -825,12 +791,15 @@ class PatentscopeScraper:
     async def _wait_for_results_stable(self, signals=None,
                                         label: str = "",
                                         max_wait: float = 5.0,
-                                        poll_interval: float = 0.3) -> int:
+                                        poll_interval: float = 0.3,
+                                        max_zero_polls: int = 10) -> int:
         """轮询 DOM 直到结果行数稳定。
 
         每 poll_interval 秒检查一次行数，连续 2 次相同即认为稳定。
         count==0 时不重置计数器（AJAX 刷新期间行数会短暂归零）。
         最长等待 max_wait 秒，超时返回当前行数。
+
+        max_zero_polls: 连续多少次为0才判定真无结果（切200时设大避免误判）。
         """
         prev_count = -1
         stable_hits = 0
@@ -845,8 +814,7 @@ class PatentscopeScraper:
             # 行数为0：不计入 stable，但也不重置（容忍 AJAX 刷新闪烁）
             if count == 0:
                 zero_streak += 1
-                # 连续 3 秒都是 0 → 可能是真没结果
-                if zero_streak >= 10:
+                if zero_streak >= max_zero_polls:
                     return 0
                 continue
             zero_streak = 0
