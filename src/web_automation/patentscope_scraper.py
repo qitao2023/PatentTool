@@ -20,6 +20,7 @@ class PatentscopeScraper:
         self.human = human
         self._results_url = None
         self._total_from_page_text = 0
+        self._no_results = False
 
     # ================================================================
     # 阶段1: 搜索 + 摘要解析
@@ -30,12 +31,13 @@ class PatentscopeScraper:
         all_items = []
         # 每次新搜索重置缓存的总结果数
         self._total_from_page_text = 0
+        self._no_results = False
         await self._navigate_and_search(query, signals)
         self._results_url = self.page.url
 
-        # 无结果 → 直接返回
+        # 无结果 → 直接返回（检查前2000字符，避免页头导航撑大截断位置）
         body_text = await self.page.evaluate(
-            "() => document.body?.innerText?.substring(0, 300) || ''")
+            "() => document.body?.innerText?.substring(0, 2000) || ''")
         if any(m in body_text for m in (
             "没有找到符合您检索的结果",
             "未找到结果", "No results found",
@@ -274,7 +276,23 @@ class PatentscopeScraper:
                     await asyncio.sleep(random.uniform(0.3, 0.6))
                     btn = self.page.locator("button[id*='fpSearch']").first
                     if await btn.count() > 0:
-                        await btn.click(no_wait_after=True, timeout=10000)
+                        try:
+                            await btn.click(no_wait_after=True, timeout=15000)
+                        except Exception:
+                            await self.page.evaluate(
+                                '() => { var b = document.querySelector('
+                                '"button[id*=\'fpSearch\']"); if(b) b.click(); }')
+                        # 快速检查无结果，避免白等 20s
+                        for _ in range(3):
+                            await asyncio.sleep(1.0)
+                            bt = await self.page.evaluate(
+                                "() => document.body?.innerText"
+                                "?.substring(0, 2000) || ''")
+                            if any(m in bt for m in (
+                                "没有找到符合您检索的结果",
+                                "未找到结果", "No results found",
+                            )):
+                                return None
                         try:
                             await self.page.wait_for_url(
                                 "**/detail.jsf*", timeout=20000)
@@ -294,7 +312,12 @@ class PatentscopeScraper:
                 # 多条结果 → 点击第一条
                 link = self.page.locator("a[href*='detail.jsf']").first
                 if await link.count() > 0:
-                    await link.click()
+                    try:
+                        await link.click(timeout=15000)
+                    except Exception:
+                        await self.page.evaluate(
+                            '() => { var a = document.querySelector('
+                            '"a[href*=\'detail.jsf\']"); if(a) a.click(); }')
                     await self.page.wait_for_url(
                         "**/detail.jsf*", timeout=15000)
                     await asyncio.sleep(1)
@@ -670,6 +693,23 @@ class PatentscopeScraper:
 
         if signals:
             signals.log.emit("INFO", "  等待搜索结果...")
+
+        # ── 快速检查无结果（"没有找到符合您检索的结果"）──
+        # JSF AJAX 返回后页面会瞬间渲染出提示文字，1-3秒足够
+        for _ in range(3):
+            await asyncio.sleep(1.5)
+            body_text = await self.page.evaluate(
+                "() => document.body?.innerText?.substring(0, 2000) || ''")
+            if any(m in body_text for m in (
+                "没有找到符合您检索的结果",
+                "未找到结果", "No results found",
+                "No records matching your query were found",
+            )):
+                if signals:
+                    signals.log.emit("WARN", "  检索无结果")
+                self._no_results = True
+                return
+
         # 不依赖 URL 变化（JSF AJAX 可能不改URL），直接等结果行出现
         await self._wait_for_results_stable(signals, label="初始加载", max_wait=30.0)
 
@@ -712,21 +752,21 @@ class PatentscopeScraper:
             # 必须由 Playwright 的 select_option 来驱动（它正确触发内联 handler）。
             if loc is None:
                 marker = "__ps_page_size_select__"
-                found = await self.page.evaluate(f'''(pageSize, marker) => {{
+                found = await self.page.evaluate('''({pageSize, marker}) => {
                     var selects = document.querySelectorAll("select");
-                    for (var i = 0; i < selects.length; i++) {{
+                    for (var i = 0; i < selects.length; i++) {
                         var s = selects[i];
                         var opts = s.querySelectorAll("option");
-                        for (var j = 0; j < opts.length; j++) {{
-                            if (opts[j].value === pageSize) {{
+                        for (var j = 0; j < opts.length; j++) {
+                            if (opts[j].value === pageSize) {
                                 if (s.value === pageSize) return "already";
                                 s.setAttribute(marker, "true");
                                 return "found";
-                            }}
-                        }}
-                    }}
+                            }
+                        }
+                    }
                     return null;
-                }}''', PAGE_SIZE, marker)
+                }''', {"pageSize": PAGE_SIZE, "marker": marker})
 
                 if found == "already":
                     if signals:
@@ -747,7 +787,7 @@ class PatentscopeScraper:
                 return
 
             await asyncio.sleep(random.uniform(0.3, 0.6))
-            await loc.select_option(value=PAGE_SIZE)
+            await loc.select_option(value=PAGE_SIZE, timeout=15000)
             if signals:
                 signals.log.emit("INFO", "  切换每页条数 → 200")
 
@@ -841,11 +881,17 @@ class PatentscopeScraper:
             raise RuntimeError(f"搜索框填入失败: {e}")
 
         # 步骤2: 点击搜索按钮（JSF AJAX 不走标准导航，禁用导航等待）
+        # Playwright click 可能因页面繁忙而超时 → JS click 兜底
         try:
             btn_locator = self.page.locator("button[id*='fpSearch']").first
-            await btn_locator.click(no_wait_after=True, timeout=10000)
-        except Exception as e:
-            raise RuntimeError(f"搜索提交失败: {e}")
+            await btn_locator.click(no_wait_after=True, timeout=15000)
+        except Exception:
+            try:
+                await self.page.evaluate(
+                    '() => { var b = document.querySelector('
+                    '"button[id*=\'fpSearch\']"); if(b) b.click(); }')
+            except Exception as e:
+                raise RuntimeError(f"搜索提交失败: {e}")
 
     # ================================================================
     # 结果页解析
@@ -1130,7 +1176,7 @@ class PatentscopeScraper:
                 aria_disabled = (await next_btn.get_attribute("aria-disabled")) or ""
                 if "disabled" in cls or "disabled" in aria_disabled or "display: none" in style:
                     return False
-                await next_btn.click()
+                await next_btn.click(timeout=15000)
                 await asyncio.sleep(2)
                 try:
                     await self.page.wait_for_selector(
@@ -1203,7 +1249,12 @@ class PatentscopeScraper:
             tab = pg.locator(f"a[href*='{href_keyword}']").first
             if await tab.count() == 0:
                 return ""
-            await tab.click()
+            try:
+                await tab.click(timeout=15000)
+            except Exception:
+                await pg.evaluate(
+                    f'() => {{ var t = document.querySelector('
+                    f'"a[href*=\'{href_keyword}\']"); if(t) t.click(); }}')
             await asyncio.sleep(2)
             text = await pg.evaluate('''() => {
                 var panels = document.querySelectorAll(".ui-tabs-panel");
