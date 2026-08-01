@@ -233,7 +233,7 @@ class Settings:
 
     @property
     def patentscope_max_results(self) -> int:
-        return self._raw.get("patentscope", {}).get("max_results_per_query", 200)
+        return self._raw.get("patentscope", {}).get("max_results_per_query", 100)
 
     @property
     def patentscope_results_per_page(self) -> int:
@@ -339,7 +339,7 @@ class Settings:
     @property
     def test_batch_default_count(self) -> int:
         """批量测试 - 默认每式结果上限"""
-        return self._raw.get("test", {}).get("batch_default_count", 200)
+        return self._raw.get("test", {}).get("batch_default_count", 100)
 
     @property
     def test_batch_default_concurrency(self) -> int:

@@ -637,7 +637,7 @@ class TestDialog(QDialog):
 
     test_abstract = Signal(str, int)   # query, max_results
     test_detail = Signal(str, int)     # query, max_results
-    test_pagesize = Signal(str, int)   # query, max_results (切换200条测试)
+    test_pagesize = Signal(str, int)   # query, max_results (切换100条测试)
     lookup_patent = Signal(str)        # doc_id
     batch_test = Signal(list, str, int, int)  # queries, test_name, max_results, concurrency
 
@@ -733,8 +733,8 @@ class TestDialog(QDialog):
         param_row = QHBoxLayout()
         param_row.addWidget(QLabel("每式结果上限:"))
         self.batch_count_spin = QSpinBox()
-        self.batch_count_spin.setRange(1, 200)
-        self.batch_count_spin.setValue(200)
+        self.batch_count_spin.setRange(1, 100)
+        self.batch_count_spin.setValue(100)
         param_row.addWidget(self.batch_count_spin)
         param_row.addSpacing(20)
         param_row.addWidget(QLabel("下载并发:"))

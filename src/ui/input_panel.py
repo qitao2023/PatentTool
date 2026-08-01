@@ -94,8 +94,8 @@ class InputPanel(QWidget):
 
         param_row.addWidget(QLabel("每式结果数:"))
         self.max_results_spin = QSpinBox()
-        self.max_results_spin.setRange(1, 200)
-        self.max_results_spin.setValue(200)
+        self.max_results_spin.setRange(1, 100)
+        self.max_results_spin.setValue(100)
         self.max_results_spin.setSuffix(" 条/检索式")
         param_row.addWidget(self.max_results_spin)
         param_row.addSpacing(20)

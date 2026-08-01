@@ -35,7 +35,7 @@ class PatentscopeScraper:
     # 阶段1: 搜索 + 摘要解析
     # ================================================================
 
-    async def search_abstracts(self, query: str, max_results: int = 200,
+    async def search_abstracts(self, query: str, max_results: int = 100,
                                 signals=None) -> list[dict]:
         all_items = []
         # 每次新搜索重置缓存的总结果数

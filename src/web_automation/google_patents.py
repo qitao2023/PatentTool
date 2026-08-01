@@ -303,7 +303,7 @@ def _translate_query(query: str) -> str:
     return q.strip()
 
 
-async def search_abstracts(page, query: str, max_results: int = 200,
+async def search_abstracts(page, query: str, max_results: int = 100,
                            signals=None) -> list[dict]:
     """Google Patents 搜索，返回与 PATENTSCOPE search_abstracts 兼容的 dict 列表。
 

@@ -351,7 +351,7 @@ class MainWindow(QMainWindow):
         cn_family = "开启" if self._user_params.get("prefer_cn_family", True) else "关闭"
         self.log_panel.append_log("INFO",
             f"检索设置: {self._user_params.get('max_queries', 3)}个检索式 "
-            f"× {self._user_params.get('max_results', 200)}条/检索式 "
+            f"× {self._user_params.get('max_results', 100)}条/检索式 "
             f"| AI: {self._user_params.get('ai_provider', 'deepseek')} "
             f"| 断点: {stop_labels.get(self._user_params.get('stop_after','full'), '全程')} "
             f"| CN同族优先: {cn_family}")

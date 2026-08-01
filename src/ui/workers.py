@@ -1417,7 +1417,7 @@ class MultiQueryTestWorker(QThread):
     """
 
     def __init__(self, queries: list[str], settings: "Settings",
-                 test_name: str = "", max_results: int = 200,
+                 test_name: str = "", max_results: int = 100,
                  concurrency: int = 1,
                  output_dir: str | None = None, parent=None):
         super().__init__(parent)

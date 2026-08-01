@@ -9,7 +9,7 @@
 输入 JSON 格式:
 {
   "test_name": "测试名称",
-  "max_results": 200,
+  "max_results": 100,
   "queries": [
     "EN_AB:(IGZO AND back gate)",
     "IGZO AND (背栅 OR 底栅)"
@@ -57,7 +57,7 @@ def _save_json(path: Path, data):
 
 async def run_multi_query(queries: list[str], settings: Settings,
                           test_name: str = "",
-                          max_results: int = 200,
+                          max_results: int = 100,
                           concurrency: int = 1,
                           output_dir: str | None = None):
     """执行多检索式批量测试管线。"""
@@ -430,7 +430,7 @@ def main():
 
     # 解析参数
     output_dir = None
-    max_results = 200
+    max_results = 100
     concurrency = 1
     engine = None
     i = 2

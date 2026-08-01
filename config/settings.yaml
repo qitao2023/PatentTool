@@ -54,7 +54,7 @@ patentscope:
   search_url: "https://patentscope2.wipo.int/search/zh/search.jsf"
   advanced_search_url: "https://patentscope2.wipo.int/search/zh/advancedSearch.jsf"
   detail_url_pattern: "https://patentscope2.wipo.int/search/zh/detail.jsf?docId={doc_id}"
-  max_results_per_query: 200
+  max_results_per_query: 100
   results_per_page: 200
   collections:
     - "PCT"
@@ -120,7 +120,7 @@ session:
 test:
   default_query: "掉电"
   default_count: 10
-  batch_default_count: 200
+  batch_default_count: 100
   batch_default_concurrency: 1
   batch_default_queries: ['"H01L-29" AND ("high-k" OR "高誘電率") AND (gradient OR "composition gradient" OR "傾斜組成")', ("high-k" OR "高誘電率") AND (gradient OR "傾斜") AND ("interface trap" OR "界面欠陥" OR "界面準位"), ("nanosheet" OR "GAA" OR "nanowire" OR "ナノシート" OR "ゲートオールアラウンド") AND ("gate dielectric" OR "ゲート絶縁膜" OR "high-k") AND (gradient OR "傾斜組成"), ("H01L-29/51" OR "H01L-29/423") AND ("high-k" OR "高誘電率"), ("high-k" OR "高誘電率") AND (gradient OR "composition gradient" OR "傾斜組成"), ("GAA" OR "gate-all-around" OR "nanosheet") AND ("high-k" OR "高誘電率")]
 
