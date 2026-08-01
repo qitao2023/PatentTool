@@ -739,10 +739,10 @@ class TestDialog(QDialog):
         param_row.addSpacing(20)
         param_row.addWidget(QLabel("下载并发:"))
         self.batch_concurrency_spin = QSpinBox()
-        self.batch_concurrency_spin.setRange(1, 15)
+        self.batch_concurrency_spin.setRange(1, 20)
         self.batch_concurrency_spin.setValue(1)
         self.batch_concurrency_spin.setToolTip(
-            "并行下载数\nGoogle引擎: 可到 10-15（快）\nWIPO引擎: 建议 1-3（高并发易403）")
+            "并行下载数\nGoogle引擎: 15-20（20=本机并行上限，超过只排队）\nWIPO引擎: 建议 1-3（高并发易403）")
         param_row.addWidget(self.batch_concurrency_spin)
         param_row.addStretch(1)
         batch_layout.addLayout(param_row)
@@ -999,9 +999,9 @@ class TestDialog(QDialog):
         self.test_count_spin.setValue(self._settings.test_default_count)
         # 批量检索式测试
         self.batch_count_spin.setValue(self._settings.test_batch_default_count)
-        # 并发默认：Google 引擎可高并发（10），WIPO 保守（配置值，通常 1）
+        # 并发默认：Google 引擎可高并发（15），WIPO 保守（配置值，通常 1）
         if self._settings.search_source == "google":
-            self.batch_concurrency_spin.setValue(10)
+            self.batch_concurrency_spin.setValue(15)
         else:
             self.batch_concurrency_spin.setValue(
                 self._settings.test_batch_default_concurrency)
