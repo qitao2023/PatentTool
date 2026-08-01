@@ -309,7 +309,7 @@ class Settings:
     @property
     def analysis_max_detail_fetch(self) -> int:
         """全文下载上限，默认 200"""
-        return self._raw.get("analysis", {}).get("max_detail_fetch", 200)
+        return self._raw.get("analysis", {}).get("max_detail_fetch", 1000)
 
     @property
     def analysis_fulltext_batch_size(self) -> int:

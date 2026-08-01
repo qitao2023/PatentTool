@@ -103,7 +103,7 @@ class InputPanel(QWidget):
         param_row.addWidget(QLabel("全文下载上限:"))
         self.fetch_detail_spin = QSpinBox()
         self.fetch_detail_spin.setRange(1, 1000)
-        self.fetch_detail_spin.setValue(200)
+        self.fetch_detail_spin.setValue(1000)
         self.fetch_detail_spin.setSuffix(" 篇")
         param_row.addWidget(self.fetch_detail_spin)
         param_row.addStretch(1)

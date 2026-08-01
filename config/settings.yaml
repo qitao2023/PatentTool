@@ -105,7 +105,7 @@ dedup:
 # 分析
 analysis:
   max_tokens: 8192
-  max_detail_fetch: 200       # 全文下载上限（超过则AI快速粗筛，~30秒）
+  max_detail_fetch: 1000      # 全文下载上限（超过则AI快速粗筛，~30秒）
   fulltext_batch_size: 30     # 全文筛选时每批发给AI的篇数
   max_chars_per_patent: 3000  # 全文筛选时每篇最多发给AI的字符数
   top_n_for_detailed: 10

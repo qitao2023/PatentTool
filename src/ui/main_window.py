@@ -669,7 +669,7 @@ class MainWindow(QMainWindow):
         max_results = self._user_params.get("max_results",
                         self.settings.patentscope_max_results)
         fetch_detail = self._user_params.get("fetch_detail",
-                        self.settings.analysis_top_n)
+                        self.settings.analysis_max_detail_fetch)
         stop_after = self._user_params.get("stop_after", "full")
         max_queries = len(queries)
         stop_labels = {"abstracts":"搜摘要", "screen":"粗筛", "download":"下载", "score":"评分", "full":"全程"}
