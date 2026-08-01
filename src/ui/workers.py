@@ -152,12 +152,18 @@ class PatentscopeSearchAndFetchWorker(QThread):
         # 阶段1: 搜索摘要
         # ================================================================
         self.signals.log.emit("INFO", "=" * 40)
-        self.signals.log.emit("INFO", "阶段1: PATENTSCOPE 搜索摘要")
+        eng_name = ("Google Patents" if self.settings.search_source == "google"
+                    else "PATENTSCOPE (WIPO)")
+        self.signals.log.emit("INFO", "阶段1: 搜索摘要")
+        self.signals.log.emit("SUCCESS", f"检索引擎: {eng_name}")
         self.signals.progress.emit(5, "启动浏览器...")
 
         browser_mgr = BrowserManager(self.settings)
         context, page = await browser_mgr.launch_with_retry(max_retries=2)
-        self.signals.log.emit("SUCCESS", "浏览器就绪 — PATENTSCOPE 无需登录")
+        if self.settings.search_source == "google":
+            self.signals.log.emit("SUCCESS", "浏览器就绪 — Google Patents")
+        else:
+            self.signals.log.emit("SUCCESS", "浏览器就绪 — PATENTSCOPE 无需登录")
 
         human = HumanBehavior(self.settings)
         scraper = PatentscopeScraper(page, self.settings, human)
@@ -189,14 +195,21 @@ class PatentscopeSearchAndFetchWorker(QThread):
             self.signals.progress.emit(progress,
                 f"阶段1: 搜索 {idx+1}/{len(normal_queries)}")
 
-            # ── 带 403 / 网络错误 重试的搜索 ──
+            # ── 带 403 / 网络错误 重试的搜索（按引擎分发）──
             MAX_SEARCH_RETRIES = 3
             abstracts = []
             for attempt in range(1, MAX_SEARCH_RETRIES + 1):
                 try:
-                    abstracts = await scraper.search_abstracts(
-                        q_str, max_results=self.settings.patentscope_max_results,
-                        signals=self.signals)
+                    if self.settings.search_source == "google":
+                        from src.web_automation.google_patents import search_abstracts as gsearch
+                        abstracts = await gsearch(
+                            page, q_str,
+                            max_results=self.settings.patentscope_max_results,
+                            signals=self.signals)
+                    else:
+                        abstracts = await scraper.search_abstracts(
+                            q_str, max_results=self.settings.patentscope_max_results,
+                            signals=self.signals)
                     break  # 成功，跳出重试循环
                 except Exception as e:
                     err_msg = str(e)
@@ -311,9 +324,16 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 abstracts = []
                 for attempt in range(1, 4):
                     try:
-                        abstracts = await scraper.search_abstracts(
-                            fq_str, max_results=self.settings.patentscope_max_results,
-                            signals=self.signals)
+                        if self.settings.search_source == "google":
+                            from src.web_automation.google_patents import search_abstracts as gsearch
+                            abstracts = await gsearch(
+                                page, fq_str,
+                                max_results=self.settings.patentscope_max_results,
+                                signals=self.signals)
+                        else:
+                            abstracts = await scraper.search_abstracts(
+                                fq_str, max_results=self.settings.patentscope_max_results,
+                                signals=self.signals)
                         break
                     except Exception as e:
                         err_msg = str(e)
@@ -1461,8 +1481,11 @@ class MultiQueryTestWorker(QThread):
         # 阶段1: 逐条搜索摘要
         # ============================================================
         self.signals.log.emit("INFO", "=" * 50)
+        eng_name = "Google Patents" if self.settings.search_source == "google" else "PATENTSCOPE (WIPO)"
         self.signals.log.emit("INFO",
             f"批量检索测试: {len(self.queries)} 个检索式 × {self.max_results} 条/式")
+        self.signals.log.emit("SUCCESS",
+            f"检索引擎: {eng_name}")
         self.signals.progress.emit(5, "启动浏览器...")
 
         browser_mgr = BrowserManager(self.settings)
@@ -1497,8 +1520,14 @@ class MultiQueryTestWorker(QThread):
             error_msg = None
             for attempt in range(1, MAX_SEARCH_RETRIES + 1):
                 try:
-                    abstracts = await scraper.search_abstracts(
-                        q_str, max_results=self.max_results, signals=self.signals)
+                    if self.settings.search_source == "google":
+                        from src.web_automation.google_patents import search_abstracts as gsearch
+                        abstracts = await gsearch(
+                            page, q_str, max_results=self.max_results,
+                            signals=self.signals)
+                    else:
+                        abstracts = await scraper.search_abstracts(
+                            q_str, max_results=self.max_results, signals=self.signals)
                     break
                 except Exception as e:
                     err_msg = str(e)

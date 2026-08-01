@@ -246,14 +246,17 @@ class MainWindow(QMainWindow):
         """批量检索测试：搜索 → 去重 → 下载 → 报告（零 AI）"""
         if not queries:
             return
+        eng_name = ("Google Patents" if self.settings.search_source == "google"
+                    else "PATENTSCOPE (WIPO)")
         self.log_panel.append_log("INFO", "=" * 50)
         self.log_panel.append_log("INFO",
             f"批量检索测试: {len(queries)} 个检索式")
+        self.log_panel.append_log("SUCCESS", f"检索引擎: {eng_name}")
         for i, q in enumerate(queries, 1):
             self.log_panel.append_log("INFO", f"  [{i}] {q[:100]}")
         self.input_panel.set_running_state(True)
         self.status_label.setText(
-            f"批量测试 ({len(queries)} 检索式 × {max_results} 条)...")
+            f"批量测试 [{eng_name}] ({len(queries)} 检索式 × {max_results} 条)...")
         self._current_worker = MultiQueryTestWorker(
             queries=queries,
             settings=self.settings,

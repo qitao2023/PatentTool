@@ -121,8 +121,13 @@ async def run_multi_query(queries: list[str], settings: Settings,
         error_msg = None
         for attempt in range(1, MAX_SEARCH_RETRIES + 1):
             try:
-                abstracts = await scraper.search_abstracts(
-                    q_str, max_results=max_results, signals=signals)
+                if settings.search_source == "google":
+                    from src.web_automation.google_patents import search_abstracts as gsearch
+                    abstracts = await gsearch(
+                        page, q_str, max_results=max_results, signals=signals)
+                else:
+                    abstracts = await scraper.search_abstracts(
+                        q_str, max_results=max_results, signals=signals)
                 break
             except Exception as e:
                 err_msg = str(e)
@@ -244,6 +249,10 @@ async def run_multi_query(queries: list[str], settings: Settings,
                "with_abstract": 0, "with_ipc": 0,
                "total_claims_chars": 0, "total_desc_chars": 0}
     succeeded_patents = []
+    # 按下载源统计（体现 download_source 参数效果）
+    source_stats = {"google_patents": 0, "patentscope": 0, "unknown": 0}
+    SOURCE_LABEL = {"google_patents": "Google Patents",
+                    "patentscope": "PATENTSCOPE", "unknown": "未知"}
 
     for fpath in detail_files:
         try:
@@ -254,9 +263,13 @@ async def run_multi_query(queries: list[str], settings: Settings,
             continue
 
         status = data.get("fetch_status", "")
+        src = data.get("_source", "") or "patentscope"
+        if src not in source_stats:
+            src = "unknown"
         if status == "ok":
             if is_cached_patent_valid(data):
                 succeeded += 1
+                source_stats[src] += 1
                 pub = data.get("publication_number", fpath.stem)
                 if data.get("claims"):
                     quality["with_claims"] += 1
@@ -271,6 +284,7 @@ async def run_multi_query(queries: list[str], settings: Settings,
                 succeeded_patents.append({
                     "doc_id": data.get("doc_id", ""),
                     "publication_number": pub,
+                    "source": src,
                     "title": str(data.get("title", ""))[:80],
                 })
             else:
@@ -296,8 +310,12 @@ async def run_multi_query(queries: list[str], settings: Settings,
 
     avg_claims = quality["total_claims_chars"] // max(succeeded, 1)
     avg_desc = quality["total_desc_chars"] // max(succeeded, 1)
+    src_name = "google" if settings.search_source == "google" else "wipo"
 
     print(f"  ✅ 下载成功: {succeeded}  缓存: {cached}  失败: {failed}")
+    print(f"  检索引擎: {src_name} | 实际来源: "
+          f"Google={source_stats['google_patents']}  "
+          f"PATENTSCOPE={source_stats['patentscope']}")
     print(f"  数据质量: 有权利要求 {quality['with_claims']}/{succeeded}"
           f"  | 有说明书 {quality['with_description']}/{succeeded}")
     print(f"  平均权利要求: {avg_claims} 字 | 平均说明书: {avg_desc} 字")
@@ -305,11 +323,14 @@ async def run_multi_query(queries: list[str], settings: Settings,
     # JSON 报告
     report = {
         "timestamp": datetime.now().isoformat(),
+        "search_source": src_name,
         "per_query": per_query_stats,
         "total_before_dedup": total_before,
         "total_unique": total_unique,
         "download_stats": {"succeeded": succeeded, "cached": cached,
                            "failed": failed},
+        "source_stats": source_stats,
+        "succeeded_patents": succeeded_patents,
         "data_quality": {
             "with_claims": quality["with_claims"],
             "with_description": quality["with_description"],
@@ -349,6 +370,9 @@ async def run_multi_query(queries: list[str], settings: Settings,
     lines.append(f"  下载成功:     {succeeded} 篇")
     lines.append(f"  缓存命中:     {cached} 篇")
     lines.append(f"  下载失败:     {failed} 篇")
+    lines.append(f"  检索引擎:     {src_name}")
+    lines.append(f"  实际来源:     Google={source_stats['google_patents']}  "
+                 f"PATENTSCOPE={source_stats['patentscope']}")
     if total_unique > 0:
         lines.append(f"  成功率:       "
                      f"{(succeeded + cached) / total_unique * 100:.1f}%")
@@ -361,6 +385,15 @@ async def run_multi_query(queries: list[str], settings: Settings,
         lines.append(f"  有说明书:     {quality['with_description']}/{succeeded}")
         lines.append(f"  有摘要:       {quality['with_abstract']}/{succeeded}")
         lines.append(f"  有IPC分类:    {quality['with_ipc']}/{succeeded}")
+    if succeeded_patents:
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("  各文件下载来源")
+        lines.append("-" * 70)
+        for sp in succeeded_patents:
+            lines.append(
+                f"  [{SOURCE_LABEL.get(sp.get('source','unknown'),'?')}] "
+                f"{sp.get('publication_number','?')}  {sp.get('title','')[:50]}")
     lines.append("")
     lines.append("=" * 70)
     lines.append(f"  输出目录: {out}")
@@ -399,6 +432,7 @@ def main():
     output_dir = None
     max_results = 200
     concurrency = 1
+    engine = None
     i = 2
     while i < len(sys.argv):
         if sys.argv[i] == "--output-dir" and i + 1 < len(sys.argv):
@@ -410,8 +444,18 @@ def main():
         elif sys.argv[i] == "--concurrency" and i + 1 < len(sys.argv):
             concurrency = int(sys.argv[i + 1])
             i += 2
+        elif sys.argv[i] == "--engine" and i + 1 < len(sys.argv):
+            engine = sys.argv[i + 1]
+            i += 2
         else:
             i += 1
+
+    settings = Settings()
+    if engine:
+        if engine not in ("wipo", "google"):
+            print(f"❌ 未知引擎: {engine}（可选 wipo|google）")
+            sys.exit(1)
+        settings._raw.setdefault("search", {})["search_source"] = engine
 
     # 加载查询
     data = json.loads(queries_file.read_text(encoding="utf-8"))
@@ -435,9 +479,9 @@ def main():
     print(f"测试名称: {test_name}")
     print(f"每式上限: {max_results}")
     print(f"并发: {concurrency}")
+    print(f"引擎: {engine or settings.search_source}")
     print()
 
-    settings = Settings()
     asyncio.run(run_multi_query(
         queries, settings,
         test_name=test_name,

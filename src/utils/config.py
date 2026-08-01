@@ -251,6 +251,24 @@ class Settings:
     def patentscope_rate_limit(self) -> int:
         return self._raw.get("patentscope", {}).get("rate_limit_calls_per_hour", 1000)
 
+    # --- 引擎选择 ---
+    @property
+    def search_source(self) -> str:
+        """全链路引擎: wipo | google
+
+        wipo   → 搜索+下载全走 PATENTSCOPE 浏览器（原行为）
+        google → 搜索+下载全走 Google Patents（免浏览器）
+        两套独立体系，不混用。
+        """
+        v = str(self._raw.get("search", {}).get("search_source", "google"))
+        if v not in ("wipo", "google"):
+            return "google"
+        return v
+
+    @property
+    def google_patents_timeout(self) -> int:
+        return int(self._raw.get("google_patents", {}).get("timeout", 20))
+
     # --- 人类行为 ---
     @property
     def human_typing_min_ms(self) -> int:

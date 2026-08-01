@@ -2,6 +2,7 @@
 PATENTSCOPE 集成爬虫 — 两阶段检索。
 """
 import asyncio
+import contextvars
 import re
 import random
 from typing import Optional
@@ -9,6 +10,14 @@ from typing import Optional
 from src.utils.config import Settings
 from src.utils.text_cleaner import clean_patent_html_text
 from src.web_automation.human_behavior import HumanBehavior
+from src.web_automation.google_patents import fetch_patent_text
+
+
+# 记录最近一次详情提取失败的具体原因，供外层日志使用。
+# 用 ContextVar 而非实例属性：fetch_details_parallel 会并发跑多个 _fetch_one，
+# 每个 asyncio task 有独立的 context，不会互相污染。
+_EXTRACT_FAIL_REASON = contextvars.ContextVar(
+    "patent_extract_fail_reason", default="")
 
 
 class PatentscopeScraper:
@@ -238,6 +247,7 @@ class PatentscopeScraper:
         自动去掉末尾种类码（A/B/U等），提高 PATENTSCOPE 搜索命中率。
         """
         import re as _re
+        _EXTRACT_FAIL_REASON.set("")
         # 去空格、去末尾种类码
         cleaned = _re.sub(r'\s+', '', search_term.strip())
         cleaned = _re.sub(r'[ABU]\d?$', '', cleaned)
@@ -248,6 +258,13 @@ class PatentscopeScraper:
                 # 导航到搜索页（用 JS 跳转代替 page.goto，更像真实用户行为）
                 await self.page.evaluate(
                     f'window.location.href = "{self.settings.patentscope_search_url}"')
+                # 等导航稳定：JS 跳转后立即 evaluate 会因页面切换报
+                # "Execution context was destroyed"，先等加载完成
+                try:
+                    await self.page.wait_for_load_state("load", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
                 # ⚠️ 先快速检测是否403，不等输入框超时
                 for _ in range(5):  # 最多等 ~10s
                     await asyncio.sleep(2)
@@ -279,19 +296,26 @@ class PatentscopeScraper:
                         try:
                             await btn.click(no_wait_after=True, timeout=15000)
                         except Exception:
-                            await self.page.evaluate(
-                                '() => { var b = document.querySelector('
-                                '"button[id*=\'fpSearch\']"); if(b) b.click(); }')
+                            try:
+                                await self.page.evaluate(
+                                    '() => { var b = document.querySelector('
+                                    '"button[id*=\'fpSearch\']"); if(b) b.click(); }')
+                            except Exception:
+                                pass
                         # 快速检查无结果，避免白等 20s
                         for _ in range(3):
                             await asyncio.sleep(1.0)
-                            bt = await self.page.evaluate(
-                                "() => document.body?.innerText"
-                                "?.substring(0, 2000) || ''")
+                            try:
+                                bt = await self.page.evaluate(
+                                    "() => document.body?.innerText"
+                                    "?.substring(0, 2000) || ''")
+                            except Exception:
+                                continue  # 页面正在跳转，执行上下文销毁，跳过本轮
                             if any(m in bt for m in (
                                 "没有找到符合您检索的结果",
                                 "未找到结果", "No results found",
                             )):
+                                _EXTRACT_FAIL_REASON.set("搜索未命中(无结果)")
                                 return None
                         try:
                             await self.page.wait_for_url(
@@ -315,9 +339,12 @@ class PatentscopeScraper:
                     try:
                         await link.click(timeout=15000)
                     except Exception:
-                        await self.page.evaluate(
-                            '() => { var a = document.querySelector('
-                            '"a[href*=\'detail.jsf\']"); if(a) a.click(); }')
+                        try:
+                            await self.page.evaluate(
+                                '() => { var a = document.querySelector('
+                                '"a[href*=\'detail.jsf\']"); if(a) a.click(); }')
+                        except Exception:
+                            pass
                     await self.page.wait_for_url(
                         "**/detail.jsf*", timeout=15000)
                     await asyncio.sleep(1)
@@ -328,10 +355,12 @@ class PatentscopeScraper:
                             f"    搜索 {term} → 点击第一条结果")
                     return await self._extract_detail_page(doc_id)
 
+                _EXTRACT_FAIL_REASON.set("搜索结果页未找到详情链接")
                 return None
             except Exception as e:
                 if signals:
                     signals.log.emit("WARN", f"    搜索 {term} 失败: {e}")
+                _EXTRACT_FAIL_REASON.set(f"搜索异常: {e}")
                 return None
 
         # 先用去掉种类码的号搜，不行再用原始号
@@ -468,34 +497,107 @@ class PatentscopeScraper:
                     batch_count = 0
                     await asyncio.sleep(2)
 
-                # 遇到403：切浏览器 + 冷却
+                # 遇到403：切浏览器 + 换代理节点(换IP) + 冷却
                 if consecutive_403 >= 1:
                     from src.web_automation.browser_manager import BrowserManager
                     new_browser = BrowserManager.switch_channel(on_403=True)
+                    # 换 Clash 代理节点 = 换出口 IP，能摆脱按 IP 的限流。
+                    # switch_channel 只换浏览器（换 session/指纹），不换 IP。
+                    ip_switched = False
+                    try:
+                        ip_switched = await BrowserManager.rotate_proxy(self.settings)
+                    except Exception:
+                        pass
                     await _restart_browser()
                     cool = random.uniform(5, 15)
                     if signals:
                         signals.log.emit("WARN",
-                            f"    遇到 403，切换至 {new_browser} + 冷却 {cool:.0f}s...")
+                            f"    遇到 403，切换至 {new_browser}"
+                            f"{' + 换IP节点' if ip_switched else ''}"
+                            f" + 冷却 {cool:.0f}s...")
                     await asyncio.sleep(cool)
                     consecutive_403 = 0
                     batch_count = 0
 
+                # ── 引擎分发：wipo 全链路浏览器 / google 全链路 Google ──
+                #   wipo   → 全部走 PATENTSCOPE 浏览器（原行为，含 CN 同族）
+                #   google → 全部走 Google（免浏览器）；无全文即失败，不降级
+                mode = ("google" if self.settings.search_source == "google"
+                        else "wipo")
+
                 # 随机延迟（逐批递增）
-                delay = 5.0 + random.uniform(0, 3.0)
-                if batch_count > 5:
-                    delay = 8.0 + random.uniform(0, 5.0)
+                if mode == "google":
+                    # Google 免登录，无需长延迟防 403；保留 ~1s 最小间隔防反爬
+                    delay = 0.5 + random.uniform(0, 1.0)
+                else:
+                    delay = 5.0 + random.uniform(0, 3.0)
+                    if batch_count > 5:
+                        delay = 8.0 + random.uniform(0, 5.0)
                 await asyncio.sleep(delay)
+                meta = meta_map.get(doc_id, {})
+                pub = meta.get("publication_number") or doc_id or ""
+                # 纯数字号缺国别前缀（PATENTSCOPE 搜索页常见，如 US 公布号
+                # 显示为 "20210343831"）→ 用 doc_id 的国别前缀补全为 Google
+                # 可解析的公开号（如 "US20210343831"）。
+                if re.match(r'^\d', pub) and re.match(r'^[A-Z]{2}', doc_id or ""):
+                    pub = doc_id[:2] + pub
+                if mode == "google":
+                    gp_detail = None
+                    try:
+                        gp_detail = await asyncio.to_thread(
+                            fetch_patent_text, pub,
+                            self.settings.web_proxy,
+                            self.settings.google_patents_timeout,
+                            meta)
+                    except Exception:
+                        gp_detail = None
+                    if gp_detail:
+                        file_key = pub
+                        safe = _safe_filename(file_key)
+                        fpath = out / f"{safe}.json"
+                        fpath.write_text(
+                            json_module.dumps(gp_detail, indent=2,
+                                              ensure_ascii=False, default=str),
+                            encoding="utf-8")
+                        success_count += 1
+                        if signals:
+                            idx = _orig_idx.get(
+                                doc_id, success_count + fail_count)
+                            signals.log.emit("INFO",
+                                f"    ✓G [{idx}/{len(remaining)}] {pub}")
+                        return
+                    # google 模式：无全文直接记为失败，不降级浏览器
+                    fail_count += 1
+                    failed_ids.append(doc_id)
+                    safe = _safe_filename(doc_id)
+                    fpath = out / f"{safe}.json"
+                    fpath.write_text(
+                        json_module.dumps({
+                            "doc_id": doc_id,
+                            "fetch_status": "failed",
+                            "url": (f"https://patents.google.com/patent/"
+                                    f"{pub}/zh"),
+                            "error": "Google Patents 无全文",
+                        }, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+                    if signals:
+                        idx = _orig_idx.get(
+                            doc_id, success_count + fail_count)
+                        signals.log.emit("WARN",
+                            f"    ✗G [{idx}/{len(remaining)}] "
+                            f"{pub}: Google 无全文")
+                    return
 
                 pg = await current_context.new_page()
                 is_403 = False
+                detail_url = ""
                 try:
-                    meta = meta_map.get(doc_id, {})
                     stored_url = meta.get("detail_url")
                     detail_url = stored_url or (
                         f"https://patentscope2.wipo.int/search/zh/detail.jsf"
                         f"?docId={doc_id}"
                     )
+                    # 直接进详情链接（已验证：无需先建 session，detail.jsf 能正常渲染）
                     await pg.goto(detail_url, timeout=60000,
                                   wait_until="commit")
                     # ⚠️ 第一时间检测 403
@@ -535,20 +637,34 @@ class PatentscopeScraper:
 
                     detail = await self._extract_detail_page(
                         actual_doc_id, page=pg)
+                    direct_reason = ""
+                    if not detail:
+                        direct_reason = (_EXTRACT_FAIL_REASON.get()
+                                         or "未知原因")
 
                     # 记录专利族替换信息
                     if detail and cn_family_note:
                         detail["_cn_family_original"] = doc_id
                         detail["_cn_family_replaced_by"] = cn_family_note
 
-                    # 有链接的直接用，没链接的才搜——绝不多搜一次
-                    if not detail and not stored_url:
+                    # 直连提取失败 → 搜索兜底（即使有 stored_url 也搜一次：
+                    # 无 session 直连 detail.jsf 经常渲染失败，搜索能重建 session 并命中）
+                    search_reason = ""
+                    if not detail:
                         self.page = pg
                         detail = await self.fetch_detail_via_search(
                             actual_doc_id, signals=signals)
+                        if not detail:
+                            search_reason = (_EXTRACT_FAIL_REASON.get()
+                                             or "未知原因")
 
                     if not detail:
-                        raise RuntimeError("内容无效（缺摘要/权利要求/说明书）")
+                        if search_reason:
+                            reason = (f"直连失败: {direct_reason}; "
+                                      f"搜索失败: {search_reason}")
+                        else:
+                            reason = direct_reason
+                        raise RuntimeError(f"内容无效: {reason}")
                     consecutive_403 = 0
                     batch_count += 1
                     detail["fetch_status"] = "ok"
@@ -594,17 +710,19 @@ class PatentscopeScraper:
                         json_module.dumps({
                             "doc_id": doc_id,
                             "fetch_status": "failed",
+                            "url": detail_url or "",
                             "error": str(e)[:200],
                         }, indent=2, ensure_ascii=False),
                         encoding="utf-8")
                     if signals:
                         meta = meta_map.get(doc_id, {})
                         label = meta.get("publication_number", doc_id)
-                        reason = "403" if is_403 else "内容无效"
+                        reason = str(e)[:120]
                         idx = _orig_idx.get(doc_id, success_count + fail_count)
+                        url = detail_url or f"docId={doc_id}"
                         signals.log.emit("WARN",
                             f"    ✗ [{idx}/{len(remaining)}] "
-                            f"{label}: {reason}")
+                            f"{label}: {reason} | {url}")
                 finally:
                     await pg.close()
                     # 请求间微小延迟，避免触发限流
@@ -1164,6 +1282,8 @@ class PatentscopeScraper:
 
     async def _extract_detail_page(self, doc_id: str, page=None) -> dict | None:
         pg = page or self.page
+        # 每次调用先清空上次失败原因，失败时再写入具体原因
+        _EXTRACT_FAIL_REASON.set("")
 
         # 快速校验：不在详情页/明显错误 → 直接放弃
         cur_url = await pg.evaluate("() => window.location.href")
@@ -1174,8 +1294,11 @@ class PatentscopeScraper:
             "内部错误", "页面未找到", "Page Not Found",
         ]
         if any(m in body_check for m in _INVALID_MARKERS):
+            hit = next(m for m in _INVALID_MARKERS if m in body_check)
+            _EXTRACT_FAIL_REASON.set(f"页面为错误页(命中'{hit}')")
             return None
         if "detail.jsf" not in cur_url:
+            _EXTRACT_FAIL_REASON.set(f"未进入详情页(当前URL: {cur_url[:80]})")
             return None
 
         result = {
@@ -1263,13 +1386,19 @@ class PatentscopeScraper:
 
         # WO 等非 CN 专利没有独立 Claims/Description 标签，需从「全文」tab 提取
         if not claims_text or not desc_text:
-            fulltext = await self._click_and_extract_tab("FULLTEXT", page=pg)
-            if fulltext:
-                fulltext = clean_patent_html_text(fulltext)
+            fulltext_raw = await self._click_and_extract_tab("FULLTEXT", page=pg)
+            if fulltext_raw:
+                # ⚠️ 必须用原始文本提取：clean_patent_html_text 会把换行压成
+                # 单个空格，而 _extract_wo_claims 依赖换行锚定 claims 起点。
+                # 提取成功后再单独 clean 成紧凑版给 AI 消费。
                 if not claims_text:
-                    claims_text = _extract_wo_claims(fulltext)
+                    claims_text = _extract_wo_claims(fulltext_raw)
                 if not desc_text:
-                    desc_text = _extract_wo_description(fulltext)
+                    desc_text = _extract_wo_description(fulltext_raw)
+                if claims_text:
+                    claims_text = clean_patent_html_text(claims_text)
+                if desc_text:
+                    desc_text = clean_patent_html_text(desc_text)
 
         if claims_text:
             result["claims"] = claims_text[:10000]
@@ -1278,6 +1407,11 @@ class PatentscopeScraper:
 
         # 校验：权利要求和说明书都非空才算有效，摘要可缺
         if not (result["claims"] and result["description"]):
+            missing = [label for field, label in (
+                ("claims", "权利要求"), ("description", "说明书"))
+                if not result[field]]
+            _EXTRACT_FAIL_REASON.set(
+                f"{'/'.join(missing)}提取为空(tab未加载或无全文)")
             return None
 
         # 纯摘要 — 摘要/Abstract 双模式，中文优先
@@ -1561,9 +1695,20 @@ def _extract_wo_claims(fulltext: str) -> str:
 
     支持多种格式：
     - CN: [权利要求 1] ... / 权利要求书
-    - WO: [Claim 1] ... / Claims
+    - WO/EN: [Claim 1] ... / Claims
+    - JP: [請求項1] ... / 請求の範囲
+    - KR: [청구항 1] ... / 청구범위
     - US: Claims\\n1. ... (无方括号)
     """
+    # 0. 方括号/方角括号标记最可靠（不限语言）：直接找第一个
+    #    [Claim N]/[請求項 N]/[权利要求 N]/[청구항 N]（KR 常用【청구항 N】）
+    #    并取其到结尾。WO/JP 的 claims 目录只是纯数字，不会误命中。
+    m = re.search(
+        r'[\[【](?:Claim|請求項|权利要求|청구항)\s*\d+\s*[\]】]',
+        fulltext, re.IGNORECASE)
+    if m:
+        return fulltext[m.start():].strip()
+
     # 1. 中文格式：权利要求书 → [权利要求 N]
     idx = fulltext.rfind('权利要求书')
     if idx < 0:
@@ -1578,25 +1723,20 @@ def _extract_wo_claims(fulltext: str) -> str:
         if m:
             return m.group(0).strip()
 
-    # 2. 英文格式：Claims → [Claim N] 或直接编号
+    # 2. 编号格式（美/德/法）：Claims/Patentansprüche/Revendications
+    #    标题后紧跟 [Claim 1] 或编号 "1." 等（无方括号的 US/DE/FR 格式）
     for pattern in [
-        r'Claims?\s*\n\s*\[Claim\s*\d+\]',   # [Claim 1]
-        r'Claims?\s*\n\s*\d+\.\s',             # Claims\n1. (US format)
+        r'(?:Claims?|Patentansprüche|Revendications?)'
+        r'\s*\n\s*\[Claim\s*\d+\]',
+        r'(?:Claims?|Patentansprüche|Revendications?)'
+        r'\s*\n\s*\d+\s*[\.、]\s*\S',
     ]:
         m = re.search(pattern, fulltext, re.IGNORECASE)
         if m:
-            idx = m.start()
-            tail = fulltext[idx:]
-            # 先试方括号格式
+            tail = fulltext[m.start():]
             m2 = re.search(r'\[Claim\s*\d+\][\s\S]*', tail, re.IGNORECASE)
             if m2:
                 return m2.group(0).strip()
-            # 无方括号：Claims 之后到 Description 或末尾
-            m2 = re.search(
-                r'(Claims?\s*\n[\s\S]*?)(?=\n(?:Description|DESCRIPTION|说明书)\b|\Z)',
-                tail, re.IGNORECASE)
-            if m2:
-                return m2.group(1).strip()
             return tail.strip()
     return ""
 
@@ -1604,11 +1744,53 @@ def _extract_wo_claims(fulltext: str) -> str:
 def _extract_wo_description(fulltext: str) -> str:
     """从 WO 全文文本中提取说明书正文。
 
-    「技术领域」只出现在正文区，用其定位最可靠。
+    FULLTEXT 面板 = 书目 → 目录 → 正文 → 权利要求 → 摘要 → 附图。
+    「技术领域」等章节标题在目录里也会出现一次，因此取最后一次出现的
+    位置作为正文起点，避开目录。
     """
-    m = re.search(r'(技术领域[\s\S]*?)(?:权利要求书\s*\[权利要求|$)', fulltext)
-    if not m:
-        m = re.search(r'(Technical\s*Field[\s\S]*)$', fulltext, re.IGNORECASE)
-    if not m:
-        m = re.search(r'(发明内容[\s\S]*)$', fulltext)
-    return m.group(1).strip() if m else ""
+    # 正文起点：最后一次出现的章节标题（多语言）
+    starts = []
+    for pat in (r'技术领域', r'技術分野', r'Technical\s*Field',
+                r'Field of the (?:present\s+)?[Ii]nvention',
+                r'Technisches?\s+Gebiet', r'Domaine\s+de\s+la\s+technique',
+                r'기술분야'):
+        for m in re.finditer(pat, fulltext, re.IGNORECASE):
+            starts.append(m.start())
+    if not starts:
+        # 无章节标题 → 用第一个正文段落编号 [NNNN] 起头（某些格式）
+        m = re.search(r'\[\s*\d{3,4}\s*\]', fulltext)
+        if m:
+            starts = [m.start()]
+    if not starts:
+        # 结构性兜底：取 claims 起点之前的文本（跳过开头导航/书目垃圾）
+        return _desc_before_claims(fulltext)
+    start = max(starts)
+
+    # 终点：start 之后第一个 权利要求书/請求の範囲/Claims/청구범위 标题
+    end = len(fulltext)
+    for pat in (r'权利要求书', r'請求の範囲', r'Claims?', r'청구범위'):
+        for m in re.finditer(pat, fulltext, re.IGNORECASE):
+            if m.start() > start and m.start() < end:
+                end = m.start()
+    return fulltext[start:end].strip()
+
+
+def _desc_before_claims(fulltext: str) -> str:
+    """无章节标题/段落编号时，从 claims 起点之前的文本取说明书正文。
+
+    跳过开头的 WIPO 导航/书目垃圾（最后一个 Document/明細書 标记之后）。
+    """
+    claims_m = re.search(
+        r'[\[【](?:Claim|請求項|权利要求|청구항)\s*\d+\s*[\]】]',
+        fulltext, re.IGNORECASE)
+    if not claims_m:
+        return ""
+    head = fulltext[:claims_m.start()]
+    # 去掉头部导航垃圾：取最后一个文档起始标记之后
+    idx = -1
+    for mark in (r'Document', r'明\s*細\s*書', r'明細書', r'Description'):
+        for m in re.finditer(mark, head):
+            idx = max(idx, m.end())
+    if idx > 0:
+        head = head[idx:]
+    return head.strip()

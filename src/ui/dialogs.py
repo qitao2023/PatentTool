@@ -159,6 +159,15 @@ class SettingsDialog(QDialog):
             "自动在专利族标签页中查找 CN 开头专利并替换，同时记录替换日志")
         search_form.addRow(self.prefer_cn_family_cb)
 
+        self.search_source_combo = QComboBox()
+        self.search_source_combo.addItem("PATENTSCOPE (WIPO)", "wipo")
+        self.search_source_combo.addItem("Google Patents", "google")
+        self.search_source_combo.setToolTip(
+            "全链路引擎（搜索+下载一体，不混用）:\n"
+            "  PATENTSCOPE → 搜索/下载全走 WIPO（原行为）\n"
+            "  Google      → 搜索/下载全走 Google Patents（免浏览器，单检索式上限100条）")
+        search_form.addRow("检索引擎:", self.search_source_combo)
+
         params_layout.addWidget(search_group)
         params_layout.addStretch(1)
         self.tab_widget.addTab(tab_params, "⚙ 检索参数")
@@ -219,6 +228,11 @@ class SettingsDialog(QDialog):
             self.settings.search_force_refresh)
         self.prefer_cn_family_cb.setChecked(
             self.settings.search_prefer_cn_family)
+        # 检索引擎
+        src = self.settings.search_source
+        idx = self.search_source_combo.findData(src)
+        if idx >= 0:
+            self.search_source_combo.setCurrentIndex(idx)
         # 流程断点
         stop = self.settings.search_stop_after
         idx = self.stop_after_combo.findData(stop)
@@ -373,6 +387,7 @@ class SettingsDialog(QDialog):
             "force_refresh": self.force_refresh_cb.isChecked(),
             "stop_after": self.stop_after_combo.currentData(),
             "prefer_cn_family": self.prefer_cn_family_cb.isChecked(),
+            "search_source": self.search_source_combo.currentData(),
         }
 
         # 写检索参数到 settings.yaml
@@ -386,6 +401,7 @@ class SettingsDialog(QDialog):
                     ("force_refresh", params["force_refresh"], False),
                     ("stop_after", params["stop_after"], True),
                     ("prefer_cn_family", params["prefer_cn_family"], False),
+                    ("search_source", params["search_source"], True),
                 ]:
                     if is_str:
                         val_str = f'"{value}"'
@@ -723,9 +739,10 @@ class TestDialog(QDialog):
         param_row.addSpacing(20)
         param_row.addWidget(QLabel("下载并发:"))
         self.batch_concurrency_spin = QSpinBox()
-        self.batch_concurrency_spin.setRange(1, 5)
+        self.batch_concurrency_spin.setRange(1, 15)
         self.batch_concurrency_spin.setValue(1)
-        self.batch_concurrency_spin.setToolTip("并行下载数（1=最稳定，3=较快）")
+        self.batch_concurrency_spin.setToolTip(
+            "并行下载数\nGoogle引擎: 可到 10-15（快）\nWIPO引擎: 建议 1-3（高并发易403）")
         param_row.addWidget(self.batch_concurrency_spin)
         param_row.addStretch(1)
         batch_layout.addLayout(param_row)
@@ -982,7 +999,12 @@ class TestDialog(QDialog):
         self.test_count_spin.setValue(self._settings.test_default_count)
         # 批量检索式测试
         self.batch_count_spin.setValue(self._settings.test_batch_default_count)
-        self.batch_concurrency_spin.setValue(self._settings.test_batch_default_concurrency)
+        # 并发默认：Google 引擎可高并发（10），WIPO 保守（配置值，通常 1）
+        if self._settings.search_source == "google":
+            self.batch_concurrency_spin.setValue(10)
+        else:
+            self.batch_concurrency_spin.setValue(
+                self._settings.test_batch_default_concurrency)
         # 批量检索式列表
         default_queries = self._settings.test_batch_default_queries
         if default_queries:

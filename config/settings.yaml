@@ -11,12 +11,12 @@ pdf:
 # AI 引擎配置
 ai:
   provider: "deepseek"                      # 默认提供商 "deepseek" 或 "kimi"
-  deepseek_model: "deepseek-v4-pro"       # 默认模型
+  deepseek_model: "deepseek-v4-flash"       # 默认模型
   kimi_model: "kimi-k3"                     # kimi-k3 / kimi-k2.6
   temperature: 0.4
   # 检索式生成可单独用不同提供商和模型
   query_provider: "deepseek"                    # 检索式专用提供商（不设则用 provider）
-  query_model: "deepseek-v4-pro"                    # 检索式模型
+  query_model: "deepseek-v4-flash"                    # 检索式模型
   # 其他阶段模型
   screen_model: "deepseek-v4-flash"         # 筛选/评分（推荐快速模型）
   analysis_model: "deepseek-v4-flash"       # 对比分析
@@ -46,6 +46,7 @@ search:
   force_refresh: false          # 强制重新获取本申请
   stop_after: "download"            # 流程断点: abstracts | screen | download | score | full
   prefer_cn_family: true        # 优先使用中国同族专利：下载全文时若遇非CN专利，自动查专利族中的CN专利替换
+  search_source: "google"            # 全链路引擎: wipo(搜索+下载走PATENTSCOPE) | google(搜索+下载走Google Patents)
 
 # PATENTSCOPE 配置
 patentscope:
@@ -92,6 +93,10 @@ human:
   typo_probability: 0.02
   mouse_move_steps: 10
 
+# Google Patents（search_source=google 时生效，免浏览器）
+google_patents:
+  timeout: 20
+
 # 去重
 dedup:
   title_similarity_threshold: 0.90
@@ -117,7 +122,7 @@ test:
   default_count: 10
   batch_default_count: 200
   batch_default_concurrency: 1
-  batch_default_queries: [("H01L 29/51" OR "H01L 21/28") AND ("high-k" OR "high dielectric" OR 高誘電率) AND (gradient OR graded OR 勾配), ("high-k" OR "high dielectric") AND (oxygen AND (diffusion OR 拡散)) AND (gate OR ゲート) AND (interface OR interfacial), (nanosheet OR GAA OR "gate-all-around") AND (gate AND dielectric) AND ("high-k" OR 高誘電率), (nanosheet OR GAA) AND (gate dielectric) AND (deposition OR CVD OR ALD OR 堆積) AND ("high-k") AND (gradient OR graded)]
+  batch_default_queries: ['"H01L-29" AND ("high-k" OR "高誘電率") AND (gradient OR "composition gradient" OR "傾斜組成")', ("high-k" OR "高誘電率") AND (gradient OR "傾斜") AND ("interface trap" OR "界面欠陥" OR "界面準位"), ("nanosheet" OR "GAA" OR "nanowire" OR "ナノシート" OR "ゲートオールアラウンド") AND ("gate dielectric" OR "ゲート絶縁膜" OR "high-k") AND (gradient OR "傾斜組成"), ("H01L-29/51" OR "H01L-29/423") AND ("high-k" OR "高誘電率"), ("high-k" OR "高誘電率") AND (gradient OR "composition gradient" OR "傾斜組成"), ("GAA" OR "gate-all-around" OR "nanosheet") AND ("high-k" OR "高誘電率")]
 
 # 输出
 output:
