@@ -1001,7 +1001,7 @@ class TestDialog(QDialog):
         self.batch_count_spin.setValue(self._settings.test_batch_default_count)
         # 并发默认：Google 引擎可高并发（15），WIPO 保守（配置值，通常 1）
         if self._settings.search_source == "google":
-            self.batch_concurrency_spin.setValue(15)
+            self.batch_concurrency_spin.setValue(20)
         else:
             self.batch_concurrency_spin.setValue(
                 self._settings.test_batch_default_concurrency)

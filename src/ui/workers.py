@@ -639,8 +639,10 @@ class PatentscopeSearchAndFetchWorker(QThread):
         human2 = HumanBehavior(self.settings)
         scraper2 = PatentscopeScraper(page2, self.settings, human2)
 
+        # 下载并发：google 引擎高并发（20），wipo 保守（1，防403）
+        dl_conc = (20 if self.settings.search_source == "google" else 1)
         await scraper2.fetch_details_parallel(
-            to_fetch, str(details_dir), concurrency=1, signals=self.signals)
+            to_fetch, str(details_dir), concurrency=dl_conc, signals=self.signals)
 
         await browser_mgr2.close()
 
