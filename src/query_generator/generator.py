@@ -2,6 +2,7 @@
 AI检索式生成模块 - 调用AI API(DeepSeek/Kimi)生成PATENTSCOPE高级检索式
 """
 import json
+import time
 from typing import Optional
 
 from src.utils.config import Settings
@@ -25,23 +26,28 @@ class QueryGenerator:
 
     def generate(self, patent: PatentDocument,
                  max_queries: int = 10) -> list[dict]:
-        """生成检索式列表"""
+        """生成检索式列表，带重试（deepseek 偶发返回 null/格式错误）。"""
         client = self._get_client()
-
         system_prompt = build_system_prompt(self.settings)
         user_prompt = build_user_prompt(patent, max_queries, self.settings)
 
-        content = client.chat(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_tokens=self.settings.query_max_tokens,
-            model=self.settings.ai_query_model,
-            json_mode=True,
-        )
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                content = client.chat(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=self.settings.query_max_tokens,
+                    model=self.settings.ai_query_model,
+                    json_mode=True,
+                )
+                # 解析JSON响应
+                return self._parse_response(content, max_queries)
+            except Exception as e:
+                last_err = e
+                time.sleep(2 * (attempt + 1))  # 退避：2s, 4s
 
-        # 解析JSON响应
-        queries = self._parse_response(content, max_queries)
-        return queries
+        raise ValueError(f"检索式生成重试3次仍失败: {last_err}")
 
     def _parse_response(self, content: str, max_queries: int) -> list[dict]:
         """解析AI返回的JSON，失败时尝试修复截断"""
