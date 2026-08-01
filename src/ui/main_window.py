@@ -21,6 +21,7 @@ from src.ui.workers import (
     AnalysisWorker, OAWriterWorker,
     PatentscopeTestWorker, PatentscopeAbstractTestWorker,
     PatentscopePageSizeTestWorker, PatentLookupWorker,
+    MultiQueryTestWorker,
 )
 from src.utils.config import Settings
 from src.utils.signals import WorkerSignals
@@ -151,11 +152,12 @@ class MainWindow(QMainWindow):
     def _on_open_test(self):
         """打开测试工具对话框"""
         from src.ui.dialogs import TestDialog
-        dlg = TestDialog(self)
+        dlg = TestDialog(self, settings=self.settings)
         dlg.test_abstract.connect(self._on_test_abstract)
         dlg.test_detail.connect(self._on_test_detail)
         dlg.test_pagesize.connect(self._on_test_pagesize)
         dlg.lookup_patent.connect(self._on_lookup_patent)
+        dlg.batch_test.connect(self._on_batch_test)
         dlg.exec()
 
     def _on_test_abstract(self, query: str, count: int):
@@ -237,6 +239,35 @@ class MainWindow(QMainWindow):
         self.report_panel.show_patent_detail(patent)
         self.input_panel.set_running_state(False)
         self.status_label.setText("查询完成")
+
+    @Slot(list, str, int, int)
+    def _on_batch_test(self, queries: list[str], test_name: str,
+                       max_results: int, concurrency: int):
+        """批量检索测试：搜索 → 去重 → 下载 → 报告（零 AI）"""
+        if not queries:
+            return
+        self.log_panel.append_log("INFO", "=" * 50)
+        self.log_panel.append_log("INFO",
+            f"批量检索测试: {len(queries)} 个检索式")
+        for i, q in enumerate(queries, 1):
+            self.log_panel.append_log("INFO", f"  [{i}] {q[:100]}")
+        self.input_panel.set_running_state(True)
+        self.status_label.setText(
+            f"批量测试 ({len(queries)} 检索式 × {max_results} 条)...")
+        self._current_worker = MultiQueryTestWorker(
+            queries=queries,
+            settings=self.settings,
+            test_name=test_name,
+            max_results=max_results,
+            concurrency=concurrency,
+        )
+        w = self._current_worker
+        w.signals.progress.connect(self.log_panel.update_progress)
+        w.signals.log.connect(self.log_panel.append_log)
+        w.signals.all_searches_done.connect(self._on_test_done)
+        w.signals.error.connect(self._handle_error)
+        w.signals.finished.connect(self._on_worker_finished)
+        w.start()
 
     def _on_test_done(self, results):
         """测试完成"""

@@ -307,6 +307,95 @@ class Settings:
     def session_profile_dir(self) -> str:
         return self._raw.get("session", {}).get("profile_dir", "profiles/patentscope_browser")
 
+    # --- 测试工具默认值 ---
+    @property
+    def test_default_query(self) -> str:
+        """测试工具 - 默认检索式"""
+        return self._raw.get("test", {}).get("default_query", "掉电")
+
+    @property
+    def test_default_count(self) -> int:
+        """测试工具 - 默认数量上限"""
+        return self._raw.get("test", {}).get("default_count", 10)
+
+    @property
+    def test_batch_default_count(self) -> int:
+        """批量测试 - 默认每式结果上限"""
+        return self._raw.get("test", {}).get("batch_default_count", 200)
+
+    @property
+    def test_batch_default_concurrency(self) -> int:
+        """批量测试 - 默认下载并发数"""
+        return self._raw.get("test", {}).get("batch_default_concurrency", 1)
+
+    @property
+    def test_batch_default_queries(self) -> list[str]:
+        """批量测试 - 默认检索式列表"""
+        return self._raw.get("test", {}).get("batch_default_queries", [])
+
+    def save_test_defaults(self, query: str, count: int,
+                           batch_count: int, batch_concurrency: int,
+                           batch_queries: list[str]):
+        """保存测试工具的默认值到 settings.yaml"""
+        yaml_path = self.config_dir / "settings.yaml"
+        if not yaml_path.exists():
+            return
+        import re
+        import yaml as _yaml
+        content = yaml_path.read_text(encoding="utf-8")
+        # 更新各字段
+        content = self._yaml_set_str(content, "default_query", query, section="test")
+        content = self._yaml_set_int(content, "default_count", count, section="test")
+        content = self._yaml_set_int(content, "batch_default_count", batch_count, section="test")
+        content = self._yaml_set_int(content, "batch_default_concurrency", batch_concurrency, section="test")
+        # 批量检索式列表：使用 yaml.dump 生成去掉缩进后的纯列表行
+        queries_yaml = _yaml.dump(
+            batch_queries, default_flow_style=True,
+            allow_unicode=True, sort_keys=False,
+            width=10**6,  # 禁止自动换行
+        ).strip()
+        if re.search(r'batch_default_queries:\s*\[.*\]', content):
+            content = re.sub(
+                r'batch_default_queries:\s*\[.*\]',
+                f'batch_default_queries: {queries_yaml}',
+                content)
+        else:
+            content = re.sub(
+                r'(batch_default_concurrency:\s*\d+)',
+                f'\\1\n  batch_default_queries: {queries_yaml}',
+                content)
+        yaml_path.write_text(content, encoding="utf-8")
+        # 刷新内存缓存
+        with open(yaml_path, "r", encoding="utf-8") as _f:
+            self._raw = _yaml.safe_load(_f)
+
+    @staticmethod
+    def _yaml_set_str(content: str, key: str, value: str, section: str) -> str:
+        import re
+        # 使用 (?m)^ 锚定行首，防止 default_query 误匹配 batch_default_queries 等
+        pattern = rf'(?m)^(\s*{key}:\s*)"[^"]*"'
+        if re.search(pattern, content):
+            return re.sub(pattern, rf'\g<1>"{value}"', content)
+        else:
+            # 在 section 下追加
+            return re.sub(
+                rf'({section}:\s*\n)',
+                rf'\g<1>  {key}: "{value}"\n',
+                content)
+
+    @staticmethod
+    def _yaml_set_int(content: str, key: str, value: int, section: str) -> str:
+        import re
+        # 使用 (?m)^ 锚定行首，防止 default_count 误匹配 batch_default_count 等
+        pattern = rf'(?m)^(\s*{key}:\s*)\d+'
+        if re.search(pattern, content):
+            return re.sub(pattern, rf'\g<1>{value}', content)
+        else:
+            return re.sub(
+                rf'({section}:\s*\n)',
+                rf'\g<1>  {key}: {value}\n',
+                content)
+
     # --- 输出 ---
     @property
     def output_report_formats(self) -> list[str]:

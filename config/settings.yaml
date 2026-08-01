@@ -30,7 +30,7 @@ query_generation:
 
 # Web自动化
 web:
-  browser: "firefox"                # chrome / msedge / firefox
+  browser: "msedge"                # chrome / msedge / firefox
   use_cdp: false                    # true=连已有浏览器(需先开 --remote-debugging-port)
   cdp_port: 9222                    # CDP 远程调试端口
   viewport_width: 1920
@@ -110,6 +110,14 @@ analysis:
 session:
   max_age_hours: 6
   profile_dir: "profiles/patentscope_browser"
+
+# 测试工具默认值（"设为默认值"按钮保存）
+test:
+  default_query: "掉电"
+  default_count: 10
+  batch_default_count: 200
+  batch_default_concurrency: 1
+  batch_default_queries: [("H01L 29/51" OR "H01L 21/28") AND ("high-k" OR "high dielectric" OR 高誘電率) AND (gradient OR graded OR 勾配), ("high-k" OR "high dielectric") AND (oxygen AND (diffusion OR 拡散)) AND (gate OR ゲート) AND (interface OR interfacial), (nanosheet OR GAA OR "gate-all-around") AND (gate AND dielectric) AND ("high-k" OR 高誘電率), (nanosheet OR GAA) AND (gate dielectric) AND (deposition OR CVD OR ALD OR 堆積) AND ("high-k") AND (gradient OR graded)]
 
 # 输出
 output:

@@ -105,6 +105,8 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
     def stop(self):
         self._is_running = False
+        from src.web_automation.browser_manager import BrowserManager
+        BrowserManager.cancel_cooldown()
 
     def run(self):
         try:
@@ -187,7 +189,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
             self.signals.progress.emit(progress,
                 f"阶段1: 搜索 {idx+1}/{len(normal_queries)}")
 
-            # ── 带 403 重试的搜索 ──
+            # ── 带 403 / 网络错误 重试的搜索 ──
             MAX_SEARCH_RETRIES = 3
             abstracts = []
             for attempt in range(1, MAX_SEARCH_RETRIES + 1):
@@ -199,13 +201,28 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 except Exception as e:
                     err_msg = str(e)
                     is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
-                    if is_403 and attempt < MAX_SEARCH_RETRIES and self._is_running:
+                    # 网络中断类错误：NS_ERROR_NET_INTERRUPT / RESET / TIMEOUT / CONNECTION_REFUSED 等
+                    is_net_error = any(kw in err_msg for kw in (
+                        "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                        "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                        "NS_BINDING_ABORTED", "net::ERR_",
+                        "NS_ERROR_PROXY_CONNECTION_REFUSED",
+                        "NS_ERROR_UNKNOWN_HOST", "NS_ERROR_UNKNOWN_PROXY_HOST",
+                    ))
+                    can_retry = (is_403 or is_net_error) and attempt < MAX_SEARCH_RETRIES and self._is_running
+                    if can_retry:
                         # 切换浏览器 + 冷却 + 重试
                         from src.web_automation.browser_manager import BrowserManager
-                        new_browser = BrowserManager.switch_channel(on_403=True)
-                        cool = random.uniform(8, 20)
+                        if is_403:
+                            new_browser = BrowserManager.switch_channel(on_403=True)
+                            cool = random.uniform(8, 20)
+                            reason = "403"
+                        else:
+                            new_browser = BrowserManager.switch_channel()
+                            cool = random.uniform(3, 8)
+                            reason = "网络中断"
                         self.signals.log.emit("WARN",
-                            f"  搜索遇到 403，切换至 {new_browser} + 冷却 {cool:.0f}s "
+                            f"  搜索遇到 {reason}，切换至 {new_browser} + 冷却 {cool:.0f}s "
                             f"(第 {attempt}/{MAX_SEARCH_RETRIES} 次重试)...")
                         await browser_mgr.close()
                         await asyncio.sleep(cool)
@@ -217,7 +234,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                         human = HumanBehavior(self.settings)
                         scraper = PatentscopeScraper(page, self.settings, human)
                     else:
-                        raise  # 非403或重试耗尽，向外抛出
+                        raise  # 非403/网络错误，或重试耗尽，向外抛出
 
             if not abstracts and attempt >= MAX_SEARCH_RETRIES:
                 self.signals.log.emit("ERROR",
@@ -290,7 +307,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                     break
                 fq_str = fq.get("query_string", "")
 
-                # ── 带 403 重试的兜底搜索 ──
+                # ── 带 403 / 网络错误 重试的兜底搜索 ──
                 abstracts = []
                 for attempt in range(1, 4):
                     try:
@@ -301,12 +318,26 @@ class PatentscopeSearchAndFetchWorker(QThread):
                     except Exception as e:
                         err_msg = str(e)
                         is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
-                        if is_403 and attempt < 3 and self._is_running:
+                        is_net_error = any(kw in err_msg for kw in (
+                            "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                            "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                            "NS_BINDING_ABORTED", "net::ERR_",
+                            "NS_ERROR_PROXY_CONNECTION_REFUSED",
+                            "NS_ERROR_UNKNOWN_HOST", "NS_ERROR_UNKNOWN_PROXY_HOST",
+                        ))
+                        can_retry = (is_403 or is_net_error) and attempt < 3 and self._is_running
+                        if can_retry:
                             from src.web_automation.browser_manager import BrowserManager
-                            new_browser = BrowserManager.switch_channel(on_403=True)
-                            cool = random.uniform(8, 20)
+                            if is_403:
+                                new_browser = BrowserManager.switch_channel(on_403=True)
+                                cool = random.uniform(8, 20)
+                                reason = "403"
+                            else:
+                                new_browser = BrowserManager.switch_channel()
+                                cool = random.uniform(3, 8)
+                                reason = "网络中断"
                             self.signals.log.emit("WARN",
-                                f"  兜底搜索 403，切换 {new_browser} + 冷却 {cool:.0f}s "
+                                f"  兜底搜索 {reason}，切换 {new_browser} + 冷却 {cool:.0f}s "
                                 f"(第 {attempt}/3 次重试)...")
                             await browser_mgr.close()
                             await asyncio.sleep(cool)
@@ -385,14 +416,20 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 _cite_failed = []
                 _consecutive_403 = 0
 
-                async def _restart_for_cite():
-                    """遇到403 → 切换浏览器 + 冷却 + 重启"""
+                async def _restart_for_cite(is_403: bool = True):
+                    """遇到403或网络错误 → 切换浏览器 + 冷却 + 重启"""
                     nonlocal context1, page1, scraper1, human1, browser_mgr1, _consecutive_403
                     from src.web_automation.browser_manager import BrowserManager
-                    new_browser = BrowserManager.switch_channel(on_403=True)
-                    cool = random.uniform(8, 20)
+                    if is_403:
+                        new_browser = BrowserManager.switch_channel(on_403=True)
+                        cool = random.uniform(8, 20)
+                        reason = "403"
+                    else:
+                        new_browser = BrowserManager.switch_channel()
+                        cool = random.uniform(3, 8)
+                        reason = "网络中断"
                     self.signals.log.emit("WARN",
-                        f"  引用下载 403，切换至 {new_browser} + 冷却 {cool:.0f}s...")
+                        f"  引用下载 {reason}，切换至 {new_browser} + 冷却 {cool:.0f}s...")
                     await browser_mgr1.close()
                     await asyncio.sleep(cool)
                     browser_mgr1 = BrowserManager(self.settings)
@@ -403,7 +440,8 @@ class PatentscopeSearchAndFetchWorker(QThread):
                         context1, page1 = await browser_mgr1.launch_with_retry(max_retries=1)
                     human1 = HumanBehavior(self.settings)
                     scraper1 = PatentscopeScraper(page1, self.settings, human1)
-                    _consecutive_403 = 0
+                    if is_403:
+                        _consecutive_403 = 0
 
                 for i, pub in enumerate(new_pubs):
                     if not self._is_running:
@@ -458,9 +496,17 @@ class PatentscopeSearchAndFetchWorker(QThread):
                         except Exception as e:
                             err_msg = str(e)
                             is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
-                            if is_403 and attempt < 3 and self._is_running:
-                                _consecutive_403 += 1
-                                await _restart_for_cite()
+                            is_net_error = any(kw in err_msg for kw in (
+                                "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                                "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                                "NS_BINDING_ABORTED", "net::ERR_",
+                                "NS_ERROR_PROXY_CONNECTION_REFUSED",
+                                "NS_ERROR_UNKNOWN_HOST", "NS_ERROR_UNKNOWN_PROXY_HOST",
+                            ))
+                            if (is_403 or is_net_error) and attempt < 3 and self._is_running:
+                                if is_403:
+                                    _consecutive_403 += 1
+                                await _restart_for_cite(is_403=is_403)
                             else:
                                 if attempt >= 3:
                                     self.signals.log.emit("WARN",
@@ -476,7 +522,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 if _cite_failed and self._is_running:
                     self.signals.log.emit("INFO",
                         f"  === 补下载 {len(_cite_failed)} 篇引用专利 === ")
-                    await _restart_for_cite()
+                    await _restart_for_cite(is_403=False)
                     await asyncio.sleep(3)
                     for pub in _cite_failed:
                         if not self._is_running:
@@ -507,8 +553,15 @@ class PatentscopeSearchAndFetchWorker(QThread):
                             except Exception as e:
                                 err_msg = str(e)
                                 is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
-                                if is_403 and attempt < 3 and self._is_running:
-                                    await _restart_for_cite()
+                                is_net_error = any(kw in err_msg for kw in (
+                                    "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                                    "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                                    "NS_BINDING_ABORTED", "net::ERR_",
+                                    "NS_ERROR_PROXY_CONNECTION_REFUSED",
+                                    "NS_ERROR_UNKNOWN_HOST", "NS_ERROR_UNKNOWN_PROXY_HOST",
+                                ))
+                                if (is_403 or is_net_error) and attempt < 3 and self._is_running:
+                                    await _restart_for_cite(is_403=is_403)
                                 else:
                                     self.signals.log.emit("WARN",
                                         f"    重试仍失败: {pub} - {e}")
@@ -997,7 +1050,7 @@ class PatentscopeTestWorker(QThread):
             # 第2条开始：先回退到结果页
             if i > 0:
                 try:
-                    await page.go_back()
+                    await page.go_back(timeout=30000)
                     await asyncio.sleep(2)
                     try:
                         await page.wait_for_selector(
@@ -1020,7 +1073,12 @@ class PatentscopeTestWorker(QThread):
                 link = page.locator(
                     f"a[href*='docId={doc_id}']").first
                 if await link.count() > 0:
-                    await link.click()
+                    try:
+                        await link.click(timeout=15000)
+                    except Exception:
+                        await page.evaluate(
+                            f'() => {{ var a = document.querySelector('
+                            f'"a[href*=\'docId={doc_id}\']"); if(a) a.click(); }}')
                     await page.wait_for_url(
                         "**/detail.jsf*", timeout=20000)
                     await asyncio.sleep(1)
@@ -1303,11 +1361,24 @@ class PatentLookupWorker(QThread):
             except Exception as e:
                 err_msg = str(e)
                 is_403 = "403" in err_msg and ("Forbidden" in err_msg or "FORBIDDEN" in err_msg)
-                if is_403 and attempt < MAX_RETRIES:
-                    new_browser = BrowserManager.switch_channel(on_403=True)
-                    cool = random.uniform(8, 20)
+                is_net_error = any(kw in err_msg for kw in (
+                    "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                    "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                    "NS_BINDING_ABORTED", "net::ERR_",
+                    "NS_ERROR_PROXY_CONNECTION_REFUSED",
+                    "NS_ERROR_UNKNOWN_HOST", "NS_ERROR_UNKNOWN_PROXY_HOST",
+                ))
+                if (is_403 or is_net_error) and attempt < MAX_RETRIES:
+                    if is_403:
+                        new_browser = BrowserManager.switch_channel(on_403=True)
+                        cool = random.uniform(8, 20)
+                        reason = "403"
+                    else:
+                        new_browser = BrowserManager.switch_channel()
+                        cool = random.uniform(3, 8)
+                        reason = "网络中断"
                     self.signals.log.emit("WARN",
-                        f"  查询遇到 403，切换至 {new_browser} + 冷却 {cool:.0f}s "
+                        f"  查询遇到 {reason}，切换至 {new_browser} + 冷却 {cool:.0f}s "
                         f"(第 {attempt}/{MAX_RETRIES} 次重试)...")
                     await asyncio.sleep(cool)
                 else:
@@ -1317,3 +1388,451 @@ class PatentLookupWorker(QThread):
                 await BrowserManager.shutdown()
 
         return None
+
+
+class MultiQueryTestWorker(QThread):
+    """批量检索式测试 Worker — 搜索 → 去重 → 下载 → 报告。
+
+    纯数据验证管线，零 AI 依赖。
+    """
+
+    def __init__(self, queries: list[str], settings: "Settings",
+                 test_name: str = "", max_results: int = 200,
+                 concurrency: int = 1,
+                 output_dir: str | None = None, parent=None):
+        super().__init__(parent)
+        self.queries = queries
+        self.settings = settings
+        self.test_name = test_name
+        self.max_results = max_results
+        self.concurrency = concurrency
+        self._given_output_dir = output_dir
+        self.signals = WorkerSignals()
+        self._is_running = True
+        self.output_dir = None
+
+    def stop(self):
+        self._is_running = False
+        from src.web_automation.browser_manager import BrowserManager
+        BrowserManager.cancel_cooldown()
+
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._run_async())
+            loop.close()
+        except Exception as e:
+            self.signals.error.emit(f"批量测试失败: {e}")
+            self.signals.log.emit("ERROR", f"批量测试失败: {e}")
+            self.signals.finished.emit(False, str(e))
+
+    async def _run_async(self):
+        import re as _re
+        import json as json_module
+        from datetime import datetime
+        from pathlib import Path
+        from src.web_automation.browser_manager import BrowserManager
+        from src.web_automation.human_behavior import HumanBehavior
+        from src.web_automation.patentscope_scraper import (
+            PatentscopeScraper, is_cached_patent_valid, _safe_filename)
+
+        # ── 输出目录 ──────────────────────────────────────────────
+        if self._given_output_dir:
+            self.output_dir = Path(self._given_output_dir)
+        else:
+            name = _re.sub(r'[\\/:*?"<>|]', '_', self.test_name or "batch_test")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_dir = Path.cwd() / "data" / "output" / "test_multi" / f"{name}_{ts}"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        out = self.output_dir
+        detail_dir = out / "02_patent_details"
+        detail_dir.mkdir(parents=True, exist_ok=True)
+
+        # 保存输入检索式
+        self._save_json(out / "queries.json", {
+            "test_name": self.test_name,
+            "max_results": self.max_results,
+            "concurrency": self.concurrency,
+            "queries": self.queries,
+        })
+
+        # ============================================================
+        # 阶段1: 逐条搜索摘要
+        # ============================================================
+        self.signals.log.emit("INFO", "=" * 50)
+        self.signals.log.emit("INFO",
+            f"批量检索测试: {len(self.queries)} 个检索式 × {self.max_results} 条/式")
+        self.signals.progress.emit(5, "启动浏览器...")
+
+        browser_mgr = BrowserManager(self.settings)
+        context, page = await browser_mgr.launch_with_retry(max_retries=2)
+        self.signals.log.emit("SUCCESS", "浏览器就绪")
+
+        human = HumanBehavior(self.settings)
+        scraper = PatentscopeScraper(page, self.settings, human)
+
+        all_abstracts = []
+        per_query_stats = []
+        per_query_dir = out / "per_query"
+        per_query_dir.mkdir(parents=True, exist_ok=True)
+
+        MAX_SEARCH_RETRIES = 3
+        for q_idx, q_str in enumerate(self.queries):
+            if not self._is_running:
+                break
+            q_str = q_str.strip()
+            if not q_str:
+                continue
+
+            label = f"检索式{q_idx + 1}"
+            self.signals.log.emit("INFO",
+                f"\n--- {label} / {len(self.queries)} ---")
+            self.signals.log.emit("INFO", f"  {q_str}")
+            pct = 5 + int((q_idx + 1) / max(len(self.queries), 1) * 20)
+            self.signals.progress.emit(pct,
+                f"搜索 {q_idx + 1}/{len(self.queries)}: {q_str[:50]}...")
+
+            abstracts = []
+            error_msg = None
+            for attempt in range(1, MAX_SEARCH_RETRIES + 1):
+                try:
+                    abstracts = await scraper.search_abstracts(
+                        q_str, max_results=self.max_results, signals=self.signals)
+                    break
+                except Exception as e:
+                    err_msg = str(e)
+                    is_403 = "403" in err_msg
+                    is_net_error = any(kw in err_msg for kw in (
+                        "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                        "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                        "NS_BINDING_ABORTED", "net::ERR_",
+                    ))
+                    if (is_403 or is_net_error) and attempt < MAX_SEARCH_RETRIES and self._is_running:
+                        if is_403:
+                            BrowserManager.switch_channel(on_403=True)
+                            cool = random.uniform(8, 20)
+                        else:
+                            BrowserManager.switch_channel()
+                            cool = random.uniform(3, 8)
+                        self.signals.log.emit("WARN",
+                            f"  搜索遇到{'403' if is_403 else '网络中断'}，"
+                            f"冷却 {cool:.0f}s 重试 ({attempt}/{MAX_SEARCH_RETRIES})...")
+                        await browser_mgr.close()
+                        await asyncio.sleep(cool)
+                        try:
+                            context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                        except Exception:
+                            await asyncio.sleep(2)
+                            context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                        human = HumanBehavior(self.settings)
+                        scraper = PatentscopeScraper(page, self.settings, human)
+                    else:
+                        error_msg = str(e)
+                        break
+
+            for a in abstracts:
+                a["source_query"] = q_str
+            all_abstracts.append(abstracts)
+
+            self._save_json(
+                per_query_dir / f"{q_idx + 1:02d}_abstracts.json",
+                {"query": q_str, "count": len(abstracts),
+                 "error": error_msg, "results": abstracts})
+
+            per_query_stats.append({
+                "index": q_idx + 1,
+                "query": q_str,
+                "results_count": len(abstracts),
+                "error": error_msg,
+            })
+
+            if error_msg:
+                self.signals.log.emit("ERROR", f"  {label} 失败: {error_msg}")
+            else:
+                self.signals.log.emit("SUCCESS",
+                    f"  {label}: {len(abstracts)} 篇摘要")
+
+            if q_idx < len(self.queries) - 1 and self._is_running:
+                await human.inter_search_delay(q_idx + 1)
+
+        await browser_mgr.close()
+
+        # ============================================================
+        # 轮询合并去重
+        # ============================================================
+        self.signals.log.emit("INFO", "\n" + "=" * 50)
+        self.signals.log.emit("INFO", "去重合并...")
+        seen = set()
+        unique_abstracts = []
+        max_batch = max((len(b) for b in all_abstracts), default=0)
+        for i in range(max_batch):
+            for batch in all_abstracts:
+                if i < len(batch):
+                    a = batch[i]
+                    key = a.get("publication_number") or a.get("doc_id", "")
+                    if key and key not in seen:
+                        seen.add(key)
+                        unique_abstracts.append(a)
+
+        total_before = sum(len(b) for b in all_abstracts)
+        total_unique = len(unique_abstracts)
+        self.signals.log.emit("SUCCESS",
+            f"去重: {total_before} 篇 → {total_unique} 篇唯一专利")
+
+        self._save_json(out / "01_all_abstracts.json", {
+            "stage": "merged_abstracts",
+            "timestamp": datetime.now().isoformat(),
+            "total_before_dedup": total_before,
+            "total_unique": total_unique,
+            "per_query": per_query_stats,
+            "results": unique_abstracts,
+        })
+
+        if total_unique == 0:
+            self.signals.log.emit("WARN", "所有检索式均无结果，停止")
+            self._write_report(out, per_query_stats, 0, 0, 0, 0, 0, [])
+            self.signals.progress.emit(100, "无结果")
+            self.signals.finished.emit(True, "无结果")
+            return
+
+        # ============================================================
+        # 阶段2: 并行下载完整详情
+        # ============================================================
+        self.signals.log.emit("INFO", "\n" + "=" * 50)
+        self.signals.log.emit("INFO",
+            f"下载 {total_unique} 篇完整详情 (并发 {self.concurrency})...")
+        self.signals.progress.emit(28, "启动浏览器下载...")
+
+        browser_mgr2 = BrowserManager(self.settings)
+        context2, page2 = await browser_mgr2.launch_with_retry(max_retries=2)
+        human2 = HumanBehavior(self.settings)
+        scraper2 = PatentscopeScraper(page2, self.settings, human2)
+
+        await scraper2.fetch_details_parallel(
+            unique_abstracts, str(detail_dir),
+            concurrency=self.concurrency, signals=self.signals)
+
+        await browser_mgr2.close()
+
+        # ============================================================
+        # 数据质量验证 & 报告
+        # ============================================================
+        self.signals.log.emit("INFO", "\n" + "=" * 50)
+        self.signals.log.emit("INFO", "数据质量分析...")
+        self.signals.progress.emit(85, "生成报告...")
+
+        detail_files = sorted(detail_dir.glob("*.json"))
+        succeeded = 0
+        cached = 0
+        failed = 0
+        failed_list = []
+        quality = {"with_claims": 0, "with_description": 0,
+                   "with_abstract": 0, "with_ipc": 0,
+                   "total_claims_chars": 0, "total_desc_chars": 0}
+        succeeded_patents = []
+
+        for fpath in detail_files:
+            try:
+                data = json_module.loads(fpath.read_text(encoding="utf-8"))
+            except Exception:
+                failed += 1
+                failed_list.append({"file": fpath.name, "error": "JSON解析失败"})
+                continue
+
+            status = data.get("fetch_status", "")
+            if status == "ok":
+                if is_cached_patent_valid(data):
+                    succeeded += 1
+                    pub = data.get("publication_number", fpath.stem)
+                    if data.get("claims"):
+                        quality["with_claims"] += 1
+                        quality["total_claims_chars"] += len(data["claims"])
+                    if data.get("description"):
+                        quality["with_description"] += 1
+                        quality["total_desc_chars"] += len(data["description"])
+                    if data.get("abstract"):
+                        quality["with_abstract"] += 1
+                    if data.get("ipc"):
+                        quality["with_ipc"] += 1
+                    succeeded_patents.append({
+                        "doc_id": data.get("doc_id", ""),
+                        "publication_number": pub,
+                        "title": str(data.get("title", ""))[:80],
+                        "has_claims": bool(data.get("claims")),
+                        "has_description": bool(data.get("description")),
+                        "claims_chars": len(data.get("claims") or ""),
+                        "desc_chars": len(data.get("description") or ""),
+                    })
+                else:
+                    failed += 1
+                    failed_list.append({
+                        "file": fpath.name,
+                        "doc_id": data.get("doc_id", ""),
+                        "error": "缓存内容无效（缺权利要求/说明书）",
+                    })
+            elif status == "failed":
+                failed += 1
+                failed_list.append({
+                    "file": fpath.name,
+                    "doc_id": data.get("doc_id", ""),
+                    "error": data.get("error", "未知错误"),
+                })
+            else:
+                if is_cached_patent_valid(data):
+                    cached += 1
+                else:
+                    failed += 1
+                    failed_list.append({"file": fpath.name, "error": "缓存无效"})
+
+        total_downloaded = succeeded + cached + failed
+
+        self.signals.log.emit("SUCCESS",
+            f"下载统计: 成功 {succeeded}, 缓存 {cached}, 失败 {failed}")
+        avg_claims = quality["total_claims_chars"] // max(succeeded, 1)
+        avg_desc = quality["total_desc_chars"] // max(succeeded, 1)
+        self.signals.log.emit("INFO",
+            f"数据质量: 有权利要求 {quality['with_claims']}/{succeeded}, "
+            f"有说明书 {quality['with_description']}/{succeeded}, "
+            f"有摘要 {quality['with_abstract']}/{succeeded}, "
+            f"有IPC {quality['with_ipc']}/{succeeded}")
+        self.signals.log.emit("INFO",
+            f"  平均权利要求: {avg_claims} 字, 平均说明书: {avg_desc} 字")
+
+        self._write_report(out, per_query_stats, total_before, total_unique,
+                          succeeded, cached, failed, failed_list, quality,
+                          avg_claims, avg_desc, succeeded_patents)
+
+        self.signals.log.emit("SUCCESS", f"\n{'=' * 50}")
+        self.signals.log.emit("SUCCESS", "批量测试完成!")
+        self.signals.log.emit("INFO", f"输出目录: {out}")
+
+        self.signals.progress.emit(100, "批量测试完成")
+
+        # 加载完整专利数据发射给结果面板
+        full_patents = []
+        for fpath in sorted(detail_dir.glob("*.json")):
+            try:
+                d = json_module.loads(fpath.read_text(encoding="utf-8"))
+                if d.get("fetch_status") == "ok" and is_cached_patent_valid(d):
+                    full_patents.append(d)
+            except Exception:
+                pass
+        self.signals.all_searches_done.emit([full_patents])
+        self.signals.finished.emit(True, f"完成: {succeeded} 篇下载成功")
+
+    # ── 辅助 ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _save_json(path, data):
+        import json as json_module
+        with open(path, "w", encoding="utf-8") as f:
+            json_module.dump(data, f, indent=2, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _write_report(out_dir, per_query_stats, total_before, total_unique,
+                      succeeded, cached, failed, failed_list,
+                      quality=None, avg_claims=0, avg_desc=0,
+                      succeeded_patents=None):
+        import json as json_module
+        from datetime import datetime
+        from pathlib import Path
+        out = Path(out_dir)
+
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "per_query": per_query_stats,
+            "total_before_dedup": total_before,
+            "total_unique": total_unique,
+            "download_stats": {"succeeded": succeeded, "cached": cached,
+                               "failed": failed},
+            "data_quality": {
+                "with_claims": quality["with_claims"] if quality else 0,
+                "with_description": quality["with_description"] if quality else 0,
+                "with_abstract": quality["with_abstract"] if quality else 0,
+                "with_ipc": quality["with_ipc"] if quality else 0,
+                "average_claims_length": avg_claims,
+                "average_description_length": avg_desc,
+            } if quality else {},
+            "failed_patents": failed_list,
+        }
+        (out / "report.json").write_text(
+            json_module.dumps(report, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8")
+
+        lines = []
+        lines.append("=" * 70)
+        lines.append("  批量检索式测试报告")
+        lines.append("=" * 70)
+        lines.append(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  检索式数: {len(per_query_stats)}")
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("  各检索式结果")
+        lines.append("-" * 70)
+        for s in per_query_stats:
+            status = "✓" if not s.get("error") else "✗"
+            lines.append(
+                f"  [{s['index']:2d}] {status} "
+                f"{s.get('results_count', 0):4d} 篇  "
+                f"{s.get('query', '')[:70]}")
+            if s.get("error"):
+                lines.append(f"       错误: {s['error'][:120]}")
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("  总体统计")
+        lines.append("-" * 70)
+        lines.append(f"  各检索式合计: {total_before} 篇")
+        lines.append(f"  去重后唯一:   {total_unique} 篇")
+        if total_before > 0:
+            lines.append(
+                f"  去重率:       "
+                f"{((1 - total_unique / total_before) * 100):.1f}%")
+        lines.append("")
+        lines.append(f"  下载成功:     {succeeded} 篇")
+        lines.append(f"  缓存命中:     {cached} 篇")
+        lines.append(f"  下载失败:     {failed} 篇")
+        if total_unique > 0:
+            lines.append(
+                f"  成功率:       "
+                f"{(succeeded + cached) / total_unique * 100:.1f}%")
+        lines.append("")
+        if quality and succeeded > 0:
+            lines.append("-" * 70)
+            lines.append("  数据质量")
+            lines.append("-" * 70)
+            lines.append(f"  有权利要求:   {quality['with_claims']}/{succeeded}")
+            lines.append(f"  有说明书:     {quality['with_description']}/{succeeded}")
+            lines.append(f"  有摘要:       {quality['with_abstract']}/{succeeded}")
+            lines.append(f"  有IPC分类:    {quality['with_ipc']}/{succeeded}")
+            lines.append(f"  权利要求均长: {avg_claims} 字")
+            lines.append(f"  说明书均长:   {avg_desc} 字")
+            lines.append("")
+        if succeeded_patents:
+            lines.append("-" * 70)
+            lines.append(f"  成功下载的专利 ({len(succeeded_patents)} 篇)")
+            lines.append("-" * 70)
+            for i, p in enumerate(succeeded_patents, 1):
+                pub = p.get("publication_number", "?")
+                title = p.get("title", "")[:60]
+                c_len = p.get("claims_chars", 0)
+                d_len = p.get("desc_chars", 0)
+                lines.append(
+                    f"  [{i:3d}] {pub:20s} | "
+                    f"权利要求:{c_len:5d}字 | 说明书:{d_len:6d}字 | {title}")
+            lines.append("")
+        if failed_list:
+            lines.append("-" * 70)
+            lines.append(f"  下载失败 ({len(failed_list)} 篇)")
+            lines.append("-" * 70)
+            for f_item in failed_list:
+                lines.append(
+                    f"  ✗ {f_item.get('file', '?')}: "
+                    f"{f_item.get('error', '?')[:100]}")
+            lines.append("")
+        lines.append("=" * 70)
+        lines.append(f"  报告结束 — 输出目录: {out}")
+        lines.append("=" * 70)
+
+        (out / "report.txt").write_text(
+            "\n".join(lines), encoding="utf-8")

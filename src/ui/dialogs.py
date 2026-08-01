@@ -8,7 +8,8 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSlider, QTabWidget, QWidget, QMessageBox,
-    QGroupBox, QPlainTextEdit, QSpinBox, QCheckBox,
+    QGroupBox, QPlainTextEdit, QSpinBox, QCheckBox, QInputDialog,
+    QListWidget, QListWidgetItem, QFileDialog,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -622,16 +623,19 @@ class TestDialog(QDialog):
     test_detail = Signal(str, int)     # query, max_results
     test_pagesize = Signal(str, int)   # query, max_results (切换200条测试)
     lookup_patent = Signal(str)        # doc_id
+    batch_test = Signal(list, str, int, int)  # queries, test_name, max_results, concurrency
 
     _HISTORY_FILE = Path(__file__).parent.parent.parent / "data" / "lookup_history.json"
     _MAX_HISTORY = 20
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, settings: "Settings" = None):
         super().__init__(parent)
+        self._settings = settings
         self.setWindowTitle("测试工具")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(580)
         self._setup_ui()
         self._load_lookup_history()
+        self._load_defaults()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -673,6 +677,83 @@ class TestDialog(QDialog):
         search_layout.addLayout(row2)
 
         layout.addWidget(search_group)
+
+        # ── 批量检索测试 ──
+        batch_group = QGroupBox("📋 批量检索测试")
+        batch_layout = QVBoxLayout(batch_group)
+
+        # 测试名称
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("测试名称:"))
+        self.batch_name_edit = QLineEdit()
+        self.batch_name_edit.setPlaceholderText("可选，用于命名输出目录...")
+        name_row.addWidget(self.batch_name_edit, 1)
+        batch_layout.addLayout(name_row)
+
+        # 检索式列表 + 按钮
+        list_label_row = QHBoxLayout()
+        list_label_row.addWidget(QLabel("检索式列表:"))
+        list_label_row.addStretch(1)
+        self.batch_import_btn = QPushButton("📂 导入...")
+        self.batch_import_btn.setToolTip("选择历史运行目录，自动提取其中的检索式")
+        self.batch_import_btn.clicked.connect(self._on_batch_import)
+        list_label_row.addWidget(self.batch_import_btn)
+        self.batch_add_btn = QPushButton("+添加")
+        self.batch_add_btn.setToolTip("添加单行检索式；也可直接粘贴多行文本")
+        self.batch_add_btn.clicked.connect(self._on_batch_add)
+        list_label_row.addWidget(self.batch_add_btn)
+        self.batch_remove_btn = QPushButton("✕删除")
+        self.batch_remove_btn.setToolTip("删除选中检索式")
+        self.batch_remove_btn.clicked.connect(self._on_batch_remove)
+        list_label_row.addWidget(self.batch_remove_btn)
+        batch_layout.addLayout(list_label_row)
+
+        self.batch_query_list = QListWidget()
+        self.batch_query_list.setMinimumHeight(100)
+        self.batch_query_list.setAlternatingRowColors(True)
+        batch_layout.addWidget(self.batch_query_list)
+
+        # 参数行
+        param_row = QHBoxLayout()
+        param_row.addWidget(QLabel("每式结果上限:"))
+        self.batch_count_spin = QSpinBox()
+        self.batch_count_spin.setRange(1, 200)
+        self.batch_count_spin.setValue(200)
+        param_row.addWidget(self.batch_count_spin)
+        param_row.addSpacing(20)
+        param_row.addWidget(QLabel("下载并发:"))
+        self.batch_concurrency_spin = QSpinBox()
+        self.batch_concurrency_spin.setRange(1, 5)
+        self.batch_concurrency_spin.setValue(1)
+        self.batch_concurrency_spin.setToolTip("并行下载数（1=最稳定，3=较快）")
+        param_row.addWidget(self.batch_concurrency_spin)
+        param_row.addStretch(1)
+        batch_layout.addLayout(param_row)
+
+        # 操作按钮
+        batch_btn_row = QHBoxLayout()
+        self.batch_run_btn = QPushButton("▶ 运行批量测试")
+        self.batch_run_btn.setObjectName("saveBtn")
+        self.batch_run_btn.setMinimumHeight(32)
+        self.batch_run_btn.setToolTip(
+            "逐条搜索 → 去重合并 → 并行下载 → 生成报告\n结果保存到 data/output/test_multi/")
+        self.batch_run_btn.clicked.connect(self._on_batch_run)
+        batch_btn_row.addWidget(self.batch_run_btn)
+
+        self.batch_open_btn = QPushButton("📂 打开输出目录")
+        self.batch_open_btn.setToolTip("在资源管理器中打开 data/output/test_multi/")
+        self.batch_open_btn.clicked.connect(self._on_batch_open_output)
+        batch_btn_row.addWidget(self.batch_open_btn)
+
+        self.batch_save_defaults_btn = QPushButton("⭐ 设为默认值")
+        self.batch_save_defaults_btn.setToolTip("将当前界面所有参数保存为默认值，下次打开自动填充")
+        self.batch_save_defaults_btn.clicked.connect(self._on_save_defaults)
+        batch_btn_row.addWidget(self.batch_save_defaults_btn)
+
+        batch_btn_row.addStretch(1)
+        batch_layout.addLayout(batch_btn_row)
+
+        layout.addWidget(batch_group)
 
         # ── 公布号直查 ──
         lookup_group = QGroupBox("公布号直查")
@@ -759,3 +840,181 @@ class TestDialog(QDialog):
             self.lookup_combo.setCurrentIndex(0)
             self._save_lookup_history()
             self.lookup_patent.emit(doc_id)
+
+    # ── 批量检索测试 ──────────────────────────────────────────────
+
+    def _on_batch_add(self):
+        """弹出对话框添加检索式；支持粘贴多行文本"""
+        text, ok = QInputDialog.getMultiLineText(
+            self, "添加检索式",
+            "输入 PATENTSCOPE 检索式（可一次粘贴多行，每行一个检索式）:",
+            "")
+        if ok and text.strip():
+            for line in text.strip().splitlines():
+                line = line.strip()
+                if line:
+                    # 避免重复
+                    existing = [
+                        self.batch_query_list.item(i).text()
+                        for i in range(self.batch_query_list.count())
+                    ]
+                    if line not in existing:
+                        self.batch_query_list.addItem(line)
+
+    def _on_batch_remove(self):
+        """删除选中的检索式"""
+        for item in self.batch_query_list.selectedItems():
+            row = self.batch_query_list.row(item)
+            self.batch_query_list.takeItem(row)
+
+    def _on_batch_import(self):
+        """从历史运行目录中导入检索式"""
+        data_dir = Path(__file__).parent.parent.parent / "data" / "output"
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择历史运行目录", str(data_dir))
+        if not folder:
+            return
+
+        folder = Path(folder)
+        imported = 0
+
+        # 尝试读取 01_search_abstracts.json 中的 queries 字段
+        search_file = folder / "01_search_abstracts.json"
+        if search_file.exists():
+            try:
+                data = json.loads(search_file.read_text(encoding="utf-8"))
+                queries = data.get("queries", [])
+                if queries:
+                    existing = {
+                        self.batch_query_list.item(i).text()
+                        for i in range(self.batch_query_list.count())
+                    }
+                    for q in queries:
+                        q_str = str(q).strip()
+                        if q_str and q_str not in existing:
+                            self.batch_query_list.addItem(q_str)
+                            existing.add(q_str)
+                            imported += 1
+            except Exception:
+                pass
+
+        # 如果没找到，尝试读取 per_query 目录下的文件
+        if imported == 0:
+            per_query_dir = folder / "per_query"
+            patterns = ["01_query_*_abstracts.json",
+                        "0*_abstracts.json", "01_*_abstracts.json"]
+            import glob as glob_module
+            found_any = False
+            for pat in patterns:
+                for f in sorted(glob_module.glob(str(per_query_dir / pat))):
+                    found_any = True
+                    try:
+                        data = json.loads(
+                            Path(f).read_text(encoding="utf-8"))
+                        q = data.get("query", "")
+                        if q:
+                            existing = {
+                                self.batch_query_list.item(i).text()
+                                for i in range(self.batch_query_list.count())
+                            }
+                            if q.strip() not in existing:
+                                self.batch_query_list.addItem(q.strip())
+                                imported += 1
+                    except Exception:
+                        pass
+                if found_any:
+                    break
+
+            # 再尝试直接的 query 文件
+            if not found_any:
+                for f in sorted(folder.glob("01_query_*_abstracts.json")):
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                        q = data.get("query", "")
+                        if q:
+                            existing = {
+                                self.batch_query_list.item(i).text()
+                                for i in range(self.batch_query_list.count())
+                            }
+                            if q.strip() not in existing:
+                                self.batch_query_list.addItem(q.strip())
+                                imported += 1
+                    except Exception:
+                        pass
+
+        if imported > 0:
+            QMessageBox.information(self, "导入完成",
+                f"从 {Path(folder).name} 导入 {imported} 个检索式")
+        else:
+            QMessageBox.warning(self, "未找到检索式",
+                f"在 {Path(folder).name} 中未找到检索式数据。\n\n"
+                "请确保选择的是包含 01_search_abstracts.json\n"
+                "或 per_query/*_abstracts.json 的运行输出目录。")
+
+    def _on_batch_run(self):
+        """发射批量测试信号"""
+        queries = [
+            self.batch_query_list.item(i).text()
+            for i in range(self.batch_query_list.count())
+        ]
+        if not queries:
+            QMessageBox.warning(self, "无检索式", "请先添加至少一个检索式。")
+            return
+        test_name = self.batch_name_edit.text().strip()
+        max_results = self.batch_count_spin.value()
+        concurrency = self.batch_concurrency_spin.value()
+        self.batch_test.emit(queries, test_name, max_results, concurrency)
+
+    def _on_batch_open_output(self):
+        """打开批量测试输出目录"""
+        output_dir = Path(__file__).parent.parent.parent / "data" / "output" / "test_multi"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(output_dir))
+
+    def _load_defaults(self):
+        """从配置文件加载上次保存的默认值"""
+        if not self._settings:
+            return
+        # 单条检索式测试
+        default_query = self._settings.test_default_query
+        if default_query:
+            self.test_query_edit.setText(default_query)
+        self.test_count_spin.setValue(self._settings.test_default_count)
+        # 批量检索式测试
+        self.batch_count_spin.setValue(self._settings.test_batch_default_count)
+        self.batch_concurrency_spin.setValue(self._settings.test_batch_default_concurrency)
+        # 批量检索式列表
+        default_queries = self._settings.test_batch_default_queries
+        if default_queries:
+            self.batch_query_list.clear()
+            for q in default_queries:
+                self.batch_query_list.addItem(str(q))
+
+    def _on_save_defaults(self):
+        """将当前界面所有参数保存为默认值"""
+        if not self._settings:
+            QMessageBox.warning(self, "无法保存", "设置对象不可用，请通过主窗口打开测试工具。")
+            return
+
+        query = self.test_query_edit.text().strip()
+        count = self.test_count_spin.value()
+        batch_count = self.batch_count_spin.value()
+        batch_concurrency = self.batch_concurrency_spin.value()
+        batch_queries = [
+            self.batch_query_list.item(i).text()
+            for i in range(self.batch_query_list.count())
+        ]
+
+        try:
+            self._settings.save_test_defaults(
+                query, count, batch_count, batch_concurrency, batch_queries)
+            QMessageBox.information(self, "已保存",
+                f"当前测试参数已设为默认值：\n"
+                f"  检索式: {query}\n"
+                f"  数量上限: {count}\n"
+                f"  批量每式上限: {batch_count}\n"
+                f"  批量并发: {batch_concurrency}\n"
+                f"  批量检索式: {len(batch_queries)} 个\n\n"
+                f"下次打开测试工具将自动加载这些值。")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", f"无法写入配置文件:\n{e}")

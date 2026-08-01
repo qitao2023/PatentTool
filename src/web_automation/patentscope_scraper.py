@@ -694,84 +694,244 @@ class PatentscopeScraper:
         await asyncio.sleep(1)
 
     async def _set_max_page_size(self, signals=None):
-        """切到每页最多条数（200）。
+        """切到每页最多条数（200）—— 组合方案 + 变化检测。
 
-        页面布局: 「相关性」<select> | 「每页:」<select> | 「查看:」
-        找到包含选项"200"的 select 即目标。
+        关键：PATENTSCOPE 页面同时存在两个"每页条数"下拉框——
+          settingsForm:lengthOption:input  （隐藏，设置表单里的默认值偏好）
+          resultListCommandsForm:perPage:input（可见，真正控制当前结果列表）
+        因此对每个含200选项的 select 评分（perPage 权重最高、可见加分、
+        lengthOption 降权），取最高分者，绝不误信 settingsForm 那个。
+        然后按顺序尝试：
+          方式A: Playwright select_option(force=True) —— 原生/可信事件，
+                能同时触发 JSF inline onchange 和 addEventListener 绑定。
+          方式B: 纯 JS 改值 + 直接调用 sel.onchange() + 派发 change。
 
-        切换后 PATENTSCOPE 通过 JSF AJAX 重新加载结果表格。
-        使用轮询 DOM 行数稳定的方式确认加载完成，不依赖页面文本正则。
+        每次切换后都用 _wait_for_results_stable(min_change_from=old_count)
+        等待"行数真正变化"再判定稳定——旧10行连续两次相同不再被误判为稳定。
+        若两次切换后行数仍不变，把页面所有下拉框 DOM 导出到
+        tools/debug_select_dom.json 供进一步诊断。
         """
+        old_count = await self._count_result_rows()
+
+        # ── 1. 定位目标下拉框（评分选最优）────────────────────────────
+        # 页面上存在两个"每页条数"下拉框：
+        #   settingsForm:lengthOption:input  —— 隐藏，是"设置"里的默认值偏好
+        #   resultListCommandsForm:perPage:input —— 可见，真正控制当前结果列表
+        # 绝不能命中 settingsForm 那个（它可能已是200但列表仍是10）。
+        # 因此对每个含200选项的 select 评分，perPage 权重最高、可见加分、
+        # lengthOption 降权，取最高分者并直接打标记（一个 evaluate 完成）。
+        target = await self.page.evaluate('''() => {
+            function has200(s) {
+                for (var j = 0; j < s.options.length; j++) {
+                    if (s.options[j].value === "200") return true;
+                }
+                return false;
+            }
+            function score(s) {
+                var id = (s.id || "").toLowerCase();
+                var name = (s.name || "").toLowerCase();
+                var sc = 0;
+                if (id.indexOf("perpage") !== -1 || name.indexOf("perpage") !== -1) sc += 100;
+                if (id.indexOf("pagesize") !== -1) sc += 90;
+                if (id.indexOf("rowsperpage") !== -1) sc += 90;
+                if (id.indexOf("itemsperpage") !== -1) sc += 90;
+                if (id.indexOf("resultlist") !== -1) sc += 50;   // 结果列表表单
+                if (id.indexOf("lengthoption") !== -1) sc += 10; // 设置表单，降权
+                if (id.indexOf("length") !== -1) sc += 10;
+                if (s.offsetParent !== null) sc += 20;           // 可见优先
+                return sc;
+            }
+
+            var allSelects = document.querySelectorAll("select");
+            var cands = [];
+            for (var i = 0; i < allSelects.length; i++) {
+                var s = allSelects[i];
+                if (!has200(s)) continue;
+                cands.push({sel: s, sc: score(s)});
+            }
+            if (!cands.length) return {status: "not_found"};
+
+            cands.sort(function(a, b) { return b.sc - a.sc; });
+            var best = cands[0].sel;
+            best.setAttribute("data-ps-length-target", "1");
+
+            var candInfo = cands.map(function(c) {
+                return {id: c.sel.id || "", name: c.sel.name || "",
+                        value: c.sel.value, score: c.sc,
+                        visible: !!(c.sel.offsetParent !== null)};
+            });
+            var opts = [];
+            for (var j = 0; j < best.options.length; j++) {
+                opts.push({v: best.options[j].value, t: best.options[j].text});
+            }
+            return {
+                status: "found",
+                id: best.id || "", name: best.name || "",
+                className: (best.className || "").toString(),
+                currentValue: best.value,
+                visible: !!(best.offsetParent !== null),
+                hasOnchange: typeof best.onchange === "function",
+                options: opts,
+                reason: "score " + cands[0].sc,
+                candidates: candInfo,
+            };
+        }''')
+        target_loc = self.page.locator("select[data-ps-length-target]")
+
+        if target.get("status") != "found":
+            if signals:
+                signals.log.emit("WARN",
+                    "  未找到分页下拉框（JS 定位失败）")
+            return
+
+        if signals:
+            cands = target.get("candidates") or []
+            cand_str = " | ".join(
+                f"{c.get('id') or '(无id)'}={c.get('value')}"
+                f"(分{c.get('score')},"
+                f"{'可见' if c.get('visible') else '隐藏'})"
+                for c in cands)
+            signals.log.emit("DEBUG",
+                f"  候选下拉框: {cand_str}")
+
+        if target.get("currentValue") == "200":
+            if signals:
+                signals.log.emit("INFO",
+                    "  每页已是 200 条，等待数据稳定...")
+            await self._wait_for_results_stable(signals, label="已是200")
+            return
+
+        if signals:
+            signals.log.emit("INFO",
+                f"  切换每页条数: {target.get('currentValue')} → 200 "
+                f"(id={target.get('id') or '(无id)'}, "
+                f"{target.get('reason')}, "
+                f"visible={target.get('visible')}, "
+                f"onchange={target.get('hasOnchange')})")
+
+        async def _wait_change():
+            return await self._wait_for_results_stable(
+                signals, label="切换200", max_wait=15.0,
+                min_change_from=old_count)
+
+        # ── 方式A: Playwright select_option（原生事件）──
+        switched = False
         try:
-            all_selects = await self.page.locator("select").all()
-            for loc in all_selects:
-                try:
-                    options = await loc.locator("option").all()
-                    vals = []
-                    for opt in options:
-                        try:
-                            v_text = (await opt.text_content()).strip()
-                            v_num = int(v_text) if v_text.isdigit() else 0
-                            if v_num > 0:
-                                vals.append(v_num)
-                        except Exception:
-                            continue
-                    # 包含 200 就是分页下拉框
-                    if 200 not in vals:
-                        continue
-
-                    # 检查是否需要切换
-                    need_switch = True
-                    try:
-                        current_val = await loc.input_value()
-                        if current_val == "200":
-                            need_switch = False
-                    except Exception:
-                        pass
-
-                    if not need_switch:
-                        if signals:
-                            signals.log.emit("INFO",
-                                "  每页已是 200 条，等待数据稳定...")
-                        stable_count = await self._wait_for_results_stable(
-                            signals, label="已是200")
-                        if signals:
-                            signals.log.emit("INFO",
-                                f"  数据已稳定: {stable_count} 行")
-                        return
-
-                    # 切换前先记录旧行数，用于判断是否真的刷新了
-                    old_count = await self._count_result_rows()
-
-                    await loc.select_option(value="200")
-                    if signals:
-                        signals.log.emit("INFO", "  切换每页条数: 200 条")
-
-                    # 等待 JSF AJAX 完成
-                    try:
-                        await self.page.wait_for_load_state(
-                            "networkidle", timeout=15000)
-                    except Exception:
-                        await asyncio.sleep(3)
-
-                    # 等待数据稳定
-                    stable_count = await self._wait_for_results_stable(
-                        signals, label="切换200")
-
-                    if signals:
-                        signals.log.emit("INFO",
-                            f"  页面刷新完成: {old_count} → "
-                            f"{stable_count} 行")
-                    return
-
-                except Exception:
-                    continue
-
+            await target_loc.select_option(
+                value="200", force=True, no_wait_after=True, timeout=8000)
+            switched = True
+        except Exception as e:
             if signals:
-                signals.log.emit("WARN", "  未找到包含200的分页下拉框")
+                signals.log.emit("WARN",
+                    f"  select_option 失败({str(e)[:80]})，尝试 JS 方式...")
+
+        if not switched:
+            # ── 方式B: 纯 JS 改值 + onchange + 派发 change ──
+            try:
+                await self.page.evaluate('''() => {
+                    var sel = document.querySelector(
+                        "select[data-ps-length-target]");
+                    if (!sel) return;
+                    sel.value = "200";
+                    if (typeof sel.onchange === "function") sel.onchange();
+                    sel.dispatchEvent(new Event("change",
+                        {bubbles: true, cancelable: true}));
+                }''')
+            except Exception:
+                pass
+
+        # ── 3. 等待行数真正变化并稳定 ─────────────────────────────
+        stable_count = await _wait_change()
+
+        if stable_count > old_count:
+            if signals:
+                signals.log.emit("INFO",
+                    f"  页面刷新完成: {old_count} → {stable_count} 行")
+            return
+
+        # 变化失败：可能页面整体刷新导致选择被重置，用 JS 再应用一次
+        if signals:
+            signals.log.emit("WARN",
+                f"  切换后行数未增加（{old_count} → {stable_count}），"
+                f"再用 JS 应用一次...")
+        try:
+            await self.page.evaluate('''() => {
+                // 与定位阶段相同的评分逻辑，选出真正控制结果列表的下拉框
+                function has200(s) {
+                    for (var j = 0; j < s.options.length; j++) {
+                        if (s.options[j].value === "200") return true;
+                    }
+                    return false;
+                }
+                function score(s) {
+                    var id = (s.id || "").toLowerCase();
+                    var name = (s.name || "").toLowerCase();
+                    var sc = 0;
+                    if (id.indexOf("perpage") !== -1 || name.indexOf("perpage") !== -1) sc += 100;
+                    if (id.indexOf("pagesize") !== -1) sc += 90;
+                    if (id.indexOf("rowsperpage") !== -1) sc += 90;
+                    if (id.indexOf("itemsperpage") !== -1) sc += 90;
+                    if (id.indexOf("resultlist") !== -1) sc += 50;
+                    if (id.indexOf("lengthoption") !== -1) sc += 10;
+                    if (id.indexOf("length") !== -1) sc += 10;
+                    if (s.offsetParent !== null) sc += 20;
+                    return sc;
+                }
+                var allSelects = document.querySelectorAll("select");
+                var best = null, bestSc = -1;
+                for (var i = 0; i < allSelects.length; i++) {
+                    var s = allSelects[i];
+                    if (!has200(s)) continue;
+                    var sc = score(s);
+                    if (sc > bestSc) { best = s; bestSc = sc; }
+                }
+                if (!best) return;
+                best.value = "200";
+                if (typeof best.onchange === "function") best.onchange();
+                best.dispatchEvent(new Event("change",
+                    {bubbles: true, cancelable: true}));
+            }''')
         except Exception:
-            if signals:
-                signals.log.emit("WARN", "  未找到分页下拉框")
+            pass
+        stable_count = await _wait_change()
+        if signals:
+            signals.log.emit("INFO",
+                f"  二次应用后: {stable_count} 行")
+
+        if stable_count <= old_count:
+            # ── 4. 仍失败：导出 DOM 诊断信息 ──
+            try:
+                diag = await self.page.evaluate('''() => {
+                    var out = [];
+                    var all = document.querySelectorAll("select");
+                    for (var i = 0; i < all.length; i++) {
+                        var s = all[i];
+                        out.push({
+                            id: s.id || "", name: s.name || "",
+                            className: (s.className || "").toString(),
+                            value: s.value,
+                            visible: !!(s.offsetParent !== null),
+                            hasOnchange: typeof s.onchange === "function",
+                            options: Array.from(s.options).map(
+                                function(o) {
+                                    return {v: o.value, t: o.text};
+                                }),
+                        });
+                    }
+                    return out;
+                }''')
+                import json as _json
+                from pathlib import Path
+                dump_path = (Path(__file__).resolve().parent.parent.parent
+                             / "tools" / "debug_select_dom.json")
+                dump_path.write_text(
+                    _json.dumps(diag, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+                if signals:
+                    signals.log.emit("WARN",
+                        f"  已导出下拉框 DOM 到 {dump_path}，请查看")
+            except Exception:
+                pass
 
     # ── DOM 稳定性轮询 ─────────────────────────────────────────────
 
@@ -788,26 +948,50 @@ class PatentscopeScraper:
     async def _wait_for_results_stable(self, signals=None,
                                         label: str = "",
                                         max_wait: float = 12.0,
-                                        poll_interval: float = 0.6) -> int:
+                                        poll_interval: float = 0.6,
+                                        min_change_from: int | None = None) -> int:
         """轮询 DOM 直到结果行数稳定。
 
         每 poll_interval 秒检查一次行数，连续 2 次相同即认为稳定。
         最长等待 max_wait 秒，超时返回当前行数。
+
+        min_change_from: 若传入（切换每页条数前的旧行数），会先等待行数
+            真正发生变化（!= 旧值）再进入稳定性判定，避免"切换事件尚未生效
+            （AJAX 刷新延迟）时旧行数连续两次相同被误判为稳定"的问题。
 
         同时缓存总结果数到 _total_from_page_text。
         """
         prev_count = -1
         stable_hits = 0
         max_polls = int(max_wait / poll_interval)
+        # 切换场景下：先等行数变化，变化前不做稳定性判定
+        changed = min_change_from is None
 
         for attempt in range(max_polls):
             await asyncio.sleep(poll_interval)
 
             count = await self._count_result_rows()
             if count == 0:
+                # 刷新期间表格可能暂时清空（JSF AJAX 重建 DOM）
                 prev_count = -1
                 stable_hits = 0
                 continue
+
+            # 切换场景：等待行数真正变化
+            if not changed:
+                if count != min_change_from:
+                    changed = True
+                    if signals:
+                        signals.log.emit("DEBUG",
+                            f"  _wait_stable{label}: 行数已变化 "
+                            f"{min_change_from} → {count}")
+                else:
+                    if signals and attempt == 0:
+                        signals.log.emit("DEBUG",
+                            f"  _wait_stable{label}: 等待行数变化"
+                            f"（当前仍为 {count} 行）...")
+                    prev_count = count
+                    continue
 
             # 同时尝试提取总结果数（best-effort）
             if self._total_from_page_text <= 0:
@@ -836,7 +1020,8 @@ class PatentscopeScraper:
         if signals:
             signals.log.emit("DEBUG",
                 f"  _wait_stable{label}: 超时 ({max_wait}s)，"
-                f" 最后行数={prev_count}")
+                f" 最后行数={prev_count}"
+                + ("（行数从未变化，切换可能未生效）" if not changed else ""))
         return max(prev_count, 0)
 
     async def _fill_and_submit(self, query: str):

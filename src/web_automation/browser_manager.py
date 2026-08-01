@@ -45,15 +45,27 @@ class BrowserManager:
 
         if BrowserManager._browser is not None:
             try:
-                page = await BrowserManager._context.new_page()
-                page.set_default_timeout(60000)
-                return BrowserManager._context, page
+                return await self._get_or_create_page()
             except Exception:
                 await self._cleanup()
                 await asyncio.sleep(1)
 
-        await self._start_browser()
-        page = await BrowserManager._context.new_page()
+        return await self._start_browser()
+
+    async def _get_or_create_page(self) -> Tuple:
+        """安全获取页面：Firefox 可能自动打开多余标签页，先清理再使用。"""
+        pages = BrowserManager._context.pages
+        # 关闭多余的标签页（Firefox 可能会自动打开欢迎页、恢复页等）
+        if len(pages) > 1:
+            for p in pages[1:]:
+                try:
+                    await p.close()
+                except Exception:
+                    pass
+        if pages:
+            page = pages[0]
+        else:
+            page = await BrowserManager._context.new_page()
         page.set_default_timeout(60000)
         return BrowserManager._context, page
 
@@ -63,8 +75,9 @@ class BrowserManager:
                 return await self.launch()
             except Exception as e:
                 if attempt < max_retries:
-                    print(f"连接失败(第{attempt+1}次), 重试... {e}")
-                    await asyncio.sleep(2)
+                    delay = 2 * (2 ** attempt)  # 2s, 4s, 8s progressive backoff
+                    print(f"连接失败(第{attempt+1}次), {delay}s后重试... {e}")
+                    await asyncio.sleep(delay)
                 else:
                     raise
 
@@ -273,7 +286,10 @@ class BrowserManager:
 
     @classmethod
     async def _check_cooldown(cls):
-        """如果处于冷却期，阻塞等待冷却结束再继续"""
+        """如果处于冷却期，等待冷却结束再继续。
+
+        将长等待拆分为 10s 块，允许外部通过 cancel_cooldown() 中断。
+        """
         if not cls._is_in_cooldown():
             return
         remain = cls._cooldown_until - time.time()
@@ -281,17 +297,36 @@ class BrowserManager:
             cls._cooldown_until = 0.0
             cls._channels_failed_403.clear()
             cls._channel_index = 0
+            cls._cancel_cooldown = False
             print("[BrowserManager] ✅ 冷却结束，重置浏览器通道")
             return
 
         mins = remain / 60
         print(f"[BrowserManager] 🕐 处于冷却期（剩余 {mins:.1f} 分钟），"
-              f"等待中...")
-        await asyncio.sleep(remain + 2)  # 多等2秒确保冷却完全结束
-        cls._cooldown_until = 0.0
-        cls._channels_failed_403.clear()
-        cls._channel_index = 0
-        print("[BrowserManager] ✅ 冷却结束，重置浏览器通道，继续工作")
+              f"等待中...（可手动停止）")
+
+        # 拆成 10 秒一块，允许中断
+        while remain > 0 and not cls._cancel_cooldown:
+            chunk = min(10, remain)
+            await asyncio.sleep(chunk)
+            remain = cls._cooldown_until - time.time()
+
+        cls._cancel_cooldown = False
+        if remain <= 0:
+            cls._cooldown_until = 0.0
+            cls._channels_failed_403.clear()
+            cls._channel_index = 0
+            print("[BrowserManager] ✅ 冷却结束，重置浏览器通道，继续工作")
+        else:
+            print("[BrowserManager] ⚠️ 冷却被取消")
+            raise RuntimeError("冷却被用户取消")
+
+    _cancel_cooldown: bool = False
+
+    @classmethod
+    def cancel_cooldown(cls):
+        """取消当前冷却等待（由 stop 按钮触发）"""
+        cls._cancel_cooldown = True
 
     async def _start_browser(self):
         """启动浏览器，支持 Chrome/Edge/Firefox 轮换，或 CDP 连接已打开的浏览器。"""
@@ -306,7 +341,8 @@ class BrowserManager:
             # 先尝试连接已运行的浏览器
             try:
                 BrowserManager._browser = await BrowserManager._playwright.chromium.connect_over_cdp(
-                    f"http://127.0.0.1:{cdp_port}"
+                    f"http://127.0.0.1:{cdp_port}",
+                    timeout=10000,
                 )
                 print(f"[BrowserManager] CDP 已连接: 127.0.0.1:{cdp_port}")
             except Exception:
@@ -319,7 +355,8 @@ class BrowserManager:
                     # 重新连接
                     BrowserManager._playwright = await async_playwright().start()
                     BrowserManager._browser = await BrowserManager._playwright.chromium.connect_over_cdp(
-                        f"http://127.0.0.1:{cdp_port}"
+                        f"http://127.0.0.1:{cdp_port}",
+                        timeout=10000,
                     )
                     print(f"[BrowserManager] CDP 已连接 (自启动): 127.0.0.1:{cdp_port}")
                 except Exception as e2:
@@ -333,10 +370,16 @@ class BrowserManager:
                 BrowserManager._context = ctx[0]
             else:
                 BrowserManager._context = await BrowserManager._browser.new_context()
+            # CDP 模式也可能有多余标签页
+            for p in BrowserManager._context.pages:
+                try:
+                    await p.close()
+                except Exception:
+                    pass
             page = await BrowserManager._context.new_page()
             page.set_default_timeout(60000)
             print("[BrowserManager] CDP 模式就绪（渲染与手动浏览一致）")
-            return
+            return BrowserManager._context, page
 
         # ── 正常启动模式 ──
         BrowserManager._playwright = await async_playwright().start()
@@ -353,7 +396,7 @@ class BrowserManager:
             channel = configured if configured in BrowserManager._CHANNELS else "chrome"
 
         if channel == "firefox":
-            launch_opts = {"headless": False}
+            launch_opts = {"headless": False, "timeout": 30000}
             if proxy:
                 launch_opts["proxy"] = {"server": proxy}
             BrowserManager._browser = await BrowserManager._playwright.firefox.launch(**launch_opts)
@@ -371,6 +414,7 @@ class BrowserManager:
                 channel=channel,
                 headless=False,
                 args=args,
+                timeout=30000,
             )
 
         ctx_opts = {
@@ -379,4 +423,13 @@ class BrowserManager:
             "timezone_id": "Asia/Shanghai",
         }
         BrowserManager._context = await BrowserManager._browser.new_context(**ctx_opts)
+        # Firefox 可能自动打开多余标签页（欢迎页、恢复会话等），先清理
+        for p in BrowserManager._context.pages:
+            try:
+                await p.close()
+            except Exception:
+                pass
+        page = await BrowserManager._context.new_page()
+        page.set_default_timeout(60000)
         print(f"[BrowserManager] {channel} 已启动")
+        return BrowserManager._context, page
