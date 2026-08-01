@@ -25,9 +25,16 @@ Thumbs.db
 .DS_Store
 
 # Project specific
+data/
+profiles/
 data/db/patent_tool.db
 data/output/reports/
 *.log
+
+# 调试输出（不纳入版本控制）
+debug_*.json
+debug_*.txt
+debug_*.png
 
 # Playwright
 __pycache__/
