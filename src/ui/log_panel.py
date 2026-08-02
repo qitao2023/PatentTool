@@ -99,6 +99,10 @@ class LogPanel(QWidget):
         self.progress_bar.setValue(percent)
         self.status_label.setText(status)
 
+    def clear_log(self):
+        """仅清空日志文本，保留进度状态"""
+        self.log_text.clear()
+
     def reset(self):
         self.progress_bar.setValue(0)
         self.status_label.setText("就绪")

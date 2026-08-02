@@ -145,11 +145,13 @@ class SettingsDialog(QDialog):
 
         self.stop_after_combo = QComboBox()
         self.stop_after_combo.addItem("跑完全程（撰写通知书）", "full")
-        self.stop_after_combo.addItem("AI评分后停止", "score")
+        self.stop_after_combo.addItem("Claims广筛评分后停止", "score")
         self.stop_after_combo.addItem("下载对比文件后停止", "download")
-        self.stop_after_combo.addItem("粗筛摘要后停止", "screen")
-        self.stop_after_combo.addItem("搜索摘要后停止", "abstracts")
-        self.stop_after_combo.setToolTip("流程运行到选定步骤后自动停止")
+        self.stop_after_combo.addItem("下载前停止（结果截断后）", "screen")
+        self.stop_after_combo.addItem("检索命中后停止（最省时，不下载）", "abstracts")
+        self.stop_after_combo.setToolTip(
+            "流程运行到选定步骤后自动停止：\n"
+            "  检索命中后（不下载） / 下载前（截断选择后） / 下载后 / Claims广筛评分后 / 全程")
         search_form.addRow("流程断点:", self.stop_after_combo)
 
         self.prefer_cn_family_cb = QCheckBox("优先使用中国同族专利（下载全文时自动替换非CN专利）")
@@ -167,6 +169,15 @@ class SettingsDialog(QDialog):
             "  PATENTSCOPE → 搜索/下载全走 WIPO（原行为）\n"
             "  Google      → 搜索/下载全走 Google Patents（免浏览器，单检索式上限100条）")
         search_form.addRow("检索引擎:", self.search_source_combo)
+
+        self.download_concurrency_spin = QSpinBox()
+        self.download_concurrency_spin.setRange(1, 50)
+        self.download_concurrency_spin.setValue(20)
+        self.download_concurrency_spin.setToolTip(
+            "下载全文的并行数（主流程 + 批量测试共用）\n"
+            "Google 引擎: 15-20（20=本机并行上限，超过只排队）\n"
+            "WIPO 引擎: 自动保守为 1（高并发易403）")
+        search_form.addRow("下载并发数:", self.download_concurrency_spin)
 
         params_layout.addWidget(search_group)
         params_layout.addStretch(1)
@@ -233,6 +244,9 @@ class SettingsDialog(QDialog):
         idx = self.search_source_combo.findData(src)
         if idx >= 0:
             self.search_source_combo.setCurrentIndex(idx)
+        # 下载并发数
+        self.download_concurrency_spin.setValue(
+            self.settings.search_download_concurrency)
         # 流程断点
         stop = self.settings.search_stop_after
         idx = self.stop_after_combo.findData(stop)
@@ -388,6 +402,7 @@ class SettingsDialog(QDialog):
             "stop_after": self.stop_after_combo.currentData(),
             "prefer_cn_family": self.prefer_cn_family_cb.isChecked(),
             "search_source": self.search_source_combo.currentData(),
+            "download_concurrency": self.download_concurrency_spin.value(),
         }
 
         # 写检索参数到 settings.yaml
@@ -414,6 +429,16 @@ class SettingsDialog(QDialog):
                             r'(search:\s*\n)',
                             f'\\1  {key}: {val_str}\n',
                             content)
+                # 下载并发（整数）
+                _dl = params["download_concurrency"]
+                if re.search(r'download_concurrency:\s*\d+', content):
+                    content = re.sub(
+                        r'download_concurrency:\s*\d+',
+                        f'download_concurrency: {_dl}', content)
+                else:
+                    content = re.sub(
+                        r'(search:\s*\n)',
+                        f'\\1  download_concurrency: {_dl}\n', content)
                 yaml_path.write_text(content, encoding="utf-8")
                 # 强制刷新 Settings 内存缓存
                 import yaml as _yaml
@@ -635,18 +660,17 @@ class PromptEditorDialog(QDialog):
 class TestDialog(QDialog):
     """测试工具对话框 — 检索式测试、公布号查询等"""
 
-    test_abstract = Signal(str, int)   # query, max_results
-    test_detail = Signal(str, int)     # query, max_results
-    test_pagesize = Signal(str, int)   # query, max_results (切换100条测试)
-    lookup_patent = Signal(str)        # doc_id
+    lookup_patent = Signal(str)        # doc_id（公布号直查，保留）
     batch_test = Signal(list, str, int, int)  # queries, test_name, max_results, concurrency
 
     _HISTORY_FILE = Path(__file__).parent.parent.parent / "data" / "lookup_history.json"
     _MAX_HISTORY = 20
 
-    def __init__(self, parent=None, settings: "Settings" = None):
+    def __init__(self, parent=None, settings: "Settings" = None,
+                 max_results: int | None = None):
         super().__init__(parent)
         self._settings = settings
+        self._panel_max_results = max_results  # 主面板"每式结果数"（批量测试共用，不单独存）
         self.setWindowTitle("测试工具")
         self.setMinimumWidth(580)
         self._setup_ui()
@@ -656,45 +680,7 @@ class TestDialog(QDialog):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # ── 检索式测试 ──
-        search_group = QGroupBox("检索式测试")
-        search_layout = QVBoxLayout(search_group)
-
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("检索式:"))
-        self.test_query_edit = QLineEdit()
-        self.test_query_edit.setPlaceholderText("输入 PATENTSCOPE 检索式...")
-        self.test_query_edit.setText("掉电")
-        row1.addWidget(self.test_query_edit, 1)
-        search_layout.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("数量上限:"))
-        self.test_count_spin = QSpinBox()
-        self.test_count_spin.setRange(1, 500)
-        self.test_count_spin.setValue(10)
-        row2.addWidget(self.test_count_spin)
-        row2.addStretch(1)
-
-        self.test_abstract_btn = QPushButton("🔍 测试摘要")
-        self.test_abstract_btn.setToolTip("仅搜索摘要（快，验证检索式）")
-        self.test_abstract_btn.clicked.connect(self._on_test_abstract)
-        row2.addWidget(self.test_abstract_btn)
-
-        self.test_detail_btn = QPushButton("📄 测试详情")
-        self.test_detail_btn.setToolTip("搜索摘要 + 抓取全文详情")
-        self.test_detail_btn.clicked.connect(self._on_test_detail)
-        row2.addWidget(self.test_detail_btn)
-
-        self.test_pagesize_btn = QPushButton("📐 测试200条")
-        self.test_pagesize_btn.setToolTip("测试切换每页200条是否生效")
-        self.test_pagesize_btn.clicked.connect(self._on_test_pagesize)
-        row2.addWidget(self.test_pagesize_btn)
-        search_layout.addLayout(row2)
-
-        layout.addWidget(search_group)
-
-        # ── 批量检索测试 ──
+        # ── 批量检索测试（替代原单条检索式测试）──
         batch_group = QGroupBox("📋 批量检索测试")
         batch_layout = QVBoxLayout(batch_group)
 
@@ -729,23 +715,10 @@ class TestDialog(QDialog):
         self.batch_query_list.setAlternatingRowColors(True)
         batch_layout.addWidget(self.batch_query_list)
 
-        # 参数行
-        param_row = QHBoxLayout()
-        param_row.addWidget(QLabel("每式结果上限:"))
-        self.batch_count_spin = QSpinBox()
-        self.batch_count_spin.setRange(1, 100)
-        self.batch_count_spin.setValue(100)
-        param_row.addWidget(self.batch_count_spin)
-        param_row.addSpacing(20)
-        param_row.addWidget(QLabel("下载并发:"))
-        self.batch_concurrency_spin = QSpinBox()
-        self.batch_concurrency_spin.setRange(1, 20)
-        self.batch_concurrency_spin.setValue(1)
-        self.batch_concurrency_spin.setToolTip(
-            "并行下载数\nGoogle引擎: 15-20（20=本机并行上限，超过只排队）\nWIPO引擎: 建议 1-3（高并发易403）")
-        param_row.addWidget(self.batch_concurrency_spin)
-        param_row.addStretch(1)
-        batch_layout.addLayout(param_row)
+        # 参数跟随设置：每式结果数 = 主面板参数，并发 = ⚙设置 下载并发数
+        self.batch_params_hint = QLabel()
+        self.batch_params_hint.setStyleSheet("color:#718096;")
+        batch_layout.addWidget(self.batch_params_hint)
 
         # 操作按钮
         batch_btn_row = QHBoxLayout()
@@ -830,21 +803,6 @@ class TestDialog(QDialog):
             pass
 
     # ── 按钮事件 ────────────────────────────────────────────────────────
-
-    def _on_test_abstract(self):
-        q = self.test_query_edit.text().strip()
-        if q:
-            self.test_abstract.emit(q, self.test_count_spin.value())
-
-    def _on_test_detail(self):
-        q = self.test_query_edit.text().strip()
-        if q:
-            self.test_detail.emit(q, self.test_count_spin.value())
-
-    def _on_test_pagesize(self):
-        q = self.test_query_edit.text().strip()
-        if q:
-            self.test_pagesize.emit(q, self.test_count_spin.value())
 
     def _on_lookup(self):
         doc_id = self.lookup_combo.currentText().strip()
@@ -978,8 +936,12 @@ class TestDialog(QDialog):
             QMessageBox.warning(self, "无检索式", "请先添加至少一个检索式。")
             return
         test_name = self.batch_name_edit.text().strip()
-        max_results = self.batch_count_spin.value()
-        concurrency = self.batch_concurrency_spin.value()
+        # 每式结果数 = 主面板参数；并发 = 设置 search.download_concurrency
+        max_results = (self._panel_max_results
+                       or (self._settings.patentscope_max_results
+                           if self._settings else 100))
+        concurrency = (self._settings.search_download_concurrency
+                       if self._settings else 20)
         self.batch_test.emit(queries, test_name, max_results, concurrency)
 
     def _on_batch_open_output(self):
@@ -992,25 +954,19 @@ class TestDialog(QDialog):
         """从配置文件加载上次保存的默认值"""
         if not self._settings:
             return
-        # 单条检索式测试
-        default_query = self._settings.test_default_query
-        if default_query:
-            self.test_query_edit.setText(default_query)
-        self.test_count_spin.setValue(self._settings.test_default_count)
-        # 批量检索式测试
-        self.batch_count_spin.setValue(self._settings.test_batch_default_count)
-        # 并发默认：Google 引擎可高并发（15），WIPO 保守（配置值，通常 1）
-        if self._settings.search_source == "google":
-            self.batch_concurrency_spin.setValue(20)
-        else:
-            self.batch_concurrency_spin.setValue(
-                self._settings.test_batch_default_concurrency)
         # 批量检索式列表
         default_queries = self._settings.test_batch_default_queries
         if default_queries:
             self.batch_query_list.clear()
             for q in default_queries:
                 self.batch_query_list.addItem(str(q))
+        # 参数提示：跟随主面板/设置
+        max_results = (self._panel_max_results
+                       or self._settings.patentscope_max_results)
+        dl_conc = self._settings.search_download_concurrency
+        self.batch_params_hint.setText(
+            f"参数跟随设置：每式结果数 = 主面板 {max_results} 条/检索式，"
+            f"下载并发 = {dl_conc}（在 ⚙设置 中修改）")
 
     def _on_save_defaults(self):
         """将当前界面所有参数保存为默认值"""
@@ -1018,24 +974,15 @@ class TestDialog(QDialog):
             QMessageBox.warning(self, "无法保存", "设置对象不可用，请通过主窗口打开测试工具。")
             return
 
-        query = self.test_query_edit.text().strip()
-        count = self.test_count_spin.value()
-        batch_count = self.batch_count_spin.value()
-        batch_concurrency = self.batch_concurrency_spin.value()
         batch_queries = [
             self.batch_query_list.item(i).text()
             for i in range(self.batch_query_list.count())
         ]
 
         try:
-            self._settings.save_test_defaults(
-                query, count, batch_count, batch_concurrency, batch_queries)
+            self._settings.save_test_defaults(batch_queries)
             QMessageBox.information(self, "已保存",
                 f"当前测试参数已设为默认值：\n"
-                f"  检索式: {query}\n"
-                f"  数量上限: {count}\n"
-                f"  批量每式上限: {batch_count}\n"
-                f"  批量并发: {batch_concurrency}\n"
                 f"  批量检索式: {len(batch_queries)} 个\n\n"
                 f"下次打开测试工具将自动加载这些值。")
         except Exception as e:

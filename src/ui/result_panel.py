@@ -30,9 +30,9 @@ class ResultPanel(QWidget):
         layout.addLayout(info_row)
 
         # 结果表格
-        self.summary_table = QTableWidget(0, 4)
+        self.summary_table = QTableWidget(0, 5)
         self.summary_table.setHorizontalHeaderLabels([
-            "相关度", "公布号", "标题", "申请人"
+            "相关度", "公布号", "标题", "申请人", "相关理由"
         ])
         self.summary_table.horizontalHeader().setStretchLastSection(True)
         self.summary_table.horizontalHeader().setSectionResizeMode(
@@ -62,7 +62,7 @@ class ResultPanel(QWidget):
         self.summary_table.cellClicked.connect(self._on_cell_clicked)
 
     def _populate_table(self, table: QTableWidget, results: list):
-        """填充表格数据 — 列: 相关度 | 公布号 | 标题 | 申请人"""
+        """填充表格数据 — 列: 相关度 | 公布号 | 标题 | 申请人 | 相关理由"""
         table.setRowCount(len(results))
         for row_idx, r in enumerate(results):
             score = r.get("fulltext_score") or r.get("relevance_score") or ""
@@ -71,6 +71,12 @@ class ResultPanel(QWidget):
             table.setItem(row_idx, 1, QTableWidgetItem(r.get("publication_number", "")))
             table.setItem(row_idx, 2, QTableWidgetItem(r.get("title", "")))
             table.setItem(row_idx, 3, QTableWidgetItem(r.get("applicant", "")))
+            reason = (r.get("fulltext_reason")
+                      or r.get("relevance_reason")
+                      or r.get("best_reason") or "")
+            reason_item = QTableWidgetItem(reason)
+            reason_item.setToolTip(reason)
+            table.setItem(row_idx, 4, reason_item)
         table.resizeColumnsToContents()
 
     def _on_cell_clicked(self, row: int, col: int):

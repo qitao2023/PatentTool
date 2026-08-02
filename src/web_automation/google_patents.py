@@ -32,6 +32,8 @@ from typing import Optional
 
 from lxml import html as lxml_html
 
+from src.utils.patent_extract import extract_embodiments
+
 
 GOOGLE_PATENTS_BASE = "https://patents.google.com/patent/{pub}"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -413,6 +415,7 @@ def fetch_patent_text(pub: str, proxy: str | None = None,
             "abstract": abstract[:5000],
             "claims": claims[:10000],
             "description": description[:20000],
+            "embodiments": extract_embodiments(description),  # 具体实施方式（说明书最后大节）
             "ipc": "",
             "applicant": "",
             "inventor": "",

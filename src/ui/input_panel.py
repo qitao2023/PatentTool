@@ -17,12 +17,13 @@ class InputPanel(QWidget):
     # 信号
     start_clicked = Signal()
     stop_clicked = Signal()
-    reset_clicked = Signal()
+    clear_log_clicked = Signal()
     file_selected = Signal(str)
     test_clicked = Signal()                      # 打开测试工具对话框
     settings_clicked = Signal()
     test_clicked = Signal()                     # 打开测试工具对话框
     open_existing = Signal(str)                 # 打开已有结果
+    final_review_clicked = Signal()             # 终选评述（从历史最佳中挑最终几篇）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -129,9 +130,16 @@ class InputPanel(QWidget):
         self.stop_btn.clicked.connect(self.stop_clicked.emit)
         btn_row.addWidget(self.stop_btn)
 
-        self.reset_btn = QPushButton("↻ 重置")
-        self.reset_btn.clicked.connect(self.reset_clicked.emit)
-        btn_row.addWidget(self.reset_btn)
+        self.clear_log_btn = QPushButton("🧹 清空日志")
+        self.clear_log_btn.setToolTip("清空日志面板内容，不影响当前分析状态")
+        self.clear_log_btn.clicked.connect(self.clear_log_clicked.emit)
+        btn_row.addWidget(self.clear_log_btn)
+
+        self.final_review_btn = QPushButton("🎯 终选评述")
+        self.final_review_btn.setToolTip(
+            "从历史最佳对比文件中挑最终几篇做详细评述（需先跑过开始分析积累记录）")
+        self.final_review_btn.clicked.connect(self.final_review_clicked.emit)
+        btn_row.addWidget(self.final_review_btn)
 
         self.test_btn = QPushButton("🧪 测试")
         self.test_btn.setToolTip("打开测试工具（检索式测试、公布号直查）")
@@ -213,6 +221,7 @@ class InputPanel(QWidget):
         self.max_results_spin.setEnabled(not running)
         self.fetch_detail_spin.setEnabled(not running)
         self.test_btn.setEnabled(not running)
+        self.final_review_btn.setEnabled(not running)
 
     def reset(self):
         self.path_edit.clear()

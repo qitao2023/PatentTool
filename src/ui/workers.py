@@ -596,32 +596,38 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 total_abstracts = len(unique_abstracts)
 
         # ================================================================
-        # 阶段2: 超过上限时 AI 快速粗筛（一批搞定，只返回公布号列表）
+        # 阶段2: 结果超过下载上限时降量
+        #   策略: 说明书引用专利优先保留（申请人在说明书中明确引用的
+        #         对比文件，相关度最高，不能被截断丢掉）
+        #        + 剩余名额按检索式轮询配额填满
+        #         （unique_abstracts 已按轮询合并，截取前 N 即每式等额
+        #          配额：20式×100→选1000=每式约50，不足的式子让出名额）
+        #   不做 AI 摘要粗筛：全量下载后再用 Claims 广筛，避免摘要漏检
         # ================================================================
         self.signals.log.emit("INFO", "=" * 40)
         if total_abstracts > max_detail:
+            cited = [a for a in unique_abstracts
+                     if str(a.get("source_query", "")).startswith("说明书引用")]
+            search_part = [a for a in unique_abstracts
+                           if not str(a.get("source_query", "")).startswith("说明书引用")]
+            keep_cited = cited[:max_detail]
+            budget = max_detail - len(keep_cited)
+            if budget > 0:
+                to_fetch = keep_cited + search_part[:budget]
+            else:
+                to_fetch = keep_cited
             self.signals.log.emit("INFO",
-                f"阶段2: 结果数 {total_abstracts} > 下载上限 {max_detail}，"
-                f"AI 快速粗筛...")
-            self.signals.progress.emit(25, "阶段2: AI 快速粗筛（~30秒）...")
-
-            screener = PatentScreener(self.settings)
-            screener._get_client().set_log_dir(
-                str(output_dir / "ai_logs"))
-            to_fetch = screener.quick_screen(
-                self.patent_doc, unique_abstracts,
-                top_n=max_detail, signals=self.signals)
-
-            self.signals.log.emit("SUCCESS",
-                f"阶段2 完成: {total_abstracts} → {len(to_fetch)} 篇")
+                f"阶段2: 结果数 {total_abstracts} > 下载上限 {max_detail}，降量选取 "
+                f"{len(to_fetch)} 篇 = 引用专利优先 {len(keep_cited)} "
+                f"+ 检索式轮询配额 {len(to_fetch) - len(keep_cited)}")
         else:
             self.signals.log.emit("INFO",
                 f"阶段2: 结果数 {total_abstracts} ≤ 上限 {max_detail}，全部下载全文")
             to_fetch = unique_abstracts
 
-        # ── 断点：粗筛后 ──
+        # ── 断点：截断选择后（下载前）──
         if self.stop_after == "screen":
-            self._stop_here("AI粗筛", [to_fetch])
+            self._stop_here("截断选择后", [to_fetch])
             return
 
         # ================================================================
@@ -639,8 +645,10 @@ class PatentscopeSearchAndFetchWorker(QThread):
         human2 = HumanBehavior(self.settings)
         scraper2 = PatentscopeScraper(page2, self.settings, human2)
 
-        # 下载并发：google 引擎高并发（20），wipo 保守（1，防403）
-        dl_conc = (20 if self.settings.search_source == "google" else 1)
+        # 下载并发：用设置值 search.download_concurrency；wipo 保守防403
+        dl_conc = self.settings.search_download_concurrency
+        if self.settings.search_source == "wipo":
+            dl_conc = min(dl_conc, 1)
         await scraper2.fetch_details_parallel(
             to_fetch, str(details_dir), concurrency=dl_conc, signals=self.signals)
 
@@ -697,20 +705,68 @@ class PatentscopeSearchAndFetchWorker(QThread):
             return
 
         # ================================================================
-        # 阶段4: AI 全文精选（全部评分排序）
+        # 阶段4: 全量 Claims 广筛（只发权利要求书，分批评分排序）
         # ================================================================
         self.signals.log.emit("INFO", "=" * 40)
-        self.signals.log.emit("INFO", "阶段4: AI 全文评分...")
-        self.signals.progress.emit(45, "阶段4: AI 全文评分...")
+        self.signals.log.emit("INFO", "阶段4: Claims 广筛...")
+        self.signals.progress.emit(45, "阶段4: Claims 广筛...")
+
+        # 历史记录库：已知对比文件复用历史评分，只对新出现的调 AI
+        history = None
+        _history_base = (Path(self._cache_dir).parent
+                         if self._cache_dir else None)
+        if (_history_base and self.patent_doc
+                and getattr(self.patent_doc, "publication_number", None)):
+            from src.analysis.history import ScreeningHistory
+            history = ScreeningHistory(
+                str(_history_base), self.patent_doc.publication_number)
 
         if self.patent_doc:
             screener2 = PatentScreener(self.settings)
-            screener2._get_client().set_log_dir(
-                str(output_dir / "ai_logs"))
-            all_scored = screener2.screen_fulltext(
-                self.patent_doc, str(details_dir),
-                batch_size=self.settings.analysis_fulltext_batch_size,
-                signals=self.signals)
+            # screen_claims_all 内部按批创建独立 client 并写 ai_logs/batch_NN/
+            all_scored = []
+            if history is not None:
+                # 分区：已有历史评分的直接复用，只对新出现的走广筛
+                new_pubs = set()
+                for f in sorted(Path(details_dir).glob("*.json")):
+                    try:
+                        d = json_module.loads(f.read_text(encoding="utf-8"))
+                        if d.get("fetch_status") != "ok" or not d.get("claims"):
+                            continue
+                        rec = history.get(d.get("publication_number", ""))
+                        if rec and rec.get("best_score", 0) > 0:
+                            d["fulltext_score"] = rec["best_score"]
+                            d["fulltext_reason"] = rec.get(
+                                "best_reason", "历史记录复用")
+                            d["key_features"] = rec.get("key_features", [])
+                            d["_history_reused"] = True
+                            all_scored.append(d)
+                        else:
+                            new_pubs.add(d.get("publication_number", ""))
+                    except Exception:
+                        pass
+                if all_scored:
+                    self.signals.log.emit("INFO",
+                        f"  历史记录复用: {len(all_scored)} 篇已评分，跳过 AI")
+                if new_pubs:
+                    self.signals.log.emit("INFO",
+                        f"  新增对比文件: {len(new_pubs)} 篇，开始 Claims 广筛...")
+                    new_scored = screener2.screen_claims_all(
+                        self.patent_doc, str(details_dir),
+                        signals=self.signals,
+                        log_dir=str(output_dir / "ai_logs"),
+                        only_pubs=new_pubs)
+                    all_scored.extend(new_scored)
+                all_scored.sort(
+                    key=lambda x: x.get("fulltext_score",
+                                        x.get("relevance_score", 0)),
+                    reverse=True)
+            else:
+                # 无历史库（未传 cache_dir）→ 全量广筛
+                all_scored = screener2.screen_claims_all(
+                    self.patent_doc, str(details_dir),
+                    signals=self.signals,
+                    log_dir=str(output_dir / "ai_logs"))
         else:
             # 无本申请信息，加载全部
             import glob as glob_module
@@ -726,6 +782,21 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
         self.signals.log.emit("SUCCESS",
             f"阶段4 完成: 共评分 {len(all_scored)} 篇")
+
+        # ── 写回历史记录库（记录 detail_file + 广筛结果）──
+        if history is not None and all_scored:
+            from src.web_automation.patentscope_scraper import _safe_filename
+            for r in all_scored:
+                pub = r.get("publication_number", "")
+                if pub:
+                    r["_detail_file"] = str(
+                        Path(details_dir) / f"{_safe_filename(pub)}.json")
+            history.merge_screened(all_scored)
+            history.save()
+            reused = sum(1 for r in all_scored if r.get("_history_reused"))
+            self.signals.log.emit("SUCCESS",
+                f"  历史记录库已更新: {history.path.name} "
+                f"({len(all_scored)} 篇, 其中 {reused} 篇历史复用)")
         for i, r in enumerate(all_scored[:10]):
             score = r.get("fulltext_score", r.get("relevance_score", "?"))
             pub = r.get("publication_number", "?")
@@ -748,6 +819,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 "publication_date": r.get("publication_date", ""),
                 "fulltext_score": r.get("fulltext_score", 0),
                 "fulltext_reason": r.get("fulltext_reason", ""),
+                "key_features": r.get("key_features", []),
             })
         stage4_path = output_dir / "03_ai_screened.json"
         self._save_json(stage4_path, {
@@ -776,7 +848,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
             # ── 断点：评分后 ──
             if self.stop_after == "score":
-                self._stop_here("AI评分", [all_scored])
+                self._stop_here("Claims广筛评分", [all_scored])
                 return
 
             self.signals.log.emit("INFO",
@@ -916,6 +988,267 @@ def _extract_cited_patent_numbers(text: str) -> list[str]:
                 results.append(pn)
     return results
 
+
+class FinalReviewWorker(QThread):
+    """终选评述 Worker — 从历史最佳候选池中挑最终 N 篇做详细评述。
+
+    单独手动触发（UI「终选评述」按钮）：
+      1. 加载历史记录库（ScreeningHistory）
+      2. 构建紧凑候选池（best_pool），LLM 挑最终 final_n 篇
+      3. 每篇：有 detailed_review → 复用历史；否则读全文缓存 →
+         _detailed_comparison → 写回历史
+      4. 渲染 06_终选评述.md，发射 comparisons 供后续 OA
+    """
+
+    review_done = Signal(list)       # 终选评述结果 comparisons（含 source_raw 全文）
+    review_markdown = Signal(str)    # 渲染后的 markdown
+
+    def __init__(self, patent_doc, settings, pdf_path: str,
+                 final_n: int | None = None, top_pool: int | None = None,
+                 min_score: int | None = None,
+                 ai_provider: str | None = None, parent=None):
+        super().__init__(parent)
+        self.patent_doc = patent_doc
+        self.settings = settings
+        self.pdf_path = pdf_path
+        self.final_n = (final_n if final_n is not None
+                        else settings.analysis_final_review_n)
+        self.top_pool = (top_pool if top_pool is not None
+                         else settings.analysis_final_pool_top_n)
+        self.min_score = (min_score if min_score is not None
+                          else settings.analysis_final_pool_min_score)
+        self.ai_provider = ai_provider
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            self._run()
+        except Exception as e:
+            self.signals.error.emit(f"终选评述失败: {e}")
+            self.signals.log.emit("ERROR", f"终选评述失败: {e}")
+            self.signals.finished.emit(False, str(e))
+
+    def _run(self):
+        import json as json_module
+        from pathlib import Path
+
+        from src.ai_client import AIClient
+        from src.analysis.comparator import PatentComparator
+        from src.analysis.history import ScreeningHistory
+        from src.analysis.screener import PatentScreener
+        from src.web_automation.patentscope_scraper import _safe_filename
+
+        if not self.pdf_path:
+            self.signals.log.emit("ERROR", "请先选择专利申请 PDF（用于定位历史记录库）")
+            self.signals.finished.emit(False, "缺少 PDF 路径")
+            return
+        pub_num = (self.patent_doc.publication_number or ""
+                   if self.patent_doc else "")
+        if not pub_num:
+            self.signals.log.emit("ERROR", "本申请缺少公布号，无法定位历史记录")
+            self.signals.finished.emit(False, "缺少公布号")
+            return
+
+        history = ScreeningHistory.from_pdf(self.pdf_path, pub_num)
+        pool = history.best_pool(top_n=self.top_pool, min_score=self.min_score)
+        if not pool:
+            self.signals.log.emit("WARN",
+                f"历史记录库为空或没有达标记录（best_score ≥ {self.min_score}）。\n"
+                f"请先运行「开始分析」完成检索+Claims 广筛。")
+            self.signals.finished.emit(True, "无候选")
+            return
+
+        self.signals.log.emit("INFO", "=" * 40)
+        self.signals.log.emit("INFO",
+            f"终选评述: 候选池 {len(pool)} 篇 (best_score≥{self.min_score})，"
+            f"从中选 {self.final_n} 篇做详细评述")
+
+        # ── 候选池紧凑文本 → LLM 终选 ──
+        client = AIClient(self.settings, provider=self.ai_provider)
+        screener = PatentScreener(self.settings, provider=self.ai_provider)
+        patent_summary = screener._build_patent_summary(self.patent_doc)
+
+        lines = []
+        for i, rec in enumerate(pool):
+            kf = "、".join(rec.get("key_features") or [])[:200]
+            lines.append(
+                f"[{i+1}] {rec.get('publication_number','')} | "
+                f"评分:{rec.get('best_score','?')} | "
+                f"{str(rec.get('title',''))[:60]}\n"
+                f"    理由: {str(rec.get('best_reason',''))[:150]}\n"
+                f"    关键特征: {kf}")
+        pool_text = "\n".join(lines)
+
+        user_prompt = f"""## 本申请
+{patent_summary}
+
+## 候选池（{len(pool)} 篇，按历史最佳评分排序）
+{pool_text}
+
+---
+从以上候选池中，选出最合适作为**最接近的现有技术**的恰好 {self.final_n} 篇。
+考虑：
+- 新颖性评述：单篇公开了最多与本申请相同的技术特征
+- 创造性评述：需要至少 1 篇最接近 + 若干篇可组合公开区别特征
+只输出公布号 JSON 数组，不要评分不要理由：
+```json
+["CN117317030B", "WO2019006821A1", ...]
+```"""
+
+        system_prompt = ("你是中国专利审查员。根据候选池中每篇的评分、理由和关键特征，"
+                         "从历史最佳中挑选最终用于评述的对比文件。"
+                         "只输出公布号 JSON 数组，不要其他内容。")
+
+        self.signals.progress.emit(5, "LLM 终选候选...")
+        self.signals.log.emit("INFO", "  LLM 从候选池终选...")
+        try:
+            response = client.chat(
+                system_prompt=system_prompt, user_prompt=user_prompt,
+                max_tokens=4096, temperature=0.3,
+                model=self.settings.ai_screen_model)
+        except Exception as e:
+            self.signals.log.emit("ERROR", f"  LLM 终选失败: {e}")
+            self.signals.finished.emit(False, f"终选失败: {e}")
+            return
+
+        selected_pubs = screener._parse_pub_list(response)
+        pool_pubs = {r.get("publication_number", "") for r in pool}
+        selected_pubs = [p for p in selected_pubs if p in pool_pubs]
+        if not selected_pubs:
+            self.signals.log.emit("WARN",
+                "  LLM 未返回有效公布号，退回候选池前几篇")
+            selected_pubs = [r.get("publication_number", "")
+                             for r in pool[:self.final_n]]
+
+        self.signals.log.emit("SUCCESS",
+            f"  终选 {len(selected_pubs)} 篇: {', '.join(selected_pubs)}")
+
+        # ── 逐篇详细评述：复用历史 or 调 _detailed_comparison ──
+        cache_dir = Path(self.pdf_path).parent / "patent_cache"
+        comparator = PatentComparator(self.settings, provider=self.ai_provider)
+        comp_client = comparator._get_client()
+
+        comparisons = []
+        total = len(selected_pubs)
+        for i, sel_pub in enumerate(selected_pubs):
+            rec = history.get(sel_pub) or {}
+            # 组装 result（元数据 + 全文，供 _detailed_comparison 使用）
+            result = {
+                "publication_number": sel_pub,
+                "title": rec.get("title", ""),
+                "applicant": rec.get("applicant", ""),
+                "ipc": rec.get("ipc", ""),
+                "publication_date": rec.get("publication_date", ""),
+                "claims": "", "description": "", "abstract": "",
+            }
+            detail_file = cache_dir / f"{_safe_filename(sel_pub)}.json"
+            if detail_file.exists():
+                try:
+                    detail = json_module.loads(
+                        detail_file.read_text(encoding="utf-8"))
+                    for k in ("claims", "description", "abstract"):
+                        if detail.get(k):
+                            result[k] = detail[k]
+                except Exception:
+                    pass
+
+            if history.has_detailed_review(sel_pub):
+                self.signals.log.emit("INFO",
+                    f"  [{i+1}/{total}] {sel_pub} 复用历史评述")
+                review = dict(rec["detailed_review"])
+                review.pop("reviewed_at", None)
+                review["relevance_score"] = rec.get(
+                    "best_score", review.get("relevance_score", 0))
+                review["source_raw"] = result
+                comparisons.append(review)
+            else:
+                self.signals.log.emit("INFO",
+                    f"  [{i+1}/{total}] {sel_pub} 详细评述...")
+                self.signals.progress.emit(
+                    15 + int((i + 1) / total * 55), f"评述 {sel_pub}")
+                detail = comparator._detailed_comparison(
+                    comp_client, self.patent_doc, result)
+                if detail:
+                    detail["relevance_score"] = rec.get(
+                        "best_score", detail.get("relevance_score", 0))
+                    comparisons.append(detail)
+                    # 只存评述字段，不含全文，保持历史库轻量
+                    history.set_detailed_review(sel_pub, {
+                        k: detail.get(k) for k in (
+                            "publication_number", "relevance_score",
+                            "novelty_impact", "inventive_step_impact",
+                            "key_features_same", "key_features_different",
+                            "conclusion")})
+                else:
+                    self.signals.log.emit("WARN",
+                        f"    {sel_pub} 详细评述失败")
+
+        history.save()
+        self.signals.log.emit("SUCCESS",
+            f"终选评述完成: {len(comparisons)} 篇，历史记录库已更新")
+
+        # ── 渲染 markdown 报告并落盘 ──
+        md = self._render_markdown(comparisons)
+        out_md = Path(self.pdf_path).parent / "06_终选评述.md"
+        try:
+            out_md.write_text(md, encoding="utf-8")
+            self.signals.log.emit("INFO", f"  已保存: {out_md}")
+        except Exception as e:
+            self.signals.log.emit("WARN", f"  报告保存失败: {e}")
+
+        self.review_markdown.emit(md)
+        self.review_done.emit(comparisons)
+        self.signals.progress.emit(100, "终选评述完成")
+        self.signals.finished.emit(True, f"终选评述 {len(comparisons)} 篇")
+
+    def _render_markdown(self, comparisons: list[dict]) -> str:
+        """把终选评述渲染成 Markdown（供报告面板 + 落盘）"""
+        lines = ["# 终选评述（从历史最佳对比文件中筛选）", ""]
+        if self.patent_doc:
+            lines.append(f"**本申请**: {self.patent_doc.title or '?'}")
+            if self.patent_doc.publication_number:
+                lines.append(
+                    f"**公布号**: {self.patent_doc.publication_number}")
+        lines.append("")
+
+        def impact_label(v):
+            m = {"high": "⚠️ 高（可能影响授权）",
+                 "moderate": "⚡ 中（需要关注）",
+                 "low": "✅ 低（影响有限）"}
+            return m.get(str(v).lower(), str(v))
+
+        for i, c in enumerate(comparisons, 1):
+            sel_pub = c.get("publication_number", "?")
+            src = c.get("source_raw", {}) or {}
+            title = c.get("title", "") or src.get("title", "")
+            score = c.get("relevance_score", "?")
+            novelty = c.get("novelty_impact", "?")
+            inventive = c.get("inventive_step_impact", "?")
+            same = c.get("key_features_same", []) or []
+            diff = c.get("key_features_different", []) or []
+            conclusion = c.get("conclusion", "")
+            lines.append(f"## {i}. {sel_pub} (相关度 {score})")
+            lines.append("")
+            if title:
+                lines.append(f"- **标题**: {title}")
+            lines.append(f"- **新颖性影响**: {impact_label(novelty)}")
+            lines.append(f"- **创造性影响**: {impact_label(inventive)}")
+            lines.append("")
+            lines.append("### 相同技术特征")
+            lines.append("\n".join(f"- {f}" for f in same)
+                         if same else "- *(AI 未列出)*")
+            lines.append("")
+            lines.append("### 不同技术特征")
+            lines.append("\n".join(f"- {f}" for f in diff)
+                         if diff else "- *(AI 未列出)*")
+            lines.append("")
+            if conclusion:
+                lines.append("### 综合结论")
+                lines.append(conclusion)
+            lines.append("")
+        return "\n".join(lines)
+
+
 class AnalysisWorker(QThread):
     """对比分析后台线程"""
 
@@ -993,336 +1326,6 @@ class OAWriterWorker(QThread):
             self.signals.finished.emit(False, str(e))
 
 
-class PatentscopeTestWorker(QThread):
-    """PATENTSCOPE 快速测试 Worker：搜索N条摘要 → 逐条点开→提取→回退 → 返回。
-
-    流程模拟真人操作：搜索一次 → 点开第1条看详情 → 回退 → 点开第2条 → ...
-    全程走正常浏览路径，不会被 PATENTSCOPE 拦截。
-
-    注意：测试Worker不取硬盘缓存数据，始终直接从 PATENTSCOPE 网站获取。
-    """
-
-    def __init__(self, query: str, settings: Settings,
-                 max_results: int = 5, parent=None):
-        super().__init__(parent)
-        self.query = query
-        self.settings = settings
-        self.max_results = max_results
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._run_async())
-            loop.close()
-        except Exception as e:
-            self.signals.error.emit(f"PATENTSCOPE 测试失败: {e}")
-            self.signals.log.emit("ERROR", f"测试失败: {e}")
-            self.signals.finished.emit(False, str(e))
-
-    async def _run_async(self):
-        from src.web_automation.browser_manager import BrowserManager
-        from src.web_automation.human_behavior import HumanBehavior
-        from src.web_automation.patentscope_scraper import PatentscopeScraper
-
-        self.signals.log.emit("INFO", "启动浏览器（无头模式）...")
-        self.signals.progress.emit(10, "启动浏览器...")
-
-        browser_mgr = BrowserManager(self.settings)
-        context, page = await browser_mgr.launch_with_retry(max_retries=2)
-
-        human = HumanBehavior(self.settings)
-        scraper = PatentscopeScraper(page, self.settings, human)
-
-        # 阶段1: 搜索摘要（直接从网站获取，不使用硬盘缓存）
-        self.signals.log.emit("INFO", f"搜索: {self.query}")
-        self.signals.progress.emit(30, "搜索摘要...")
-        abstracts = await scraper.search_abstracts(
-            self.query, max_results=self.max_results, signals=self.signals)
-
-        if not abstracts:
-            self.signals.log.emit("WARN", "未找到结果")
-            await browser_mgr.close()
-            self.signals.finished.emit(True, "0 条结果")
-            return
-
-        self.signals.log.emit("SUCCESS",
-            f"找到 {len(abstracts)} 条摘要")
-
-        # 阶段2: 从结果页逐条点开→提取→回退（模拟真人操作）
-        self.signals.log.emit("INFO",
-            f"逐条点开详情（点开→提取→回退，共 {len(abstracts)} 条）...")
-
-        enriched = []
-        for i, p in enumerate(abstracts):
-            doc_id = p.get("doc_id", "")
-            pub = p.get("publication_number", "?")
-            if not doc_id:
-                p["_no_detail"] = True
-                enriched.append(p)
-                continue
-
-            self.signals.progress.emit(
-                40 + int((i + 1) / len(abstracts) * 40),
-                f"详情 {i+1}/{len(abstracts)}")
-            self.signals.log.emit("INFO",
-                f"  [{i+1}/{len(abstracts)}] {pub}")
-
-            # 第2条开始：先回退到结果页
-            if i > 0:
-                try:
-                    await page.go_back(timeout=30000)
-                    await asyncio.sleep(2)
-                    try:
-                        await page.wait_for_selector(
-                            ".ps-patent-result, .trans-result-list-row",
-                            timeout=10000)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(1)
-                except Exception:
-                    # go_back 失败则直接导航到结果页URL
-                    self.signals.log.emit("DEBUG", "    go_back 失败，导航到结果页")
-                    if scraper._results_url:
-                        await page.goto(scraper._results_url,
-                                        timeout=30000,
-                                        wait_until="domcontentloaded")
-                        await asyncio.sleep(2)
-
-            # 点击当前专利链接，进入详情页
-            try:
-                link = page.locator(
-                    f"a[href*='docId={doc_id}']").first
-                if await link.count() > 0:
-                    try:
-                        await link.click(timeout=15000)
-                    except Exception:
-                        await page.evaluate(
-                            f'() => {{ var a = document.querySelector('
-                            f'"a[href*=\'docId={doc_id}\']"); if(a) a.click(); }}')
-                    await page.wait_for_url(
-                        "**/detail.jsf*", timeout=20000)
-                    await asyncio.sleep(1)
-
-                    detail = await scraper._extract_detail_page(doc_id)
-                    if detail:
-                        pub_num = p.get("publication_number", "")
-                        merged = {**p, **{k: v for k, v in detail.items()
-                                          if v}}
-                        if pub_num:
-                            merged["publication_number"] = pub_num
-                        enriched.append(merged)
-                        self.signals.log.emit("INFO",
-                            f"    ✓ 权利要求:{len(detail.get('claims',''))}字 "
-                            f"说明书:{len(detail.get('description',''))}字")
-                    else:
-                        p["_no_detail"] = True
-                        enriched.append(p)
-                        self.signals.log.emit("WARN",
-                            "    ✗ 详情提取失败")
-                else:
-                    p["_no_detail"] = True
-                    enriched.append(p)
-                    self.signals.log.emit("WARN",
-                        f"    ✗ 当前页未找到该专利链接")
-            except Exception as e:
-                p["_no_detail"] = True
-                enriched.append(p)
-                self.signals.log.emit("WARN", f"    ✗ 失败: {e}")
-
-            # 请求间微小延迟
-            if i < len(abstracts) - 1:
-                await asyncio.sleep(0.8)
-
-        await browser_mgr.close()
-
-        full_count = sum(1 for r in enriched if not r.get("_no_detail"))
-        self.signals.log.emit("SUCCESS",
-            f"测试完成: {len(enriched)} 条 ({full_count} 篇有全文)")
-
-        # 输出摘要
-        for i, r in enumerate(enriched):
-            pub = r.get("publication_number", "?")
-            title = str(r.get("title", ""))[:60]
-            claims_len = len(r.get("claims", "") or "")
-            desc_len = len(r.get("description", "") or "")
-            self.signals.log.emit("INFO",
-                f"  [{i+1}] {pub} | {title} | "
-                f"权利要求:{claims_len}字 说明书:{desc_len}字")
-
-        self.signals.progress.emit(100, "测试完成")
-        self.signals.all_searches_done.emit([enriched])
-        self.signals.finished.emit(True, "")
-
-
-class PatentscopeAbstractTestWorker(QThread):
-    """PATENTSCOPE 快速摘要测试 Worker：只搜索N条摘要，不抓详情。
-
-    注意：始终直接从 PATENTSCOPE 网站搜索，不使用硬盘缓存数据。
-    """
-
-    def __init__(self, query: str, settings: Settings,
-                 max_results: int = 5, parent=None):
-        super().__init__(parent)
-        self.query = query
-        self.settings = settings
-        self.max_results = max_results
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._run_async())
-            loop.close()
-        except Exception as e:
-            self.signals.error.emit(f"PATENTSCOPE 测试失败: {e}")
-            self.signals.log.emit("ERROR", f"测试失败: {e}")
-            self.signals.finished.emit(False, str(e))
-
-    async def _run_async(self):
-        from src.web_automation.browser_manager import BrowserManager
-        from src.web_automation.human_behavior import HumanBehavior
-        from src.web_automation.patentscope_scraper import PatentscopeScraper
-
-        self.signals.log.emit("INFO", "启动浏览器（无头模式）...")
-        self.signals.progress.emit(10, "启动浏览器...")
-
-        browser_mgr = BrowserManager(self.settings)
-        context, page = await browser_mgr.launch_with_retry(max_retries=2)
-
-        human = HumanBehavior(self.settings)
-        scraper = PatentscopeScraper(page, self.settings, human)
-
-        self.signals.log.emit("INFO", f"搜索摘要: {self.query}")
-        self.signals.progress.emit(30, "搜索摘要...")
-        abstracts = await scraper.search_abstracts(
-            self.query, max_results=self.max_results, signals=self.signals)
-
-        await browser_mgr.close()
-
-        if not abstracts:
-            self.signals.log.emit("WARN", "未找到结果")
-            self.signals.finished.emit(True, "0 条结果")
-            return
-
-        self.signals.log.emit("SUCCESS", f"找到 {len(abstracts)} 条摘要")
-        for i, a in enumerate(abstracts):
-            self.signals.log.emit("INFO",
-                f"  [{i+1}] {a.get('publication_number','?')} | "
-                f"{str(a.get('title',''))[:70]} | "
-                f"{str(a.get('abstract_snippet',''))[:60]}")
-
-        self.signals.progress.emit(100, "摘要测试完成")
-        self.signals.all_searches_done.emit([abstracts])
-        self.signals.finished.emit(True, "")
-
-
-class PatentscopePageSizeTestWorker(QThread):
-    """PATENTSCOPE 每页条数测试 Worker：搜索 → 切换200条 → 验证结果行数。
-
-    用于诊断"搜索结果只有10条"的问题——确认 _set_max_page_size 是否生效。
-    """
-
-    def __init__(self, query: str, settings: Settings,
-                 max_results: int = 10, parent=None):
-        super().__init__(parent)
-        self.query = query
-        self.settings = settings
-        self.max_results = max_results
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._run_async())
-            loop.close()
-        except Exception as e:
-            self.signals.error.emit(f"每页条数测试失败: {e}")
-            self.signals.log.emit("ERROR", f"测试失败: {e}")
-            self.signals.finished.emit(False, str(e))
-
-    async def _run_async(self):
-        from src.web_automation.browser_manager import BrowserManager
-        from src.web_automation.human_behavior import HumanBehavior
-        from src.web_automation.patentscope_scraper import PatentscopeScraper
-
-        self.signals.log.emit("INFO", "=" * 50)
-        self.signals.log.emit("INFO", "每页条数切换测试")
-        self.signals.progress.emit(10, "启动浏览器...")
-
-        browser_mgr = BrowserManager(self.settings)
-        context, page = await browser_mgr.launch_with_retry(max_retries=2)
-
-        human = HumanBehavior(self.settings)
-        scraper = PatentscopeScraper(page, self.settings, human)
-
-        # ── 步骤1: 搜索 ──
-        self.signals.log.emit("INFO", f"检索式: {self.query}")
-        self.signals.progress.emit(20, "搜索中...")
-        await scraper._navigate_and_search(self.query, signals=self.signals)
-
-        # ── 步骤2: 切换前统计 ──
-        rows_before = await scraper._count_result_rows()
-        total_text = await scraper._get_total_result_count()
-        self.signals.log.emit("INFO",
-            f"切换前: {rows_before} 行可见, "
-            f"检索总结果: {total_text or '?'} 条")
-
-        # ── 步骤3: 执行切换 ──
-        self.signals.log.emit("INFO", "执行 _set_max_page_size(200)...")
-        self.signals.progress.emit(40, "切换每页200条...")
-        await scraper._set_max_page_size(signals=self.signals)
-
-        # ── 步骤4: 切换后统计 ──
-        await asyncio.sleep(1)
-        rows_after = await scraper._count_result_rows()
-        self.signals.log.emit("INFO",
-            f"切换后: {rows_after} 行可见")
-
-        # ── 步骤5: 判断结果 ──
-        if rows_after > rows_before:
-            self.signals.log.emit("SUCCESS",
-                f"切换成功: {rows_before} → {rows_after} 行 (+{rows_after - rows_before})")
-        elif rows_after == rows_before and rows_before >= 200:
-            self.signals.log.emit("SUCCESS",
-                f"切换后行数不变 ({rows_before})，但已达到200条上限，切换可能已生效")
-        elif rows_after == rows_before:
-            total_after = await scraper._get_total_result_count()
-            if total_after and total_after <= rows_after:
-                self.signals.log.emit("SUCCESS",
-                    f"切换后行数不变 ({rows_before})，总结果 {total_after} ≤ 每页条数，无需翻页")
-            else:
-                self.signals.log.emit("WARN",
-                    f"切换后行数未变 ({rows_before} → {rows_after})，"
-                    f"可能切换失败或总结果不足200")
-        else:
-            self.signals.log.emit("WARN",
-                f"行数反而减少了: {rows_before} → {rows_after}")
-
-        # ── 步骤6: 尝试解析结果 ──
-        self.signals.progress.emit(60, "解析结果...")
-        abstracts = await scraper._parse_results_table()
-        self.signals.log.emit("INFO",
-            f"当前页解析到: {len(abstracts)} 条")
-
-        if abstracts:
-            self.signals.log.emit("INFO", "前5条:")
-            for a in abstracts[:5]:
-                self.signals.log.emit("INFO",
-                    f"  {a.get('publication_number','?')} | "
-                    f"{str(a.get('title',''))[:60]}")
-
-        await browser_mgr.close()
-
-        self.signals.log.emit("SUCCESS", "每页条数测试完成")
-        self.signals.progress.emit(100, "完成")
-        self.signals.all_searches_done.emit([abstracts])
-        self.signals.finished.emit(True, "")
-
-
 class PatentLookupWorker(QThread):
     """公布号直查 Worker：每次查询用完即关浏览器，下次再开新的，永不被限流。"""
 
@@ -1359,8 +1362,32 @@ class PatentLookupWorker(QThread):
         import re as _re
         q = self.query.strip()
         q = _re.sub(r'\s+', '', q)
-        q = _re.sub(r'[ABU]\d?$', '', q)
         self.signals.log.emit("INFO", f"查询: {q}")
+
+        # ── Google 引擎：免浏览器，纯 HTTP 从 Google Patents 获取本申请全文 ──
+        if self.settings.search_source == "google":
+            from src.web_automation.google_patents import fetch_patent_text
+            import asyncio as _asyncio
+            for attempt in range(1, 3):
+                try:
+                    result = fetch_patent_text(
+                        q, proxy=self.settings.web_proxy,
+                        timeout=self.settings.google_patents_timeout)
+                    if result and result.get("fetch_status") == "ok":
+                        self.signals.log.emit("SUCCESS",
+                            f"查询完成: claims={len(result.get('claims',''))} "
+                            f"desc={len(result.get('description',''))} (Google Patents)")
+                        return result
+                except Exception as e:
+                    self.signals.log.emit("WARN",
+                        f"  Google 查询失败(第{attempt}次): {e}")
+                if attempt < 2:
+                    await _asyncio.sleep(2)
+            self.signals.log.emit("ERROR", f"Google Patents 查询失败: {q}")
+            return None
+
+        # ── WIPO 引擎（原行为）：搜索需要去掉类别码 ──
+        q = _re.sub(r'[ABU]\d?$', '', q)
 
         MAX_RETRIES = 3
         for attempt in range(1, MAX_RETRIES + 1):

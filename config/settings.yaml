@@ -47,6 +47,7 @@ search:
   stop_after: "download"            # 流程断点: abstracts | screen | download | score | full
   prefer_cn_family: true        # 优先使用中国同族专利：下载全文时若遇非CN专利，自动查专利族中的CN专利替换
   search_source: "google"            # 全链路引擎: wipo(搜索+下载走PATENTSCOPE) | google(搜索+下载走Google Patents)
+  download_concurrency: 20           # 下载并发数（主流程+批量测试共用；wipo 自动保守为1防403）
 
 # PATENTSCOPE 配置
 patentscope:
@@ -105,11 +106,24 @@ dedup:
 # 分析
 analysis:
   max_tokens: 8192
-  max_detail_fetch: 1000      # 全文下载上限（超过则AI快速粗筛，~30秒）
-  fulltext_batch_size: 30     # 全文筛选时每批发给AI的篇数
-  max_chars_per_patent: 3000  # 全文筛选时每篇最多发给AI的字符数
+  max_detail_fetch: 1000      # 全文下载上限（不再做摘要粗筛，超过则直接截断）
+  fulltext_batch_size: 30     # 旧全文筛选每批篇数（兼容保留）
+  max_chars_per_patent: 3000  # 旧全文筛选每篇字符数（兼容保留）
   top_n_for_detailed: 10
   batch_comparison: true
+
+  # 全量 Claims 广筛（替代摘要粗筛 + 旧全文评分）
+  screen_content: "embodiments"  # 广筛内容: claims | embodiments | claims+embodiments
+                                 #   embodiments = 具体实施方式（审查员推荐，
+                                 #   对比文件实际实施方案比权利要求更能判断可用性）
+  screen_claims_limit: 3000      # 每篇内容截断字符（claims 或 具体实施方式）
+  screen_batch_chars: 300000     # 每批内容字符预算（≈100-150篇/批）
+  screen_max_concurrency: 3      # 批并发数
+
+  # 终选评述（从历史最佳候选池挑最终几篇做详细评述）
+  final_pool_top_n: 50           # 候选池 = 历史最佳前N
+  final_pool_min_score: 55       # 低于此分不进候选池
+  final_review_n: 8              # 终选评述篇数
 
 # Session
 session:

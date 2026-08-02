@@ -11,6 +11,7 @@ from PySide6.QtCore import Slot
 import markdown
 
 from src.utils.patent_formatter import format_patent_text
+from src.utils.patent_extract import extract_embodiments
 
 _BROWSER_STYLE = """
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
@@ -93,6 +94,12 @@ class ReportPanel(QWidget):
         self.tab_claims.setOpenExternalLinks(True)
         self.tab_claims.setStyleSheet(f"QTextBrowser {{{_BROWSER_STYLE}}}")
         self.detail_tabs.addTab(self.tab_claims, "📜 权利要求书")
+
+        # Tab 4: 具体实施方式（下载时从说明书抽取的详述/实施例部分）
+        self.tab_embodiments = QTextBrowser()
+        self.tab_embodiments.setOpenExternalLinks(True)
+        self.tab_embodiments.setStyleSheet(f"QTextBrowser {{{_BROWSER_STYLE}}}")
+        self.detail_tabs.addTab(self.tab_embodiments, "🧪 具体实施方式")
 
         # ── 堆叠切换 ───────────────────────────────────────────────────
         self.stack = QStackedWidget()
@@ -183,6 +190,18 @@ class ReportPanel(QWidget):
             self.tab_claims.setHtml(self._wrap_html(
                 '<p style="color:#888;">无权利要求信息</p>'))
             self.detail_tabs.setTabVisible(2, False)
+
+        # ── Tab 3: 具体实施方式（优先下载存的字段，旧数据兜底现抽）──
+        emb = str(d.get("embodiments") or "")
+        if not emb and d.get("description"):
+            emb = extract_embodiments(str(d.get("description", "")))
+        if emb:
+            self.tab_embodiments.setHtml(format_patent_text(emb, "description"))
+            self.detail_tabs.setTabVisible(3, True)
+        else:
+            self.tab_embodiments.setHtml(self._wrap_html(
+                '<p style="color:#888;">无具体实施方式信息</p>'))
+            self.detail_tabs.setTabVisible(3, False)
 
         # 默认选中摘要
         self.detail_tabs.setCurrentIndex(0)

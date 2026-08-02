@@ -269,6 +269,18 @@ class Settings:
     def google_patents_timeout(self) -> int:
         return int(self._raw.get("google_patents", {}).get("timeout", 20))
 
+    @property
+    def search_download_concurrency(self) -> int:
+        """下载并发数（主流程下载 + 批量测试共用），默认 20。
+
+        兼容旧配置：优先 search.download_concurrency，
+        否则回退 test.batch_default_concurrency。
+        """
+        v = self._raw.get("search", {}).get(
+            "download_concurrency",
+            self._raw.get("test", {}).get("batch_default_concurrency", 20))
+        return max(1, min(int(v), 50))
+
     # --- 人类行为 ---
     @property
     def human_typing_min_ms(self) -> int:
@@ -313,8 +325,52 @@ class Settings:
 
     @property
     def analysis_fulltext_batch_size(self) -> int:
-        """全文筛选时每批发给 AI 的篇数，默认 30"""
+        """全文筛选时每批发给 AI 的篇数，默认 30（兼容旧流程）"""
         return self._raw.get("analysis", {}).get("fulltext_batch_size", 30)
+
+    # --- 全量 Claims 广筛 ---
+    @property
+    def analysis_screen_content(self) -> str:
+        """广筛内容模式:
+          claims            只发权利要求（紧凑）
+          embodiments       只发具体实施方式（审查员推荐，对比实际实施方案）
+          claims+embodiments 两者都发（每篇各占一半预算）
+        """
+        v = str(self._raw.get("analysis", {}).get("screen_content", "embodiments"))
+        if v not in ("claims", "embodiments", "claims+embodiments"):
+            return "embodiments"
+        return v
+
+    @property
+    def analysis_screen_claims_limit(self) -> int:
+        """每篇权利要求截断字符，默认 3000"""
+        return int(self._raw.get("analysis", {}).get("screen_claims_limit", 3000))
+
+    @property
+    def analysis_screen_batch_chars(self) -> int:
+        """每批内容字符预算，默认 300000"""
+        return int(self._raw.get("analysis", {}).get("screen_batch_chars", 300000))
+
+    @property
+    def analysis_screen_concurrency(self) -> int:
+        """广筛批并发数，默认 3"""
+        return int(self._raw.get("analysis", {}).get("screen_max_concurrency", 3))
+
+    # --- 终选评述 ---
+    @property
+    def analysis_final_pool_top_n(self) -> int:
+        """终选候选池 = 历史最佳前 N，默认 50"""
+        return int(self._raw.get("analysis", {}).get("final_pool_top_n", 50))
+
+    @property
+    def analysis_final_pool_min_score(self) -> int:
+        """低于此分不进终选候选池，默认 55"""
+        return int(self._raw.get("analysis", {}).get("final_pool_min_score", 55))
+
+    @property
+    def analysis_final_review_n(self) -> int:
+        """终选评述篇数，默认 8"""
+        return int(self._raw.get("analysis", {}).get("final_review_n", 8))
 
     # --- Session ---
     @property
@@ -351,21 +407,17 @@ class Settings:
         """批量测试 - 默认检索式列表"""
         return self._raw.get("test", {}).get("batch_default_queries", [])
 
-    def save_test_defaults(self, query: str, count: int,
-                           batch_count: int, batch_concurrency: int,
-                           batch_queries: list[str]):
-        """保存测试工具的默认值到 settings.yaml"""
+    def save_test_defaults(self, batch_queries: list[str]):
+        """保存批量测试的默认检索式列表到 settings.yaml。
+
+        每式结果数/并发已改由主面板和 ⚙设置 统一管理（不在此保存）。
+        """
         yaml_path = self.config_dir / "settings.yaml"
         if not yaml_path.exists():
             return
         import re
         import yaml as _yaml
         content = yaml_path.read_text(encoding="utf-8")
-        # 更新各字段
-        content = self._yaml_set_str(content, "default_query", query, section="test")
-        content = self._yaml_set_int(content, "default_count", count, section="test")
-        content = self._yaml_set_int(content, "batch_default_count", batch_count, section="test")
-        content = self._yaml_set_int(content, "batch_default_concurrency", batch_concurrency, section="test")
         # 批量检索式列表：使用 yaml.dump 生成去掉缩进后的纯列表行
         queries_yaml = _yaml.dump(
             batch_queries, default_flow_style=True,
@@ -379,7 +431,7 @@ class Settings:
                 content)
         else:
             content = re.sub(
-                r'(batch_default_concurrency:\s*\d+)',
+                r'(download_concurrency:\s*\d+)',
                 f'\\1\n  batch_default_queries: {queries_yaml}',
                 content)
         yaml_path.write_text(content, encoding="utf-8")
