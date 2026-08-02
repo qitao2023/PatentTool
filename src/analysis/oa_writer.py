@@ -111,8 +111,13 @@ class OAWriter:
             self._client = AIClient(self.settings, provider=self._provider)
         return self._client
 
+    def _get_system_prompt(self) -> str:
+        """System Prompt：优先使用 office_action 提示词方案，缺失时回退内置硬编码。"""
+        prompt = self.settings.get_prompt_text("office_action", "system")
+        return prompt if prompt else OA_SYSTEM_PROMPT
+
     def write(self, patent_doc, comparisons: list[dict],
-              dedup_results: list[dict]) -> str:
+              dedup_results: list[dict], options: dict | None = None) -> str:
         """
         撰写审查意见通知书。
 
@@ -120,11 +125,15 @@ class OAWriter:
             patent_doc: 本申请的 PatentDocument
             comparisons: AI 对比分析结果（已有相关度评分和对比）
             dedup_results: 去重后的对比文件列表（含全文）
+            options: 可选，撰写选项 {keep_contact: bool, mark_changes: bool,
+                     d1_pub: str, d2_pub: str}
 
         Returns:
-            str: Markdown 格式的审查意见通知书
+            str: Markdown 格式的审查意见通知书，末尾附「检索对比文件清单」附录
+            （记录检索到的最相关 ≤10 篇对比文件的公布号，供归档备查）
         """
         client = self._get_client()
+        options = options or {}
 
         # 构建本申请信息
         patent_text = self._build_patent_text(patent_doc)
@@ -132,6 +141,22 @@ class OAWriter:
         # 构建对比文件信息（只取有全文、相关度高的）
         top_docs = self._select_top_docs(dedup_results, max_count=5)
         docs_text = self._build_comparison_docs(top_docs)
+
+        # 对比文件角色指定
+        d1_pub = options.get("d1_pub", "")
+        d2_pub = options.get("d2_pub", "")
+        role_text = "（由你判断最接近的现有技术并说明理由）"
+        if d1_pub and d2_pub:
+            role_text = (f"对比文件 {d1_pub} 为最接近的现有技术；"
+                         f"权利要求以对比文件 {d2_pub} 辅助评述创造性。")
+        elif d1_pub:
+            role_text = f"对比文件 {d1_pub} 为最接近的现有技术。"
+
+        # 输出要求
+        keep_contact = options.get("keep_contact", False)
+        mark_changes = options.get("mark_changes", False)
+        contact_text = "是" if keep_contact else "否"
+        mark_text = "是" if mark_changes else "否"
 
         user_prompt = f"""## 本申请
 
@@ -143,22 +168,78 @@ class OAWriter:
 
 ---
 
-请根据以上信息，按照三步法撰写审查意见通知书。
+## 对比文件角色指定
 
-要求：
-1. 每个权利要求都要评述
-2. 对比文件引用要具体
-3. 三步法逻辑要完整
-4. 结论要明确"""
+{role_text}
+
+## 输出要求
+
+- 是否需要 DOCX：由接收方按版式规范生成
+- 是否保留联系方式：{contact_text}
+- 是否标记修改：{mark_text}
+
+## 撰写要求
+
+请根据以上信息，按照三步法撰写审查意见通知书，并遵循 System Prompt 中的全部规则：
+
+1. 每个权利要求都要评述，结论明确；
+2. 对比文件引用要具体（指出段号/页码/附图）；
+3. 三步法逻辑要完整（区别特征→实际技术问题→结合动机→法律结论）；
+4. 交付前执行引用核验：每一处"对比文件X公开（参见……）"都须与原文核对，不臆造公开内容、段号、公开日。"""
 
         response = client.chat(
-            system_prompt=OA_SYSTEM_PROMPT,
+            system_prompt=self._get_system_prompt(),
             user_prompt=user_prompt,
             max_tokens=16384,
             temperature=0.3,
         )
 
+        # 末尾追加检索对比文件清单附录（前 10 篇，按相关度排序）。
+        # 直接取检索结果数据，不经 AI 生成，避免编造公布号。
+        appendix = self._build_appendix(dedup_results, max_count=10)
+        if appendix:
+            response = response.rstrip() + appendix
+
         return response
+
+    def _build_appendix(self, dedup_results: list[dict],
+                        max_count: int = 10) -> str:
+        """构建通知书末尾的「检索对比文件清单」附录。
+
+        从检索结果中挑出相关度最高的不超过 max_count 篇对比文件，
+        记录其公布号（编号）与标题，供审查员归档备查。
+
+        Args:
+            dedup_results: 去重后的对比文件列表
+            max_count: 最多收录篇数（默认 10）
+
+        Returns:
+            str: Markdown 附录段落；无可用对比文件时返回空字符串
+        """
+        scored = [d for d in dedup_results if d.get("publication_number")]
+        scored.sort(key=lambda x: x.get("relevance_score", 0) or 0, reverse=True)
+        top = scored[:max_count]
+        if not top:
+            return ""
+
+        rows = []
+        for i, d in enumerate(top, 1):
+            pub = d.get("publication_number", "")
+            title = (d.get("title", "") or "").replace("|", "\\|")
+            title_cell = title if title else "—"
+            score = d.get("relevance_score", "")
+            score_cell = str(score) if score not in ("", None) else ""
+            rows.append(f"| {i} | {pub} | {title_cell} | {score_cell} |")
+
+        header = (
+            "\n\n---\n\n"
+            f"## 附：检索对比文件清单（前 {len(top)} 篇）\n\n"
+            "> 以下为本轮检索中相关度最高的对比文件公布号记录，"
+            "供审查员归档备查，不构成通知书正文。\n\n"
+            "| 序号 | 公布号 | 标题 | 相关度 |\n"
+            "|---|---|---|---|\n"
+        )
+        return header + "\n".join(rows)
 
     def _build_patent_text(self, patent_doc) -> str:
         """构建本申请完整文本"""
@@ -169,6 +250,10 @@ class OAWriter:
             parts.append(f"**公布号**: {patent_doc.publication_number}")
         if patent_doc.application_number:
             parts.append(f"**申请号**: {patent_doc.application_number}")
+        if getattr(patent_doc, "application_date", "") or getattr(patent_doc, "publication_date", ""):
+            ad = getattr(patent_doc, "application_date", "") or ""
+            pd_ = getattr(patent_doc, "publication_date", "") or ""
+            parts.append(f"**申请日**: {ad or '未知'} | **公开日**: {pd_ or '未知'}")
         if patent_doc.applicants:
             parts.append(f"**申请人**: {', '.join(patent_doc.applicants)}")
         if patent_doc.inventors:
@@ -223,9 +308,14 @@ class OAWriter:
             claims = d.get("claims", "")[:5000]
             description = d.get("description", "")[:5000]
 
+            pub_date = d.get("publication_date", "") or ""
+            app_num = d.get("application_number", "") or ""
+            date_line = f"公开日: {pub_date} | 申请号: {app_num}" if (pub_date or app_num) else "公开日/申请号: 未知"
+
             parts.append(f"""### 对比文件 {i+1}: {pub} (相关度: {score})
 
 - **标题**: {title}
+- **公开日/申请号**: {date_line}
 - **IPC**: {ipc}
 - **申请人**: {applicant}
 - **相关理由**: {reason}

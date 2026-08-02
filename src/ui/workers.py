@@ -8,6 +8,12 @@ from PySide6.QtCore import QThread, Signal
 
 from src.utils.signals import WorkerSignals
 from src.utils.config import Settings
+from src.utils.prompts import (
+    load_prompt,
+    render_template,
+    FINAL_REVIEW_FALLBACK_SYSTEM_PROMPT,
+    FINAL_REVIEW_FALLBACK_USER_PROMPT,
+)
 
 
 class PDFParseWorker(QThread):
@@ -36,6 +42,29 @@ class PDFParseWorker(QThread):
             self.signals.error.emit(f"PDF解析失败: {e}")
             self.signals.log.emit("ERROR", f"PDF解析失败: {e}")
             self.signals.finished.emit(False, str(e))
+
+
+class ApplicationDateWorker(QThread):
+    """申请日轻量提取后台线程：只读 PDF 前两页，不触发全流程。
+
+    用于：选择 PDF 后自动提取、点「提取」按钮手动重试。
+    提取不到只发空串，不视为异常（扫描件/无文字层属正常情况）。
+    """
+
+    extracted = Signal(str)   # 提取到的申请日；空串 = 未提取到
+    error = Signal(str)       # PDF 打不开等真实异常
+
+    def __init__(self, pdf_path: str, parent=None):
+        super().__init__(parent)
+        self.pdf_path = pdf_path
+
+    def run(self):
+        try:
+            from src.pdf_extractor.extractor import extract_application_date
+            date = extract_application_date(self.pdf_path)
+            self.extracted.emit(date)
+        except Exception as e:
+            self.error.emit(f"提取申请日失败: {e}")
 
 
 class QueryGenerateWorker(QThread):
@@ -79,9 +108,9 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
     流程：
       阶段1: 搜索摘要（快，200 条/检索式）
-      阶段2: 超过上限时 AI 快速粗筛（一批搞定，只选不评）
+      阶段2: 结果超过下载上限时降量（引用优先 + 轮询配额，不做 AI 粗筛）
       阶段3: 并行下载完整详情 → 02_patent_details/
-      阶段4: AI 全文精选（全部评分排序）
+      阶段4: 全量 Claims 广筛（只发权要/实施方式，分批评分排序）
     """
 
     def __init__(self, queries: list, settings: Settings,
@@ -394,8 +423,21 @@ class PatentscopeSearchAndFetchWorker(QThread):
             self.signals.log.emit("INFO",
                 f"  兜底结果: {total_abstracts} 篇摘要")
 
+        # ── 日期淘汰（下载前主力过滤）：公开日 ≥ 本申请截止日的直接剔除 ──
+        unique_abstracts = self._apply_date_filter(unique_abstracts, "阶段1 搜索摘要")
+        total_abstracts = len(unique_abstracts)
+        # 同步落盘，保证 01_search_abstracts.json 与过滤后的流水线一致
+        self._save_json(stage1_path, {
+            "stage": "search_abstracts",
+            "timestamp": datetime.now().isoformat(),
+            "total": total_abstracts,
+            "queries": [q.get("query_string", "") for q in self.queries],
+            "results": unique_abstracts,
+        })
+
         if total_abstracts == 0:
-            self.signals.log.emit("WARN", "所有检索式（含宽泛兜底）均未找到结果，停止检索")
+            self.signals.log.emit("WARN",
+                "无可用的对比文件（检索无结果或全部被日期淘汰），停止检索")
             self.signals.finished.emit(True, "无结果")
             return
 
@@ -480,6 +522,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                                     "abstract_snippet": (existing.get("abstract") or "")[:300],
                                     "ipc": existing.get("ipc", ""),
                                     "applicant": existing.get("applicant", ""),
+                                    "publication_date": existing.get("publication_date", ""),
                                     "source_query": f"说明书引用: {pub}",
                                 }
                                 unique_abstracts.append(item)
@@ -507,6 +550,7 @@ class PatentscopeSearchAndFetchWorker(QThread):
                                     "abstract_snippet": (detail.get("abstract") or "")[:300],
                                     "ipc": detail.get("ipc", ""),
                                     "applicant": detail.get("applicant", ""),
+                                    "publication_date": detail.get("publication_date", ""),
                                     "source_query": f"说明书引用: {pub}",
                                 }
                                 unique_abstracts.append(item)
@@ -594,6 +638,10 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 self.signals.log.emit("SUCCESS",
                     f"引用专利下载完成: 新增 {added} 篇, 累计 {len(unique_abstracts)} 篇")
                 total_abstracts = len(unique_abstracts)
+
+        # ── 日期淘汰（含说明书引用追加的对比文件）──
+        unique_abstracts = self._apply_date_filter(unique_abstracts, "阶段2 下载前")
+        total_abstracts = len(unique_abstracts)
 
         # ================================================================
         # 阶段2: 结果超过下载上限时降量
@@ -698,6 +746,14 @@ class PatentscopeSearchAndFetchWorker(QThread):
             self.signals.log.emit("SUCCESS",
                 f"  CN同族去重完成: 移除 {_cn_dup_removed} 篇重复专利")
         # ── CN同族去重结束 ──
+
+        # ── 日期淘汰二次校验：详情页权威公开日兜住搜索阶段漏网的 ──
+        _cutoff = self._application_cutoff()
+        if _cutoff is not None:
+            _pruned = self._prune_eliminated_details(details_dir, _cutoff)
+            if _pruned > 0:
+                self.signals.log.emit("SUCCESS",
+                    f"  二次校验淘汰 {_pruned} 篇（公开日 ≥ 截止日 {_cutoff}）")
 
         # ── 断点：下载后 ──
         if self.stop_after == "download":
@@ -832,6 +888,35 @@ class PatentscopeSearchAndFetchWorker(QThread):
         })
         self.signals.log.emit("INFO", f"  已保存: {stage4_path}")
 
+        # 评分快照：存于本次运行的输出目录（自己的文件夹），供综述合并
+        if (output_dir and self.patent_doc
+                and getattr(self.patent_doc, "publication_number", None)):
+            from src.analysis.history import save_score_snapshot
+            snap_results = []
+            for r in all_scored:
+                pub = r.get("publication_number", "")
+                snap_results.append({
+                    "publication_number": pub,
+                    "title": r.get("title", ""),
+                    "applicant": r.get("applicant", ""),
+                    "ipc": r.get("ipc", ""),
+                    "publication_date": r.get("publication_date", ""),
+                    "fulltext_score": r.get(
+                        "fulltext_score", r.get("relevance_score", 0)),
+                    "fulltext_reason": r.get(
+                        "fulltext_reason", r.get("relevance_reason", "")),
+                    "key_features": r.get("key_features", []),
+                    "detail_file": r.get("_detail_file", ""),
+                })
+            snap_path = save_score_snapshot(
+                output_dir, self.patent_doc.publication_number,
+                datetime.now().isoformat(timespec="seconds"),
+                snap_results,
+                source_queries=[q.get("query_string", "")
+                                for q in (self.queries or [])],
+                content_mode=self.settings.analysis_screen_content)
+            self.signals.log.emit("INFO", f"  评分快照已保存: {snap_path}")
+
         # 传给详细对比阶段的只取 Top N
         detail_n = self.settings.analysis_top_n
         top_for_compare = all_scored[:detail_n]
@@ -949,6 +1034,77 @@ class PatentscopeSearchAndFetchWorker(QThread):
                 filtered.append(a)
         return filtered, removed
 
+    # ================================================================
+    # 日期淘汰：公开日 >= 本申请截止日（申请日/优先权日）的对比文件直接剔除
+    # ================================================================
+
+    def _application_cutoff(self):
+        """本申请截止日 date | None。取 min(申请日, 优先权日)，两者都无返回 None。"""
+        if not self.patent_doc:
+            return None
+        from src.utils.date_filter import effective_cutoff_date
+        return effective_cutoff_date(
+            getattr(self.patent_doc, "application_date", "") or "",
+            getattr(self.patent_doc, "priority_date", "") or "")
+
+    def _apply_date_filter(self, patents: list[dict],
+                           stage_label: str) -> list[dict]:
+        """对候选对比文件执行日期淘汰，返回过滤后的列表。
+
+        公开日 >= 截止日 → 淘汰；公开日缺失/无法解析 → 保留。
+        未提供申请日/优先权日 → 不淘汰（提示可手动填写）。
+        """
+        cutoff = self._application_cutoff()
+        if cutoff is None:
+            self.signals.log.emit("INFO",
+                f"  {stage_label}: 未获取到本申请申请日/优先权日，"
+                "跳过日期淘汰（可在界面手动填写申请日）")
+            return patents
+        from src.utils.date_filter import filter_by_application_date
+        kept, eliminated = filter_by_application_date(patents, cutoff)
+        if eliminated:
+            self.signals.log.emit("WARN",
+                f"  {stage_label}: 淘汰 {len(eliminated)} 篇（公开日 ≥ "
+                f"截止日 {cutoff}）")
+            for e in eliminated[:10]:
+                self.signals.log.emit("DEBUG",
+                    f"    淘汰: {e.get('publication_number', '?')} "
+                    f"(公开日 {e.get('publication_date', '?')})")
+            if len(eliminated) > 10:
+                self.signals.log.emit("DEBUG",
+                    f"    其余 {len(eliminated)-10} 篇略")
+        if len(kept) != len(patents):
+            self.signals.log.emit("INFO",
+                f"  {stage_label}: 日期淘汰后剩余 {len(kept)} 篇")
+        return kept
+
+    def _prune_eliminated_details(self, details_dir, cutoff) -> int:
+        """阶段3下载后二次校验：删除公开日 >= 截止日的详情缓存文件。
+
+        搜索阶段公开日缺失/抓错的对比文件，这里用详情页的权威公开日兜住。
+        返回删除篇数。
+        """
+        from pathlib import Path
+        from src.web_automation.patentscope_scraper import _safe_filename
+        from src.utils.date_filter import is_eliminated_by_date
+
+        removed = 0
+        for f in sorted(Path(details_dir).glob("*.json")):
+            try:
+                import json as json_module
+                d = json_module.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not is_eliminated_by_date(d, cutoff):
+                continue
+            pub = d.get("publication_number", f.stem)
+            f.unlink(missing_ok=True)
+            removed += 1
+            self.signals.log.emit("WARN",
+                f"  二次校验淘汰: {pub} (公开日 {d.get('publication_date', '?')} "
+                f"≥ 截止日 {cutoff})")
+        return removed
+
 
 def _normalize_pn(pn: str) -> str:
     """标准化公布号: 去空格去横杠去斜杠大写"""
@@ -993,8 +1149,8 @@ class FinalReviewWorker(QThread):
     """终选评述 Worker — 从历史最佳候选池中挑最终 N 篇做详细评述。
 
     单独手动触发（UI「终选评述」按钮）：
-      1. 加载历史记录库（ScreeningHistory）
-      2. 构建紧凑候选池（best_pool），LLM 挑最终 final_n 篇
+      1. 加载历史记录库（ScreeningHistory，用于评述缓存复用）
+      2. 读全部评分快照文件合并为候选池，LLM 挑最终 final_n 篇
       3. 每篇：有 detailed_review → 复用历史；否则读全文缓存 →
          _detailed_comparison → 写回历史
       4. 渲染 06_终选评述.md，发射 comparisons 供后续 OA
@@ -1006,7 +1162,8 @@ class FinalReviewWorker(QThread):
     def __init__(self, patent_doc, settings, pdf_path: str,
                  final_n: int | None = None, top_pool: int | None = None,
                  min_score: int | None = None,
-                 ai_provider: str | None = None, parent=None):
+                 ai_provider: str | None = None,
+                 snapshot_files: list | None = None, parent=None):
         super().__init__(parent)
         self.patent_doc = patent_doc
         self.settings = settings
@@ -1018,6 +1175,8 @@ class FinalReviewWorker(QThread):
         self.min_score = (min_score if min_score is not None
                           else settings.analysis_final_pool_min_score)
         self.ai_provider = ai_provider
+        # 用户勾选的评分快照文件（None=读全部）
+        self.snapshot_files = snapshot_files
         self.signals = WorkerSignals()
 
     def run(self):
@@ -1050,10 +1209,15 @@ class FinalReviewWorker(QThread):
             return
 
         history = ScreeningHistory.from_pdf(self.pdf_path, pub_num)
-        pool = history.best_pool(top_n=self.top_pool, min_score=self.min_score)
+        # 候选池：读该申请的所有评分快照文件，合并取历史最高分，降序取 top_n
+        from src.analysis.history import load_score_snapshots
+        pool = load_score_snapshots(
+            Path(self.pdf_path).parent, pub_num,
+            min_score=self.min_score, top_n=self.top_pool,
+            files=self.snapshot_files)
         if not pool:
             self.signals.log.emit("WARN",
-                f"历史记录库为空或没有达标记录（best_score ≥ {self.min_score}）。\n"
+                f"没有评分快照或达标记录（best_score ≥ {self.min_score}）。\n"
                 f"请先运行「开始分析」完成检索+Claims 广筛。")
             self.signals.finished.emit(True, "无候选")
             return
@@ -1079,25 +1243,14 @@ class FinalReviewWorker(QThread):
                 f"    关键特征: {kf}")
         pool_text = "\n".join(lines)
 
-        user_prompt = f"""## 本申请
-{patent_summary}
+        user_prompt = render_template(
+            load_prompt(self.settings, "final_review", "user",
+                        FINAL_REVIEW_FALLBACK_USER_PROMPT),
+            patent_summary=patent_summary, pool_size=len(pool),
+            pool_text=pool_text, final_n=self.final_n)
 
-## 候选池（{len(pool)} 篇，按历史最佳评分排序）
-{pool_text}
-
----
-从以上候选池中，选出最合适作为**最接近的现有技术**的恰好 {self.final_n} 篇。
-考虑：
-- 新颖性评述：单篇公开了最多与本申请相同的技术特征
-- 创造性评述：需要至少 1 篇最接近 + 若干篇可组合公开区别特征
-只输出公布号 JSON 数组，不要评分不要理由：
-```json
-["CN117317030B", "WO2019006821A1", ...]
-```"""
-
-        system_prompt = ("你是中国专利审查员。根据候选池中每篇的评分、理由和关键特征，"
-                         "从历史最佳中挑选最终用于评述的对比文件。"
-                         "只输出公布号 JSON 数组，不要其他内容。")
+        system_prompt = load_prompt(self.settings, "final_review", "system",
+                                    FINAL_REVIEW_FALLBACK_SYSTEM_PROMPT)
 
         self.signals.progress.emit(5, "LLM 终选候选...")
         self.signals.log.emit("INFO", "  LLM 从候选池终选...")
@@ -1124,14 +1277,16 @@ class FinalReviewWorker(QThread):
             f"  终选 {len(selected_pubs)} 篇: {', '.join(selected_pubs)}")
 
         # ── 逐篇详细评述：复用历史 or 调 _detailed_comparison ──
-        cache_dir = Path(self.pdf_path).parent / "patent_cache"
+        from src.utils.paths import patent_detail_dir
+        cache_dir = patent_detail_dir(Path(self.pdf_path).parent)
         comparator = PatentComparator(self.settings, provider=self.ai_provider)
         comp_client = comparator._get_client()
 
         comparisons = []
         total = len(selected_pubs)
         for i, sel_pub in enumerate(selected_pubs):
-            rec = history.get(sel_pub) or {}
+            rec = next((p for p in pool
+                        if p.get("publication_number") == sel_pub), {}) or {}
             # 组装 result（元数据 + 全文，供 _detailed_comparison 使用）
             result = {
                 "publication_number": sel_pub,
@@ -1296,13 +1451,15 @@ class OAWriterWorker(QThread):
 
     def __init__(self, patent_doc, dedup_results: list,
                  comparisons: list, settings: Settings,
-                 ai_provider: str | None = None, parent=None):
+                 ai_provider: str | None = None, options: dict | None = None,
+                 parent=None):
         super().__init__(parent)
         self.patent_doc = patent_doc
         self.dedup_results = dedup_results
         self.comparisons = comparisons
         self.settings = settings
         self.ai_provider = ai_provider
+        self.options = options or {}
         self.signals = WorkerSignals()
 
     def run(self):
@@ -1314,7 +1471,8 @@ class OAWriterWorker(QThread):
 
             writer = OAWriter(self.settings, provider=self.ai_provider)
             oa_markdown = writer.write(
-                self.patent_doc, self.comparisons, self.dedup_results)
+                self.patent_doc, self.comparisons, self.dedup_results,
+                options=self.options)
 
             self.signals.log.emit("SUCCESS", "审查意见通知书撰写完成")
             self.signals.progress.emit(100, "全部完成")

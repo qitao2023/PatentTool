@@ -6,7 +6,7 @@
   - 终选评述（detailed_review，评述过即可复用，避免重复调贵模型）
 
 存储: {pdf所在目录}/对比历史_{申请公布号}.json
-与现有 本申请_{pub}.json、patent_cache/ 同级，随申请文件走，跨会话复用。
+与现有 本申请_{pub}.json、patent_detail/ 同级，随申请文件走，跨会话复用。
 """
 import json
 import re
@@ -148,3 +148,111 @@ class ScreeningHistory:
         pool = [r for r in self.all()
                 if r.get("best_score", 0) >= min_score]
         return pool[:top_n]
+
+
+# ================================================================
+# 评分快照 — 每次「开始分析」运行导出一份带时间戳的评分文件，
+# 综述（终选评述）时读全部快照合并，取历史最高分降序 top_n。
+# 与 ScreeningHistory（累积去重）并存：快照保留每次运行的完整记录，
+# 综述不再依赖单一累积文件。
+# ================================================================
+
+
+def score_snapshot_path(base_dir: str, patent_number: str,
+                        timestamp: str) -> Path:
+    """评分快照文件路径：每次运行一份（带时间戳），随 PDF 目录走。"""
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", str(patent_number or "unknown"))
+    # 时间戳含冒号（如 2026-08-02T20:30:00），需清洗为 Windows 合法文件名
+    safe_ts = re.sub(r'[\\/:*?"<>|\s]+', "_", str(timestamp or "unknown"))
+    return Path(base_dir) / f"广筛评分_{safe}_{safe_ts}.json"
+
+
+def save_score_snapshot(base_dir: str, patent_number: str, timestamp: str,
+                        results: list[dict], source_queries=None,
+                        content_mode: str = "") -> Path:
+    """把当次 Claims 广筛结果存为评分快照文件。
+
+    仅存分数 + 元数据 + detail_file 指针（不含全文，全文在固定 patent_detail/）。
+    文件名带时间戳，多次运行互不覆盖。
+    """
+    path = score_snapshot_path(base_dir, patent_number, timestamp)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "patent_number": patent_number,
+        "created_at": timestamp,
+        "source_queries": source_queries or [],
+        "content_mode": content_mode,
+        "count": len(results),
+        "results": results,
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def list_score_snapshots(base_dir: str, patent_number: str) -> list[dict]:
+    """列出该申请的所有评分快照（各在各自操作文件夹里），供综评前勾选。
+
+    每次「开始分析」的评分文件存于该次运行的输出目录（自己的文件夹）：
+      {base_dir}/{运行目录}/广筛评分_{safe}_{时间戳}.json
+    这里扫描 base_dir 下所有子目录，按公布号前缀匹配。
+
+    每项含 path / name / run_dir / created_at / count。
+    """
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", str(patent_number or "unknown"))
+    out = []
+    for sub in sorted(Path(base_dir).glob("*/")):
+        for fp in sorted(sub.glob(f"广筛评分_{safe}_*.json")):
+            meta = {"path": str(fp), "name": fp.name,
+                    "run_dir": sub.name, "created_at": "", "count": 0}
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                meta["created_at"] = data.get("created_at", "")
+                meta["count"] = data.get("count", 0)
+            except Exception:
+                pass
+            out.append(meta)
+    return out
+
+
+def load_score_snapshots(base_dir: str, patent_number: str,
+                         min_score: int = 55, top_n: int = 50,
+                         files: list | None = None) -> list[dict]:
+    """综述用：读评分快照，合并取历史最高分，降序取 top_n。
+
+    每个快照文件对应一次「开始分析」的 Claims 广筛结果；
+    同一对比文件多次出现时取历史最高分（best_score）。
+
+    Args:
+        base_dir: PDF 所在目录（快照随 PDF 走）
+        patent_number: 申请公布号
+        min_score: 低于此分不进候选池
+        top_n: 候选池上限
+        files: 只读这些快照文件路径；None 表示 glob 全部
+    """
+    if files is None:
+        safe = re.sub(r'[\\/:*?"<>|\s]+', "_", str(patent_number or "unknown"))
+        files = []
+        for sub in sorted(Path(base_dir).glob("*/")):
+            files.extend(sorted(sub.glob(f"广筛评分_{safe}_*.json")))
+    merged: dict[str, dict] = {}
+    for fp in files:
+        fp = Path(fp)
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for r in data.get("results", []) or []:
+            pub = (r.get("publication_number") or "").strip()
+            if not pub:
+                continue
+            score = r.get("fulltext_score") or r.get("relevance_score") or 0
+            cur = merged.get(pub)
+            if cur is None or score > (cur.get("best_score") or 0):
+                entry = dict(r)
+                entry["best_score"] = score
+                entry["best_reason"] = (r.get("fulltext_reason")
+                                        or r.get("relevance_reason") or "")
+                merged[pub] = entry
+    pool = [e for e in merged.values()
+            if (e.get("best_score") or 0) >= min_score]
+    pool.sort(key=lambda e: e.get("best_score") or 0, reverse=True)
+    return pool[:top_n]

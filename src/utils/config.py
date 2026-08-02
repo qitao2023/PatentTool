@@ -120,8 +120,8 @@ class Settings:
 
     @property
     def query_max_description_chars(self) -> int:
-        """说明书截断长度（保留发明内容 + 实施方式前段），默认 5000"""
-        return self._raw.get("query_generation", {}).get("max_description_chars", 5000)
+        """说明书截断长度，0=不截断（patent_markdown 全文注入）；>0 才截断。默认 0"""
+        return self._raw.get("query_generation", {}).get("max_description_chars", 0)
 
     # --- 提示词模板 ---
     @property
@@ -131,8 +131,13 @@ class Settings:
 
     @property
     def prompts_active_profile(self) -> str:
-        """当前使用的提示词方案名称"""
-        return self._raw.get("query_generation", {}).get("prompt_profile", "default")
+        """当前检索式方案:
+          default       → 通用检索式
+          semiconductor → 半导体检索式（默认）
+          auto          → 按专利内容自动判断
+        """
+        return self._raw.get("query_generation", {}).get(
+            "prompt_profile", "semiconductor")
 
     def get_prompt_text(self, profile: str, prompt_type: str) -> str:
         """读取指定 profile 的 prompt 文本（system 或 user）
@@ -322,11 +327,6 @@ class Settings:
     def analysis_max_detail_fetch(self) -> int:
         """全文下载上限，默认 200"""
         return self._raw.get("analysis", {}).get("max_detail_fetch", 1000)
-
-    @property
-    def analysis_fulltext_batch_size(self) -> int:
-        """全文筛选时每批发给 AI 的篇数，默认 30（兼容旧流程）"""
-        return self._raw.get("analysis", {}).get("fulltext_batch_size", 30)
 
     # --- 全量 Claims 广筛 ---
     @property

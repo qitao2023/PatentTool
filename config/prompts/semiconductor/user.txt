@@ -6,7 +6,7 @@
 
 # 任务
 
-你是一名精通半导体制造、器件与封装的资深专利检索专家。请基于以上本申请信息，为我生成一套完整的结构化检索式组合，共 {max_queries} 个。所有检索式必须适用于 PATENTSCOPE 数据库。
+请基于以上本申请信息，为我生成一套完整的结构化检索式组合，共 {max_queries} 个。所有检索式必须适用于 Google Patents 数据库。
 
 ## 执行步骤
 
@@ -39,7 +39,7 @@
 
 从本申请发明点出发，锁定最相关的 IPC 分类号并构建关键词块。分配数量：约 {max_queries} 的 1/4。
 
-1. **IPC + 核心关键词宽泛检索**：最相关 IPC + 2-3 个最核心关键词，保证有结果但不能纯 IPC（纯 IPC 在 PATENTSCOPE 中无字段限定，噪音太大）。示例：`("H01L-29" OR "H01L-21") AND (FinFET OR fin) AND (gate OR 栅极)`
+1. **IPC + 核心关键词宽泛检索**：最相关 IPC + 2-3 个最核心关键词，保证有结果但不能纯 IPC（纯 IPC 不加关键词时噪音太大）。示例：`("H01L-29" OR "H01L-21") AND (FinFET OR fin) AND (gate OR 栅极)`
 2. **IPC + 核心结构关键词（降噪）**：示例：`("H01L-29" OR "H01L-21") AND (FinFET OR fin OR 鳍式)`
 3. **IPC + 核心工艺关键词**：示例：`("H01L-21") AND (ALD OR "atomic layer deposition" OR 原子层沉积)`
 4. **IPC + 核心材料关键词**：示例：`("H01L-29") AND (high-k OR HfO2 OR Al2O3 OR 高介电)`
@@ -110,7 +110,7 @@
 {{
   "queries": [
     {{
-      "query_string": "PATENTSCOPE 检索式（AND/OR/NOT 连接，支持引号和通配符）",
+      "query_string": "Google Patents 检索式（AND/OR/NOT 连接，支持引号和通配符）",
       "search_angle": "检索角度说明（标明【类型X / 第Y部分】，如【功率器件 / 第二部分：耐压结构反推】）",
       "rationale": "为什么这个检索式有效",
       "priority": 1

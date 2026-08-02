@@ -91,18 +91,15 @@ async def main():
     for i, r in enumerate(unique[:5]):
         print(f"    [{i+1}] {r.get('publication_number','?')} - {r.get('title','?')[:70]}")
 
-    # ---- Step 3: AI 粗筛 ----
-    print(f"\n[3] AI 从 {len(unique)} 篇中筛选最相关...")
-    screener = PatentScreener(settings)
-    screened = screener.screen(patent, unique, top_n=settings.analysis_top_n)
-    print(f"  筛选出 {len(screened)} 篇:")
-    for i, s in enumerate(screened):
-        print(f"    [{i+1}] {s.get('publication_number','?')} "
-              f"(相关度:{s.get('relevance_score','?')}) "
-              f"{s.get('relevance_reason','')[:60]}")
+    # ---- Step 3: 并行下载全文到 details_dir ----
+    patent_name = re.sub(r'[\\/:*?"<>|]', '_',
+        (patent.publication_number or patent.title or "unknown"))[:80]
+    run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = Path(__file__).parent.parent / "data" / "output" / patent_name / run_dir
+    out.mkdir(parents=True, exist_ok=True)
 
-    # ---- Step 4: 抓取全文 ----
-    print(f"\n[4] 获取 {len(screened)} 篇全文...")
+    details_dir = out / "02_patent_details"
+    print(f"\n[3] 并行下载 {len(unique)} 篇全文到 {details_dir}...")
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True, channel="msedge",
@@ -118,19 +115,29 @@ async def main():
         from src.web_automation.patentscope_scraper import PatentscopeScraper
         scraper = PatentscopeScraper(page, settings, human)
 
-        enriched = await scraper.fetch_details_batch(screened)
+        ok = await scraper.fetch_details_parallel(
+            unique, str(details_dir), concurrency=5)
         await browser.close()
 
-    full_count = sum(1 for r in enriched if not r.get("_no_detail"))
-    print(f"  全文获取: {full_count}/{len(enriched)}")
+    print(f"  全文下载成功: {ok}/{len(unique)}")
+
+    # ---- Step 4: Claims 广筛 ----
+    print(f"\n[4] Claims 广筛（只发权要/实施方式，分批评分排序）...")
+    screener = PatentScreener(settings)
+    all_scored = screener.screen_claims_all(patent, str(details_dir))
+    print(f"  广筛完成: {len(all_scored)} 篇")
+    for i, s in enumerate(all_scored[:5]):
+        print(f"    [{i+1}] {s.get('publication_number','?')} "
+              f"(相关度:{s.get('fulltext_score', s.get('relevance_score','?'))}) "
+              f"{s.get('fulltext_reason','')[:60]}")
 
     # ---- Step 5: AI 对比分析 ----
     print(f"\n[5] AI 对比分析...")
     from src.analysis.comparator import PatentComparator
     comparator = PatentComparator(settings)
-    comparisons = comparator.compare_batch(patent, enriched)
+    comparisons = comparator.compare_batch(patent, all_scored)
     from src.analysis.report import AnalysisReport
-    report = AnalysisReport(patent_doc=patent, comparisons=comparisons, dedup_results=enriched)
+    report = AnalysisReport(patent_doc=patent, comparisons=comparisons, dedup_results=all_scored)
     report.generate()
     print(f"  报告生成完成 ({len(report.markdown_content)} 字)")
 
@@ -138,15 +145,8 @@ async def main():
     print(f"\n[6] AI 撰写审查意见通知书...")
     from src.analysis.oa_writer import OAWriter
     writer = OAWriter(settings)
-    oa_md = writer.write(patent, comparisons, enriched)
+    oa_md = writer.write(patent, comparisons, all_scored)
     print(f"  通知书完成 ({len(oa_md)} 字)")
-
-    # ---- 保存 ----
-    patent_name = re.sub(r'[\\/:*?"<>|]', '_',
-        (patent.publication_number or patent.title or "unknown"))[:80]
-    run_dir = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = Path(__file__).parent.parent / "data" / "output" / patent_name / run_dir
-    out.mkdir(parents=True, exist_ok=True)
 
     def save(name, data):
         path = out / name
@@ -160,14 +160,12 @@ async def main():
     save("01_search_abstracts.json", {
         "stage": "search_abstracts", "total": len(unique),
         "queries": [q.get("query_string","") for q in queries], "results": unique})
-    save("02_ai_screened.json", {
-        "stage": "ai_screened", "total_before": len(unique),
-        "total_after": len(screened), "results": screened})
-    save("03_full_details.json", {
-        "stage": "full_details", "total": len(enriched),
-        "full_text_count": full_count, "results": enriched})
-    save("04_analysis_report.md", report.markdown_content)
-    save("05_审查意见通知书.md", oa_md)
+    save("02_screened.json", {
+        "stage": "claims_wide_screen", "total_downloaded": ok,
+        "total_scored": len(all_scored),
+        "content_mode": settings.analysis_screen_content, "results": all_scored})
+    save("03_analysis_report.md", report.markdown_content)
+    save("04_审查意见通知书.md", oa_md)
 
     print(f"\n{'='*60}")
     print(f"  ✅ 全流程完成!")

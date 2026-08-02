@@ -28,7 +28,7 @@ class QueryGenerator:
                  max_queries: int = 10) -> list[dict]:
         """生成检索式列表，带重试（deepseek 偶发返回 null/格式错误）。"""
         client = self._get_client()
-        system_prompt = build_system_prompt(self.settings)
+        system_prompt = build_system_prompt(self.settings, patent)
         user_prompt = build_user_prompt(patent, max_queries, self.settings)
 
         last_err: Exception | None = None

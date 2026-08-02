@@ -23,9 +23,24 @@ STAGE_FILES = {
     "screen":    "03_ai_screened.json",
     "analysis":  "04_analysis_report.md",
     "oa":        "05_审查意见通知书.md",
+    "oa_docx":   "07_审查意见通知书.docx",      # 通知书 DOCX（office_action 版式）
     "cache":     "comparison_cache.json",       # AI 对比结果缓存
     "log":       "run.log",                     # 运行日志
 }
+
+# 对比文件全文缓存目录（PDF 同级，永久保留，不重复下载全文）
+CACHE_DIR_NAME = "patent_detail"
+
+
+def patent_detail_dir(pdf_dir) -> Path:
+    """定位全文缓存目录（{pdf_dir}/patent_detail/）。
+
+    全文缓存永久保留，不做清理。
+    """
+    base = Path(pdf_dir)
+    dir_path = base / CACHE_DIR_NAME
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return dir_path
 
 
 @dataclass

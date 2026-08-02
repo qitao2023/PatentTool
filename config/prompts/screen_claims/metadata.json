@@ -1,0 +1,12 @@
+{
+  "display_name": "Claims 广筛",
+  "kind": "stage",
+  "description": "按内容模式分批广筛并评分（claims/embodiments/both）",
+  "system_files": ["system_claims", "system_embodiments", "system_both"],
+  "system_labels": {
+    "system_claims": "仅权利要求",
+    "system_embodiments": "仅具体实施方式",
+    "system_both": "权利要求 + 具体实施方式"
+  },
+  "system_default": "system_claims"
+}

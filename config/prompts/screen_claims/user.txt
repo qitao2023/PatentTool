@@ -1,0 +1,8 @@
+## 本申请
+{patent_summary}
+
+## 对比文件 第{batch_number}/{num_batches}批（共{batch_count}篇）
+{candidates_text}
+
+---
+请给每篇评分。输出 JSON 数组，必须包含全部 {batch_count} 篇。

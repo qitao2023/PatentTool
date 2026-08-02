@@ -245,6 +245,10 @@ _GOOGLE_SEARCH_EXTRACT_JS = """(maxItems) => {
         return out;
     }
     const results = [];
+    let declared = null;
+    // Google 页头估算总数（"About 18 results"），用于与实际渲染数对比日志
+    const declaredM = (document.body.innerText || '').match(/(?:About\\s*)?(\\d+)\\s*results?/i);
+    if (declaredM) declared = parseInt(declaredM[1], 10);
     document.querySelectorAll('search-result-item').forEach(item => {
         const root = item.shadowRoot || item;
         const title = (deepQ(root, 'h3')?.textContent || '').trim();
@@ -282,9 +286,18 @@ _GOOGLE_SEARCH_EXTRACT_JS = """(maxItems) => {
         if (title && pubs.length) {
             results.push({title, pub: pubs[0], abstract, assignee, pubDate});
         }
-        if (results.length >= maxItems) return results;
+        if (results.length >= maxItems) return {items: results, declared};
     });
-    return results;
+    return {items: results, declared};
+}"""
+
+# 统计已渲染的完整结果数（含标题的 search-result-item），排除骨架节点
+_GOOGLE_COUNT_JS = """() => {
+    let n = 0;
+    for (const it of document.querySelectorAll('search-result-item')) {
+        if ((it.shadowRoot || it).querySelector('h3')) n++;
+    }
+    return n;
 }"""
 
 
@@ -332,23 +345,26 @@ async def search_abstracts(page, query: str, max_results: int = 100,
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2000)
 
-    # 轮询等待结果出现（须含标题内容，排除骨架节点）
-    for i in range(15):
-        n = await page.evaluate("""() => {
-            const items = document.querySelectorAll('search-result-item');
-            for (const it of items) {
-                const root = it.shadowRoot || it;
-                if (root.querySelector('h3')) return items.length;
-            }
-            return 0;
-        }""")
-        if n > 0:
-            break
-        await page.wait_for_timeout(2000)
+    # 轮询等待结果稳定渲染：首个 h3 出现后，数量连续两次不再增长才认为渲染完成。
+    # Google 会分批/懒加载结果，过早提取会漏掉后渲染的条目。
+    prev = -1
+    stable = 0
+    for _ in range(15):
+        n = await page.evaluate(_GOOGLE_COUNT_JS)
+        if n > 0 and n == prev:
+            stable += 1
+            if stable >= 2:
+                break
+        else:
+            stable = 0
+        prev = n
+        await page.wait_for_timeout(1500)
     # 稍等 shadow DOM 内容渲染完成再提取
     await page.wait_for_timeout(800)
 
-    items = await page.evaluate(_GOOGLE_SEARCH_EXTRACT_JS, max_results)
+    data = await page.evaluate(_GOOGLE_SEARCH_EXTRACT_JS, max_results)
+    items = data["items"]
+    declared = data.get("declared")
     results = []
     for it in items:
         pub = it["pub"]
@@ -365,8 +381,12 @@ async def search_abstracts(page, query: str, max_results: int = 100,
             "source_query": query,
         })
     if signals:
-        signals.log.emit("SUCCESS",
-            f"  [Google] 搜索完成: {len(results)} 篇")
+        msg = f"  [Google] 搜索完成: {len(results)} 篇"
+        if declared is not None and declared != len(results):
+            # Google 页头 "About N results" 是估算数（含同族/未去重），
+            # 实际渲染数才是本页可取到的结果，如实说明避免误判漏抓
+            msg += f"（Google 声明约{declared}条，实际渲染{len(results)}条）"
+        signals.log.emit("SUCCESS", msg)
     return results
 
 

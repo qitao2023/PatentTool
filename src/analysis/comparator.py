@@ -7,6 +7,12 @@ from typing import Optional
 from src.utils.config import Settings
 from src.pdf_extractor.extractor import PatentDocument
 from src.ai_client import AIClient
+from src.utils.prompts import (
+    load_prompt,
+    render_template,
+    COMPARISON_FALLBACK_SYSTEM_PROMPT,
+    COMPARISON_FALLBACK_USER_PROMPT,
+)
 
 
 class PatentComparator:
@@ -27,13 +33,13 @@ class PatentComparator:
         """批量对比分析：直接用已有评分排序，对 Top-N 做详细对比。
 
         评分来源（上游已计算，不再重复调 AI）：
-          - fulltext_score（screen_fulltext / 阶段4）
+          - fulltext_score（Claims 广筛 / 阶段4）
           - 降级用 relevance_score
         """
         client = self._get_client()
         comparisons = []
 
-        # 按已有评分排序（上游 screen_fulltext 已算好，不重复调 AI）
+        # 按已有评分排序（上游 Claims 广筛已算好，不重复调 AI）
         top_n = self.settings.analysis_top_n
         top_results = sorted(results,
             key=lambda x: x.get("fulltext_score", x.get("relevance_score", 0)),
@@ -56,49 +62,29 @@ class PatentComparator:
         cand_desc = result.get("description") or ""
         cand_abstract = result.get("abstract") or result.get("abstract_snippet") or ""
 
-        prompt = f"""# 本申请专利
-发明名称: {patent.title}
-IPC分类: {', '.join(patent.ipc_classifications)}
-摘要: {patent.abstract}
-
-权利要求书:
-{chr(10).join(patent.claims[:10])}
-
-说明书（节选）:
-{patent.description[:1500] if patent.description else '(无)'}
-
-# 对比文献
-公布号: {result.get('publication_number', 'N/A')}
-标题: {result.get('title', 'N/A')}
-申请人: {result.get('applicant', 'N/A')}
-公开日: {result.get('publication_date', 'N/A')}
-IPC: {result.get('ipc', 'N/A')}
-摘要: {cand_abstract}
-
-权利要求书:
-{cand_claims if cand_claims else '(无)'}
-
-说明书（节选）:
-{cand_desc if cand_desc else '(无)'}
-
-# 分析任务
-请对以上对比文献与本申请进行专业对比分析，输出JSON格式：
-
-{{
-  "publication_number": "对比文献公布号",
-  "relevance_score": 0-100的评分,
-  "novelty_impact": "新颖性影响: high/moderate/low",
-  "inventive_step_impact": "创造性影响: high/moderate/low",
-  "key_features_same": ["与本申请相同的技术特征列表"],
-  "key_features_different": ["与本申请不同的技术特征列表"],
-  "conclusion": "综合评述（100-200字）"
-}}
-
-只输出JSON，不要包含其他内容。"""
+        prompt = render_template(
+            load_prompt(self.settings, "comparison", "user",
+                        COMPARISON_FALLBACK_USER_PROMPT),
+            application_title=patent.title,
+            application_ipc=", ".join(patent.ipc_classifications),
+            application_abstract=patent.abstract,
+            application_claims="\n".join(patent.claims[:10]),
+            application_description=(patent.description[:1500]
+                                     if patent.description else "(无)"),
+            comparison_publication_number=result.get("publication_number", "N/A"),
+            comparison_title=result.get("title", "N/A"),
+            comparison_applicant=result.get("applicant", "N/A"),
+            comparison_publication_date=result.get("publication_date", "N/A"),
+            comparison_ipc=result.get("ipc", "N/A"),
+            comparison_abstract=cand_abstract,
+            comparison_claims=cand_claims if cand_claims else "(无)",
+            comparison_description=cand_desc if cand_desc else "(无)")
 
         try:
             content = client.chat(
-                system_prompt="你是一位中国专利审查专家，精通新颖性和创造性判断。",
+                system_prompt=load_prompt(
+                    self.settings, "comparison", "system",
+                    COMPARISON_FALLBACK_SYSTEM_PROMPT),
                 user_prompt=prompt,
                 max_tokens=4096,
                 temperature=0.3,

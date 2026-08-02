@@ -25,12 +25,12 @@ ai:
 query_generation:
   max_queries: 20
   max_tokens: 8192
-  max_description_chars: 5000      # 说明书截断长度（保留发明内容 + 实施方式前段）
-  prompt_profile: "semiconductor"    # 提示词方案: "default" 或 "semiconductor"
+  max_description_chars: 0         # 说明书截断长度，0=不截断（patent_markdown 全文注入）；>0 才截断
+  prompt_profile: "semiconductor"    # 检索式方案: "semiconductor"(默认) | "default" | "auto"(按专利内容判断)
 
 # Web自动化
 web:
-  browser: "msedge"                # chrome / msedge / firefox
+  browser: "chrome"                # chrome / msedge / firefox
   use_cdp: false                    # true=连已有浏览器(需先开 --remote-debugging-port)
   cdp_port: 9222                    # CDP 远程调试端口
   viewport_width: 1920
@@ -44,7 +44,7 @@ web:
 search:
   include_citations: true       # 从说明书提取引用专利号
   force_refresh: false          # 强制重新获取本申请
-  stop_after: "download"            # 流程断点: abstracts | screen | download | score | full
+  stop_after: "full"            # 流程断点: abstracts | screen | download | score | full
   prefer_cn_family: true        # 优先使用中国同族专利：下载全文时若遇非CN专利，自动查专利族中的CN专利替换
   search_source: "google"            # 全链路引擎: wipo(搜索+下载走PATENTSCOPE) | google(搜索+下载走Google Patents)
   download_concurrency: 20           # 下载并发数（主流程+批量测试共用；wipo 自动保守为1防403）
@@ -107,12 +107,10 @@ dedup:
 analysis:
   max_tokens: 8192
   max_detail_fetch: 1000      # 全文下载上限（不再做摘要粗筛，超过则直接截断）
-  fulltext_batch_size: 30     # 旧全文筛选每批篇数（兼容保留）
-  max_chars_per_patent: 3000  # 旧全文筛选每篇字符数（兼容保留）
   top_n_for_detailed: 10
   batch_comparison: true
 
-  # 全量 Claims 广筛（替代摘要粗筛 + 旧全文评分）
+  # 全量 Claims 广筛（替代摘要粗筛）
   screen_content: "embodiments"  # 广筛内容: claims | embodiments | claims+embodiments
                                  #   embodiments = 具体实施方式（审查员推荐，
                                  #   对比文件实际实施方案比权利要求更能判断可用性）

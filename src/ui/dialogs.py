@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSlider, QTabWidget, QWidget, QMessageBox,
     QGroupBox, QPlainTextEdit, QSpinBox, QCheckBox, QInputDialog,
-    QListWidget, QListWidgetItem, QFileDialog,
+    QListWidget, QListWidgetItem, QFileDialog, QTreeWidget, QTreeWidgetItem,
+    QSplitter, QScrollArea, QFrame,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -48,7 +49,14 @@ class SettingsDialog(QDialog):
         # Tab 1: 大模型设置
         # ================================================================
         tab_ai = QWidget()
-        ai_layout = QVBoxLayout(tab_ai)
+        ai_outer = QVBoxLayout(tab_ai)
+        ai_outer.setContentsMargins(0, 0, 0, 0)
+        ai_scroll = QScrollArea()
+        ai_scroll.setWidgetResizable(True)
+        ai_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        ai_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        ai_content = QWidget()
+        ai_layout = QVBoxLayout(ai_content)
 
         # --- AI 全局设置 ---
         ai_group = QGroupBox("AI 引擎设置")
@@ -109,13 +117,22 @@ class SettingsDialog(QDialog):
 
         ai_layout.addWidget(stage_group)
         ai_layout.addStretch(1)
+        ai_scroll.setWidget(ai_content)
+        ai_outer.addWidget(ai_scroll)
         self.tab_widget.addTab(tab_ai, "🤖 大模型设置")
 
         # ================================================================
         # Tab 2: 参数设置
         # ================================================================
         tab_params = QWidget()
-        params_layout = QVBoxLayout(tab_params)
+        params_outer = QVBoxLayout(tab_params)
+        params_outer.setContentsMargins(0, 0, 0, 0)
+        params_scroll = QScrollArea()
+        params_scroll.setWidgetResizable(True)
+        params_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        params_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        params_content = QWidget()
+        params_layout = QVBoxLayout(params_content)
 
         # ── 浏览器选择 ──
         browser_group = QGroupBox("浏览器")
@@ -180,7 +197,43 @@ class SettingsDialog(QDialog):
         search_form.addRow("下载并发数:", self.download_concurrency_spin)
 
         params_layout.addWidget(search_group)
+
+        # ── 检索式生成 ──
+        query_group = QGroupBox("检索式生成")
+        query_form = QFormLayout(query_group)
+
+        self.prompt_profile_combo = QComboBox()
+        self.prompt_profile_combo.addItem("半导体检索式（默认）", "semiconductor")
+        self.prompt_profile_combo.addItem("自动判断（按专利内容）", "auto")
+        self.prompt_profile_combo.addItem("通用检索式", "default")
+        self.prompt_profile_combo.setToolTip(
+            "检索式生成使用哪套提示词方案：\n"
+            "  半导体检索式   固定使用半导体专属方案（IPC全谱/洋葱分层/三语覆盖）\n"
+            "  自动判断       按本申请 IPC 分类号与标题/摘要关键词自动判断半导体/通用\n"
+            "  通用检索式     固定使用通用方案（不限技术领域）\n"
+            "可在提示词配置面板中分别编辑两套方案的具体提示词。")
+        query_form.addRow("检索式方案:", self.prompt_profile_combo)
+        params_layout.addWidget(query_group)
+
+        # ── 分析参数 ──
+        analysis_group = QGroupBox("分析参数")
+        analysis_form = QFormLayout(analysis_group)
+
+        self.screen_content_combo = QComboBox()
+        self.screen_content_combo.addItem("仅具体实施方式（审查员推荐）", "embodiments")
+        self.screen_content_combo.addItem("仅权利要求（紧凑）", "claims")
+        self.screen_content_combo.addItem("权利要求 + 具体实施方式（各占一半）", "claims+embodiments")
+        self.screen_content_combo.setToolTip(
+            "Claims 广筛时发给 AI 的对比文件内容，并自动切换对应提示词变体：\n"
+            "  仅具体实施方式      system_embodiments（推荐，对比实际实施方案）\n"
+            "  仅权利要求          system_claims（紧凑）\n"
+            "  权利要求+具体实施方式 system_both（每篇各占一半预算）")
+        analysis_form.addRow("广筛内容模式:", self.screen_content_combo)
+
+        params_layout.addWidget(analysis_group)
         params_layout.addStretch(1)
+        params_scroll.setWidget(params_content)
+        params_outer.addWidget(params_scroll)
         self.tab_widget.addTab(tab_params, "⚙ 检索参数")
 
         # ================================================================
@@ -252,6 +305,15 @@ class SettingsDialog(QDialog):
         idx = self.stop_after_combo.findData(stop)
         if idx >= 0:
             self.stop_after_combo.setCurrentIndex(idx)
+        # 广筛内容模式
+        sc = self.settings.analysis_screen_content
+        idx = self.screen_content_combo.findData(sc)
+        if idx >= 0:
+            self.screen_content_combo.setCurrentIndex(idx)
+        # 检索式方案
+        pp = self.settings.prompts_active_profile
+        idx = self.prompt_profile_combo.findData(pp)
+        self.prompt_profile_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _populate_models(self):
         """根据当前提供商填充所有模型下拉框"""
@@ -403,6 +465,8 @@ class SettingsDialog(QDialog):
             "prefer_cn_family": self.prefer_cn_family_cb.isChecked(),
             "search_source": self.search_source_combo.currentData(),
             "download_concurrency": self.download_concurrency_spin.value(),
+            "screen_content": self.screen_content_combo.currentData(),
+            "prompt_profile": self.prompt_profile_combo.currentData(),
         }
 
         # 写检索参数到 settings.yaml
@@ -439,6 +503,26 @@ class SettingsDialog(QDialog):
                     content = re.sub(
                         r'(search:\s*\n)',
                         f'\\1  download_concurrency: {_dl}\n', content)
+                # 广筛内容模式（analysis 段）
+                _sc = params["screen_content"]
+                if re.search(r'screen_content:\s*\S+', content):
+                    content = re.sub(
+                        r'screen_content:\s*\S+',
+                        f'screen_content: "{_sc}"', content)
+                else:
+                    content = re.sub(
+                        r'(analysis:\s*\n)',
+                        f'\\1  screen_content: "{_sc}"\n', content)
+                # 检索式方案（query_generation 段）
+                _pp = params["prompt_profile"]
+                if re.search(r'prompt_profile:\s*"[^"]*"', content):
+                    content = re.sub(
+                        r'prompt_profile:\s*"[^"]*"',
+                        f'prompt_profile: "{_pp}"', content)
+                else:
+                    content = re.sub(
+                        r'(query_generation:\s*\n)',
+                        f'\\1  prompt_profile: "{_pp}"\n', content)
                 yaml_path.write_text(content, encoding="utf-8")
                 # 强制刷新 Settings 内存缓存
                 import yaml as _yaml
@@ -466,61 +550,121 @@ class SettingsDialog(QDialog):
             f"  提取引用专利: {'是' if params['include_citations'] else '否'}\n"
             f"  强制重新获取: {'是' if params['force_refresh'] else '否'}\n"
             f"  优先使用中国同族: {'是' if params['prefer_cn_family'] else '否'}\n"
-            f"  流程断点: {self.stop_after_combo.currentText()}\n\n"
+            f"  流程断点: {self.stop_after_combo.currentText()}\n"
+            f"  广筛内容模式: {self.screen_content_combo.currentText()}\n"
+            f"  检索式方案: {self.prompt_profile_combo.currentText()}\n\n"
             "设置已写入 config/.env 和 config/settings.yaml，持续生效。")
 
 
+_PROFILE_DISPLAY_FALLBACK = {
+    "default": "通用检索式",
+    "semiconductor": "半导体检索式",
+    "office_action": "审查意见通知书撰写（OA）",
+}
+
+
+def _read_profile_meta(profile_dir: Path) -> dict:
+    """读取 profile 文件夹下的 metadata.json（显示名、kind、变体等）"""
+    meta_path = profile_dir / "metadata.json"
+    if meta_path.exists():
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+# 提示词方案 → 树形面板类别（无 metadata 时的兜底分组）
+_CATEGORY_BY_NAME = {
+    "default": "检索式生成",
+    "semiconductor": "检索式生成",
+    "office_action": "OA 撰写",
+}
+_DEFAULT_CATEGORY = "分析阶段"
+
+# 树节点 payload 存放角色
+_ITEM_ROLE = Qt.UserRole
+
+
 class PromptEditorDialog(QDialog):
-    """提示词模板编辑器 — 编辑 System/User Prompt 模板"""
+    """提示词模板编辑器 — 编辑 System/User Prompt 模板
+
+    kind 区分两类 profile：
+      - "profile"：领域切换方案（default/semiconductor），保存时写 prompt_profile 到 settings.yaml
+      - "stage"：固定业务阶段（screen_claims/comparison/final_review/office_action），
+        保存时不改 prompt_profile，从 src.utils.prompts.STAGE_FALLBACKS 取兜底
+    """
 
     prompt_saved = Signal(str)  # 发射当前活跃的 profile 名称
 
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self._current_profile = settings.prompts_active_profile
         self._profiles = self._scan_profiles()
-        self._modified = False
+        self._current_profile = None
+        self._current_system_file = "system"
 
         self.setWindowTitle("提示词配置")
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(1000, 640)
         self._setup_ui()
-        self._load_current_profile()
+        self._select_default_profile()
 
-    def _scan_profiles(self) -> list[str]:
+    def _profile_meta(self, name: str) -> dict:
+        for p in self._profiles:
+            if p["name"] == name:
+                return p
+        return {"name": name, "display": name, "kind": "profile",
+                "description": "", "system_files": ["system"],
+                "system_labels": {}, "system_default": "system"}
+
+    def _scan_profiles(self) -> list[dict]:
         """扫描 prompts 目录下所有子文件夹作为 profile 列表"""
         prompts_dir = self.settings.prompts_dir
         if not prompts_dir.exists():
-            return ["default"]
-        profiles = sorted([
-            p.name for p in prompts_dir.iterdir()
-            if p.is_dir() and (p / "system.txt").exists()
-        ])
-        return profiles if profiles else ["default"]
+            return [self._profile_meta("default")]
+        profiles = []
+        for p in sorted(prompts_dir.iterdir()):
+            if not p.is_dir():
+                continue
+            meta = _read_profile_meta(p)
+            has_prompt_files = (p / "system.txt").exists() or (p / "user.txt").exists()
+            if not meta and not has_prompt_files:
+                continue
+            system_files = meta.get("system_files") or ["system"]
+            profiles.append({
+                "name": p.name,
+                "display": meta.get("display_name")
+                           or _PROFILE_DISPLAY_FALLBACK.get(p.name, p.name),
+                "kind": meta.get("kind", "profile"),
+                "description": meta.get("description", ""),
+                "system_files": system_files,
+                "system_labels": meta.get("system_labels", {}),
+                "system_default": meta.get("system_default", system_files[0]),
+            })
+        return profiles if profiles else [self._profile_meta("default")]
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # ── 顶部：方案选择 ──
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(QLabel("提示词方案:"))
-        self.profile_combo = QComboBox()
-        for name in self._profiles:
-            label = f"{name}（半导体专利）" if name == "semiconductor" else f"{name}（通用专利）"
-            self.profile_combo.addItem(label, name)
-        idx = self.profile_combo.findData(self._current_profile)
-        if idx >= 0:
-            self.profile_combo.setCurrentIndex(idx)
-        self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
-        top_bar.addWidget(self.profile_combo, 1)
-        top_bar.addStretch()
-        layout.addLayout(top_bar)
+        # ── 主体：左侧树形面板 + 右侧编辑器 ──
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setColumnCount(1)
+        self.tree.setMinimumWidth(230)
+        self.tree.currentItemChanged.connect(self._on_tree_selection)
+        splitter.addWidget(self.tree)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
 
         # ── 提示信息 ──
-        hint = QLabel("💡 修改提示词会影响检索式生成质量。保存后下次检索生效。")
-        hint.setObjectName("hintLabel")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self.hint_label = QLabel("💡 修改提示词会影响对应阶段的分析质量。保存后下次运行该阶段生效。")
+        self.hint_label.setObjectName("hintLabel")
+        self.hint_label.setWordWrap(True)
+        rl.addWidget(self.hint_label)
 
         # ── 编辑区（Tab 切换 System / User） ──
         self.tab_widget = QTabWidget()
@@ -538,16 +682,21 @@ class PromptEditorDialog(QDialog):
         self.user_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.tab_widget.addTab(self.user_edit, "User Prompt")
 
-        layout.addWidget(self.tab_widget, 1)
+        rl.addWidget(self.tab_widget, 1)
 
         # ── 变量说明 ──
         var_label = QLabel(
-            "可用变量: {patent_markdown}（专利全文Markdown）  "
-            "{max_queries}（检索式数量）"
+            "可用变量因阶段而异，见各 profile 文件夹下的 README.md。\n"
+            "提示词中的 JSON 示例花括号 {} 会原样保留，无需转义。"
         )
         var_label.setWordWrap(True)
         var_label.setStyleSheet("color: #666; font-size: 11px; padding: 4px;")
-        layout.addWidget(var_label)
+        rl.addWidget(var_label)
+
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
 
         # ── 底部按钮 ──
         btn_row = QHBoxLayout()
@@ -565,34 +714,126 @@ class PromptEditorDialog(QDialog):
         btn_row.addWidget(save_btn)
         layout.addLayout(btn_row)
 
-    def _load_current_profile(self):
-        """加载当前选中方案的提示词到编辑器"""
-        profile = self.profile_combo.currentData()
-        if not profile:
+        self._build_tree()
+
+    def _build_tree(self):
+        """按类别建树：类别 → profile（多 system 文件时展开为变体子节点）"""
+        self.tree.blockSignals(True)
+        self.tree.clear()
+
+        categories = {}
+        for prof in self._profiles:
+            cat = _CATEGORY_BY_NAME.get(prof["name"], _DEFAULT_CATEGORY)
+            categories.setdefault(cat, []).append(prof)
+
+        cat_items = {}
+        for cat in ("检索式生成", "分析阶段", "OA 撰写"):
+            if cat not in categories:
+                continue
+            node = QTreeWidgetItem([cat])
+            node.setData(0, _ITEM_ROLE, {"kind": "category"})
+            f = node.font(0)
+            f.setBold(True)
+            node.setFont(0, f)
+            self.tree.addTopLevelItem(node)
+            cat_items[cat] = node
+
+        for cat, profs in categories.items():
+            for prof in profs:
+                self._add_profile_item(cat_items[cat], prof)
+
+        self.tree.expandAll()
+        self.tree.blockSignals(False)
+
+    def _add_profile_item(self, parent: "QTreeWidgetItem", prof: dict):
+        """添加一个 profile 节点；多 system 文件时展开为变体子节点"""
+        name = prof["name"]
+        files = prof["system_files"]
+        node = QTreeWidgetItem([prof["display"]])
+        node.setData(0, _ITEM_ROLE, {
+            "kind": "profile", "name": name,
+            "system_file": prof.get("system_default") or files[0]})
+        parent.addChild(node)
+        if len(files) > 1:
+            for f in files:
+                label = prof["system_labels"].get(f, f)
+                vnode = QTreeWidgetItem([label])
+                vnode.setData(0, _ITEM_ROLE, {
+                    "kind": "variant", "name": name, "system_file": f})
+                node.addChild(vnode)
+
+    def _iter_profile_items(self):
+        """遍历所有可编辑节点（profile 及变体子节点）"""
+        for i in range(self.tree.topLevelItemCount()):
+            cat = self.tree.topLevelItem(i)
+            for j in range(cat.childCount()):
+                node = cat.child(j)
+                yield node
+                for k in range(node.childCount()):
+                    yield node.child(k)
+
+    def _find_profile_item(self, name: str):
+        """按 profile 名查找第一个 profile 节点"""
+        for it in self._iter_profile_items():
+            d = it.data(0, _ITEM_ROLE)
+            if d and d.get("name") == name and d.get("kind") == "profile":
+                return it
+        return None
+
+    def _select_default_profile(self):
+        """默认选中 settings 的 prompt_profile；找不到则选第一个"""
+        it = self._find_profile_item(self.settings.prompts_active_profile)
+        if it is None:
+            for cand in self._iter_profile_items():
+                it = cand
+                break
+        if it is not None:
+            self.tree.setCurrentItem(it)
+        else:
+            self._load_profile("default", "system")
+
+    def _on_tree_selection(self, current, previous):
+        """树节点切换 → 加载对应方案"""
+        if current is None:
             return
-        self._current_profile = profile
+        d = current.data(0, _ITEM_ROLE)
+        if not d or d.get("kind") == "category":
+            return
+        self._load_profile(d["name"], d["system_file"])
 
-        system_text = self.settings.get_prompt_text(profile, "system")
-        user_text = self.settings.get_prompt_text(profile, "user")
+    def _load_profile(self, name: str, system_file: str):
+        """加载指定方案的提示词到编辑器"""
+        self._current_profile = name
+        self._current_system_file = system_file
+        meta = self._profile_meta(name)
+        self.hint_label.setText(
+            "💡 " + (meta["description"]
+                     or "修改提示词会影响对应阶段的分析质量。保存后下次运行该阶段生效。"))
 
-        # 如果文件不存在，从 fallback 常量获取
-        if not system_text:
-            from src.query_generator.prompts import FALLBACK_SYSTEM_PROMPT
-            system_text = FALLBACK_SYSTEM_PROMPT
-        if not user_text:
-            from src.query_generator.prompts import FALLBACK_USER_PROMPT
-            user_text = FALLBACK_USER_PROMPT
+        if meta["kind"] == "stage":
+            from src.utils.prompts import STAGE_FALLBACKS
+            fb = STAGE_FALLBACKS.get(name, {})
+            if name == "screen_claims":
+                mode = system_file[len("system_"):]
+                system_fb = fb.get("system", {}).get(mode, "")
+            else:
+                system_fb = fb.get("system", "")
+            user_fb = fb.get("user", "")
+        else:
+            from src.query_generator.prompts import (
+                FALLBACK_SYSTEM_PROMPT, FALLBACK_USER_PROMPT)
+            system_fb = FALLBACK_SYSTEM_PROMPT
+            user_fb = FALLBACK_USER_PROMPT
+
+        system_text = self.settings.get_prompt_text(name, system_file) or system_fb
+        user_text = self.settings.get_prompt_text(name, "user") or user_fb
 
         self.system_edit.setPlainText(system_text)
         self.user_edit.setPlainText(user_text)
 
-    def _on_profile_changed(self):
-        """切换方案 → 加载对应内容"""
-        self._load_current_profile()
-
     def _on_reset(self):
         """恢复当前方案为出厂默认"""
-        profile = self.profile_combo.currentData()
+        profile = self._current_profile
         if not profile:
             return
 
@@ -605,55 +846,48 @@ class PromptEditorDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        from src.query_generator.prompts import FALLBACK_SYSTEM_PROMPT, FALLBACK_USER_PROMPT
-        # 如果是 semiconductor 方案，没有代码级 fallback（只有文件级），
-        # 恢复 = 删除文件让它重新从默认状态创建
-        # 这里直接清空编辑器让用户重新保存
-        if profile == "semiconductor":
-            self.system_edit.setPlainText(FALLBACK_SYSTEM_PROMPT)
-            self.user_edit.setPlainText(FALLBACK_USER_PROMPT)
+        meta = self._profile_meta(profile)
+        if meta["kind"] == "stage":
+            from src.utils.prompts import STAGE_FALLBACKS
+            fb = STAGE_FALLBACKS.get(profile, {})
+            if profile == "screen_claims":
+                mode = self._current_system_file[len("system_"):]
+                system_fb = fb.get("system", {}).get(mode, "")
+            else:
+                system_fb = fb.get("system", "")
+            self.system_edit.setPlainText(system_fb)
+            self.user_edit.setPlainText(fb.get("user", ""))
         else:
+            from src.query_generator.prompts import (
+                FALLBACK_SYSTEM_PROMPT, FALLBACK_USER_PROMPT)
             self.system_edit.setPlainText(FALLBACK_SYSTEM_PROMPT)
             self.user_edit.setPlainText(FALLBACK_USER_PROMPT)
 
     def _on_save(self):
         """保存当前编辑内容到磁盘"""
-        profile = self.profile_combo.currentData()
+        profile = self._current_profile
         if not profile:
             return
+        meta = self._profile_meta(profile)
 
         # 确保目录存在
         profile_dir = self.settings.prompts_dir / profile
         profile_dir.mkdir(parents=True, exist_ok=True)
 
-        # 写入 system.txt
-        system_path = profile_dir / "system.txt"
+        # 写入当前变体的 system 文件
+        system_file = self._current_system_file
+        system_path = profile_dir / f"{system_file}.txt"
         system_path.write_text(self.system_edit.toPlainText(), encoding="utf-8")
 
         # 写入 user.txt
         user_path = profile_dir / "user.txt"
         user_path.write_text(self.user_edit.toPlainText(), encoding="utf-8")
 
-        # 更新活跃方案
-        yaml_path = self.settings.config_dir / "settings.yaml"
-        if yaml_path.exists():
-            content = yaml_path.read_text(encoding="utf-8")
-            import re
-            if re.search(r'prompt_profile:\s*"[^"]*"', content):
-                content = re.sub(
-                    r'prompt_profile:\s*"[^"]*"',
-                    f'prompt_profile: "{profile}"',
-                    content)
-            else:
-                content = re.sub(
-                    r'(max_tokens:\s*\d+)',
-                    f'\\1\n  prompt_profile: "{profile}"',
-                    content)
-            yaml_path.write_text(content, encoding="utf-8")
-
+        # 注：不再写 settings.yaml 的 prompt_profile —— 方案切换统一走
+        #   ⚙ 设置 → 检索式生成 → 检索式方案（半导体/自动/通用），避免与 auto 模式冲突
         self.prompt_saved.emit(profile)
         QMessageBox.information(self, "已保存",
-            f"提示词方案「{profile}」已保存到:\n{profile_dir}\n\n下次检索生效。")
+            f"提示词方案「{meta['display']}」已保存到:\n{profile_dir}\n\n下次运行该阶段生效。")
         self.accept()
 
 
@@ -987,3 +1221,376 @@ class TestDialog(QDialog):
                 f"下次打开测试工具将自动加载这些值。")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", f"无法写入配置文件:\n{e}")
+
+
+class OAWriteDialog(QDialog):
+    """审查意见通知书撰写对话框 — 选择对比文件 + 角色指定 + 输出选项
+
+    对比文件三种来源（Tab）：
+      A. 从检索结果选（主窗口当前 _dedup_results）
+      B. 从历史记录选（读取 03_full_details.json / 03_ai_screened.json）
+      C. 上传 PDF（PatentPDFExtractor 解析）
+
+    确定后发射 start_oa(payload)：
+      {"patent_doc", "comparisons", "dedup_results", "options"}
+    """
+
+    start_oa = Signal(dict)
+
+    def __init__(self, patent_doc, dedup_results: list | None = None,
+                 settings: Settings | None = None, parent=None):
+        super().__init__(parent)
+        self._patent_doc = patent_doc
+        self._dedup_results = dedup_results or []
+        self._settings = settings
+        self._current_docs: list[dict] = []          # 当前选中的对比文件（dedup 结构）
+        self._uploaded_docs: list[dict] = []          # 上传 PDF 解析结果
+        self._history_docs: list[dict] = []           # 当前历史运行加载的对比文件
+
+        self.setWindowTitle("撰写审查意见通知书")
+        self.setMinimumSize(760, 600)
+        self._setup_ui()
+        self._load_patent_info()
+        self._populate_search_results()
+        self._auto_assign_roles()
+
+    # ── UI ─────────────────────────────────────────────────────────────
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ── 专利信息（只读） ───────────────────────────────────────────
+        patent_box = QGroupBox("本申请")
+        patent_layout = QVBoxLayout(patent_box)
+        pub = ""
+        title = ""
+        if self._patent_doc:
+            pub = getattr(self._patent_doc, "publication_number", "") or ""
+            title = getattr(self._patent_doc, "title", "") or ""
+        self.patent_label = QLabel(
+            f"公布号: {pub or '（未解析）'}  |  {title}")
+        self.patent_label.setWordWrap(True)
+        self.patent_label.setStyleSheet("color: #1a365d; padding: 4px;")
+        patent_layout.addWidget(self.patent_label)
+        layout.addWidget(patent_box)
+
+        # ── 对比文件选择（三来源 Tab） ─────────────────────────────────
+        self.source_tabs = QTabWidget()
+        layout.addWidget(self.source_tabs, 1)
+
+        # Tab A：从检索结果
+        tab_search = QWidget()
+        tsl = QVBoxLayout(tab_search)
+        self.search_list = QListWidget()
+        self.search_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.search_list.itemSelectionChanged.connect(self._sync_current_docs)
+        tsl.addWidget(self.search_list)
+        hint = QLabel("从当前检索结果中多选对比文件；默认按相关度自动分配 D1/D2，可在下方调整。")
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        tsl.addWidget(hint)
+        self.source_tabs.addTab(tab_search, "从检索结果")
+
+        # Tab B：从历史记录
+        tab_hist = QWidget()
+        thl = QVBoxLayout(tab_hist)
+        self.history_combo = QComboBox()
+        self.history_combo.setPlaceholderText("选择历史运行…")
+        self.history_combo.currentIndexChanged.connect(self._on_history_changed)
+        thl.addWidget(self.history_combo)
+        self.history_list = QListWidget()
+        self.history_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.history_list.itemSelectionChanged.connect(self._sync_current_docs)
+        thl.addWidget(self.history_list)
+        self.source_tabs.addTab(tab_hist, "从历史记录")
+
+        # Tab C：上传 PDF
+        tab_up = QWidget()
+        tul = QVBoxLayout(tab_up)
+        btn_row = QHBoxLayout()
+        self.add_pdf_btn = QPushButton("添加 PDF…")
+        self.add_pdf_btn.clicked.connect(self._on_add_pdf)
+        self.remove_pdf_btn = QPushButton("移除选中")
+        self.remove_pdf_btn.clicked.connect(self._on_remove_pdf)
+        btn_row.addWidget(self.add_pdf_btn)
+        btn_row.addWidget(self.remove_pdf_btn)
+        btn_row.addStretch(1)
+        tul.addLayout(btn_row)
+        self.upload_list = QListWidget()
+        self.upload_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.upload_list.itemSelectionChanged.connect(self._sync_current_docs)
+        tul.addWidget(self.upload_list)
+        self.source_tabs.addTab(tab_up, "上传 PDF")
+
+        # ── 角色指定 ───────────────────────────────────────────────────
+        role_box = QGroupBox("对比文件角色")
+        role_layout = QFormLayout(role_box)
+        self.d1_combo = QComboBox()
+        self.d2_combo = QComboBox()
+        role_layout.addRow("最接近的现有技术 (D1):", self.d1_combo)
+        role_layout.addRow("辅助评述 (D2):", self.d2_combo)
+        role_hint = QLabel("默认按相关度自动分配；如只需一篇对比文件，D2 选「不使用」。")
+        role_hint.setStyleSheet("color: #666; font-size: 11px;")
+        role_layout.addRow("", role_hint)
+        layout.addWidget(role_box)
+
+        # ── 输出选项 ───────────────────────────────────────────────────
+        opt_box = QGroupBox("输出选项")
+        opt_layout = QHBoxLayout(opt_box)
+        self.keep_contact_cb = QCheckBox("保留联系方式")
+        self.mark_changes_cb = QCheckBox("标记修改")
+        self.opt_md_cb = QCheckBox("Markdown")
+        self.opt_html_cb = QCheckBox("HTML")
+        self.opt_docx_cb = QCheckBox("DOCX")
+        self.opt_md_cb.setChecked(True)
+        self.opt_html_cb.setChecked(True)
+        self.opt_docx_cb.setChecked(True)
+        for w in (self.keep_contact_cb, self.mark_changes_cb,
+                  self.opt_md_cb, self.opt_html_cb, self.opt_docx_cb):
+            opt_layout.addWidget(w)
+        opt_layout.addStretch(1)
+        layout.addWidget(opt_box)
+
+        # ── 底部按钮 ───────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        self.generate_btn = QPushButton("开始撰写")
+        self.generate_btn.setObjectName("saveBtn")
+        self.generate_btn.clicked.connect(self._on_generate)
+        btn_row.addWidget(self.generate_btn)
+        layout.addLayout(btn_row)
+
+        # 填充历史记录下拉
+        self._populate_history()
+
+    # ── 数据加载 ───────────────────────────────────────────────────────
+
+    def _load_patent_info(self):
+        """专利信息已在构造中写入；无本申请时提示。"""
+        if not self._patent_doc:
+            self.patent_label.setText("⚠ 未选择本申请。请先在主界面打开专利 PDF，再执行撰写通知书。")
+
+    def _populate_search_results(self):
+        """填充检索结果列表（当前 _dedup_results）。"""
+        self.search_list.clear()
+        if not self._dedup_results:
+            self.search_list.addItem("（当前无检索结果，请切换到其他来源）")
+            return
+        for r in self._dedup_results:
+            score = r.get("fulltext_score") or r.get("relevance_score") or ""
+            pub = r.get("publication_number", "未知")
+            title = r.get("title", "")
+            self.search_list.addItem(f"[{score}] {pub} — {title}")
+
+    def _populate_history(self):
+        """扫描历史运行目录填充下拉。"""
+        try:
+            from src.ui.history_dialog import _scan_all_runs
+            runs = _scan_all_runs()
+        except Exception:
+            runs = []
+        self.history_combo.clear()
+        self.history_combo.addItem("（无历史记录）", None)
+        for r in runs[:30]:
+            label = f"{r.get('patent_label', '')}  {r.get('timestamp', '')}"
+            self.history_combo.addItem(label, r)
+        if len(runs) > 30:
+            self.history_combo.addItem(f"… 共 {len(runs)} 条历史", None)
+
+    def _on_history_changed(self):
+        """选择历史运行 → 加载该运行的对比文件列表。"""
+        self.history_list.clear()
+        run_info = self.history_combo.currentData()
+        if not run_info:
+            self._history_docs = []
+            return
+        run_path = Path(run_info.get("path", ""))
+        self._history_docs = self._load_run_docs(run_path)
+        self._current_docs = list(self._history_docs)
+        for d in self._history_docs:
+            score = d.get("relevance_score") or d.get("fulltext_score") or ""
+            pub = d.get("publication_number", "未知")
+            title = d.get("title", "")
+            self.history_list.addItem(f"[{score}] {pub} — {title}")
+        if not self._history_docs:
+            self.history_list.addItem("（该运行无对比文件数据）")
+        self._auto_assign_roles()
+
+    def _load_run_docs(self, run_path: Path) -> list[dict]:
+        """从历史运行目录加载对比文件（03_full_details.json 优先，回退 03_ai_screened.json）。"""
+        docs = []
+        for fname in ("03_full_details.json", "03_ai_screened.json"):
+            p = run_path / fname
+            if not p.exists():
+                continue
+            try:
+                import json as _json
+                data = _json.loads(p.read_text(encoding="utf-8"))
+                res = data.get("results", []) if isinstance(data, dict) else data
+                docs = [d for d in res if d.get("publication_number")]
+                if docs:
+                    break
+            except Exception:
+                continue
+        return docs
+
+    # ── 上传 PDF ───────────────────────────────────────────────────────
+
+    def _on_add_pdf(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择对比文件 PDF（可多选）", "",
+            "PDF 文件 (*.pdf)")
+        if not files:
+            return
+        from src.pdf_extractor.extractor import PatentPDFExtractor
+        added = 0
+        for f in files:
+            try:
+                pd = PatentPDFExtractor(f).extract()
+                doc = {
+                    "publication_number": pd.publication_number or f"未知-{len(self._uploaded_docs)+1}",
+                    "title": pd.title or Path(f).name,
+                    "applicant": "、".join(pd.applicants) if pd.applicants else "",
+                    "abstract": pd.abstract or "",
+                    "claims": "\n".join(pd.claims) if pd.claims else "",
+                    "description": pd.description or "",
+                    "full_text": pd.full_text_markdown or "",
+                }
+                self._uploaded_docs.append(doc)
+                added += 1
+            except Exception as e:
+                QMessageBox.warning(self, "解析失败",
+                    f"无法解析 {Path(f).name}:\n{e}")
+        self._refresh_upload_list()
+        if added:
+            self._sync_current_docs()
+
+    def _on_remove_pdf(self):
+        rows = [i.row() for i in self.upload_list.selectedIndexes()]
+        for r in sorted(set(rows), reverse=True):
+            if 0 <= r < len(self._uploaded_docs):
+                del self._uploaded_docs[r]
+        self._refresh_upload_list()
+        self._sync_current_docs()
+
+    def _refresh_upload_list(self):
+        self.upload_list.clear()
+        for d in self._uploaded_docs:
+            self.upload_list.addItem(
+                f"{d.get('publication_number', '未知')} — {d.get('title', '')}")
+
+    # ── 角色分配与汇总 ─────────────────────────────────────────────────
+
+    def _sync_current_docs(self):
+        """根据当前激活的 Tab 同步 _current_docs。"""
+        idx = self.source_tabs.currentIndex()
+        if idx == 0:
+            selected = self.search_list.selectedItems()
+            self._current_docs = [
+                self._dedup_results[i.row()]
+                for i in self.search_list.selectedIndexes()
+                if 0 <= i.row() < len(self._dedup_results)
+            ]
+        elif idx == 1:
+            selected = self.history_list.selectedItems()
+            self._current_docs = []
+            # history_list 的选中项映射回 _history_docs（按行号）
+            for i in self.history_list.selectedIndexes():
+                row = i.row()
+                if 0 <= row < len(self._history_docs):
+                    self._current_docs.append(self._history_docs[row])
+        else:
+            selected = self.upload_list.selectedItems()
+            self._current_docs = [
+                self._uploaded_docs[i.row()]
+                for i in self.upload_list.selectedIndexes()
+                if 0 <= i.row() < len(self._uploaded_docs)
+            ]
+        self._auto_assign_roles()
+
+    def _auto_assign_roles(self):
+        """按相关度自动分配 D1/D2，并填充下拉。"""
+        docs = self._current_docs or []
+        # 保留 D1/D2 当前选择，若文档列表变化则重置
+        prev_d1 = self.d1_combo.currentText()
+        prev_d2 = self.d2_combo.currentText()
+
+        self.d1_combo.clear()
+        self.d2_combo.clear()
+        self.d2_combo.addItem("不使用", None)
+
+        if not docs:
+            self.d1_combo.addItem("（无对比文件）", None)
+            return
+
+        # 按相关度排序
+        sorted_docs = sorted(
+            docs,
+            key=lambda d: _num(d.get("fulltext_score") or d.get("relevance_score") or 0),
+            reverse=True)
+
+        for i, d in enumerate(sorted_docs):
+            label = f"{i+1}. {d.get('publication_number', '未知')}"
+            self.d1_combo.addItem(label, d)
+            self.d2_combo.addItem(label, d)
+
+        # 默认：D1=相关度最高，D2=次高（若有 ≥2 篇）；否则 D2=不使用
+        self.d1_combo.setCurrentIndex(0)
+        self.d2_combo.setCurrentIndex(0)  # 「不使用」
+        if len(sorted_docs) >= 2:
+            self.d2_combo.setCurrentIndex(2)  # index0=不使用, index1=第1篇, index2=第2篇
+
+        # 恢复用户之前的显式选择（用户改过则保留）
+        if prev_d1 and prev_d1 != "（无对比文件）":
+            ix = self.d1_combo.findText(prev_d1)
+            if ix >= 0:
+                self.d1_combo.setCurrentIndex(ix)
+        if prev_d2 and prev_d2 != "不使用":
+            ix = self.d2_combo.findText(prev_d2)
+            if ix >= 0:
+                self.d2_combo.setCurrentIndex(ix)
+
+    # ── 生成 ───────────────────────────────────────────────────────────
+
+    def _on_generate(self):
+        """校验并发射 start_oa。"""
+        d1 = self.d1_combo.currentData()
+        if not d1:
+            QMessageBox.warning(self, "提示",
+                "请先选择对比文件（从检索结果 / 历史记录 / 上传 PDF），并指定 D1。")
+            return
+        d2 = self.d2_combo.currentData()
+
+        dedup_results = self._current_docs or [d1]
+        if d2 and d2.get("publication_number") != d1.get("publication_number"):
+            if d2 not in dedup_results:
+                dedup_results.append(d2)
+
+        options = {
+            "keep_contact": self.keep_contact_cb.isChecked(),
+            "mark_changes": self.mark_changes_cb.isChecked(),
+            "d1_pub": d1.get("publication_number", ""),
+            "d2_pub": (d2.get("publication_number", "") if d2 else ""),
+            "output_md": self.opt_md_cb.isChecked(),
+            "output_html": self.opt_html_cb.isChecked(),
+            "output_docx": self.opt_docx_cb.isChecked(),
+        }
+
+        payload = {
+            "patent_doc": self._patent_doc,
+            "comparisons": [],
+            "dedup_results": dedup_results,
+            "options": options,
+        }
+        self.start_oa.emit(payload)
+        self.accept()
+
+
+def _num(x):
+    """把相关度字符串转数值（'78'→78，无效→0）。"""
+    try:
+        return float(str(x).replace("%", "").strip())
+    except (TypeError, ValueError):
+        return 0

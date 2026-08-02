@@ -1,0 +1,5 @@
+{
+  "display_name": "终选评述",
+  "kind": "stage",
+  "description": "从历史最佳候选池中挑选最终用于评述的对比文件（只输出公布号）"
+}

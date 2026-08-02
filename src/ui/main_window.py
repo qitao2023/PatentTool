@@ -21,6 +21,7 @@ from src.ui.workers import (
     AnalysisWorker, OAWriterWorker,
     PatentLookupWorker,
     MultiQueryTestWorker, FinalReviewWorker,
+    ApplicationDateWorker,
 )
 from src.utils.config import Settings
 from src.utils.signals import WorkerSignals
@@ -42,9 +43,12 @@ class MainWindow(QMainWindow):
         self._output_dir = None     # 本次运行输出目录
         self._comparison_cache = {} # 对比结果缓存 {pub: markdown}
         self._analysis_report = None
+        self._date_extract_seq = 0  # 申请日提取任务序号，用于丢弃过期结果
+        self._date_worker = None    # 当前申请日提取线程
         self._setup_ui()
         self._setup_menu()
         self._setup_statusbar()
+        self._auto_extract_default_date()
 
     def _setup_ui(self):
         self.setWindowTitle("专利检索分析工具 v1.0")
@@ -65,11 +69,10 @@ class MainWindow(QMainWindow):
         self.input_panel.start_clicked.connect(self._on_start)
         self.input_panel.stop_clicked.connect(self._on_stop)
         self.input_panel.clear_log_clicked.connect(self._on_clear_log)
-        self.input_panel.test_clicked.connect(self._on_open_test)
         self.input_panel.settings_clicked.connect(self._on_open_settings)
         self.input_panel.file_selected.connect(self._on_file_selected)
         self.input_panel.open_existing.connect(self._on_open_existing)
-        self.input_panel.final_review_clicked.connect(self._on_final_review)
+        self.input_panel.extract_date_clicked.connect(self._on_extract_date_clicked)
         main_layout.addWidget(self.input_panel)
 
         # ② 日志面板（可拖拽高度）
@@ -116,6 +119,18 @@ class MainWindow(QMainWindow):
         prompts_action = QAction("提示词配置...", self)
         prompts_action.triggered.connect(self._on_open_prompt_editor)
         file_menu.addAction(prompts_action)
+        file_menu.addSeparator()
+        final_review_action = QAction("终选评述...", self)
+        final_review_action.triggered.connect(self._on_final_review)
+        file_menu.addAction(final_review_action)
+        file_menu.addSeparator()
+        oa_action = QAction("撰写通知书...", self)
+        oa_action.triggered.connect(self._on_oa_write_clicked)
+        file_menu.addAction(oa_action)
+        file_menu.addSeparator()
+        test_action = QAction("测试工具...", self)
+        test_action.triggered.connect(self._on_open_test)
+        file_menu.addAction(test_action)
         file_menu.addSeparator()
         exit_action = QAction("退出", self)
         exit_action.triggered.connect(self.close)
@@ -302,6 +317,7 @@ class MainWindow(QMainWindow):
         saved_queries = self.input_panel.max_queries_spin.value()
         saved_results = self.input_panel.max_results_spin.value()
         saved_fetch = self.input_panel.fetch_detail_spin.value()
+        saved_app_date = self.input_panel.application_date_edit.text().strip()
 
         # 重置界面
         self._reset_state()
@@ -311,6 +327,7 @@ class MainWindow(QMainWindow):
         self.input_panel.max_queries_spin.setValue(saved_queries)
         self.input_panel.max_results_spin.setValue(saved_results)
         self.input_panel.fetch_detail_spin.setValue(saved_fetch)
+        self.input_panel.application_date_edit.setText(saved_app_date)
         self.input_panel.set_running_state(True)
         self.session_label.setText("会话进行中...")
 
@@ -322,13 +339,71 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_file_selected(self, pdf_path: str):
-        """PDF 选择后扫描历史运行"""
+        """PDF 选择后扫描历史运行 + 自动提取申请日"""
         from src.utils.paths import scan_runs
         runs = scan_runs(pdf_path)
         self.input_panel.show_runs(runs)
         if runs:
             self.log_panel.append_log("INFO",
                 f"发现 {len(runs)} 次历史运行")
+        self._run_application_date_extract(pdf_path)
+
+    # --- 申请日提取（选择PDF自动 + 点「提取」手动） ---
+
+    def _run_application_date_extract(self, pdf_path: str):
+        """启动申请日轻量提取（后台线程，不阻塞界面）。
+
+        用自增序号标记任务：期间又选了别的 PDF 时，过期结果直接丢弃。
+        """
+        path = (pdf_path or "").strip()
+        if not path or not Path(path).exists():
+            return
+        if self._date_worker and self._date_worker.isRunning():
+            self._date_worker.wait(2000)
+
+        self._date_extract_seq += 1
+        seq = self._date_extract_seq
+        w = ApplicationDateWorker(path)
+        w.extracted.connect(
+            lambda d, s=seq: self._on_application_date_extracted(d, s))
+        w.error.connect(
+            lambda msg, s=seq: self._on_application_date_error(msg, s))
+        self._date_worker = w
+        w.start()
+
+    def _on_application_date_extracted(self, date_str: str, seq: int):
+        if seq != self._date_extract_seq:
+            return  # 过期结果：期间又选了别的 PDF
+        if date_str:
+            self.log_panel.append_log("INFO",
+                f"已从PDF提取申请日: {date_str}")
+        else:
+            self.log_panel.append_log("WARN",
+                "未从PDF提取到申请日，请在界面手动填写")
+        self.input_panel.apply_extracted_date(date_str)
+
+    def _on_application_date_error(self, msg: str, seq: int):
+        if seq != self._date_extract_seq:
+            return
+        self.log_panel.append_log("WARN", msg)
+        self.input_panel.show_extract_failed()
+
+    def _on_extract_date_clicked(self):
+        """点「提取」按钮：对当前路径重新提取。"""
+        path = self.input_panel.get_pdf_path()
+        if not path:
+            QMessageBox.warning(self, "提示", "请先选择有效的PDF文件")
+            return
+        if not Path(path).exists():
+            QMessageBox.warning(self, "提示", f"文件不存在:\n{path}")
+            return
+        self._run_application_date_extract(path)
+
+    def _auto_extract_default_date(self):
+        """启动时若已预填默认测试 PDF 路径，自动提取一次申请日。"""
+        path = self.input_panel.get_pdf_path()
+        if path and Path(path).exists():
+            self._run_application_date_extract(path)
 
     def _on_open_history(self):
         """打开历史记录浏览对话框"""
@@ -482,8 +557,23 @@ class MainWindow(QMainWindow):
         w.signals.finished.connect(self._on_worker_finished)
         w.start()
 
+    def _apply_manual_dates(self, patent_doc):
+        """手动录入的申请日覆盖 PDF 解析结果（兜底：PDF 首页没提出来时用）。"""
+        manual = (self._user_params.get("application_date") or "").strip()
+        if not manual:
+            return
+        patent_doc.application_date = manual
+        self.log_panel.append_log("INFO",
+            f"已应用手动申请日: {manual}")
+
+    def _engine_name(self) -> str:
+        """按 search_source 返回实际检索引擎显示名，供日志/状态栏使用。"""
+        return ("Google Patents" if self.settings.search_source == "google"
+                else "PATENTSCOPE (WIPO)")
+
     @Slot(object)
     def _on_pdf_done(self, patent_doc):
+        self._apply_manual_dates(patent_doc)
         self._patent_doc = patent_doc
         pub_num = patent_doc.publication_number or ""
 
@@ -518,9 +608,9 @@ class MainWindow(QMainWindow):
                     except Exception:
                         self.log_panel.append_log("WARN", "缓存文件损坏，重新查询...")
 
-            # 无缓存或强制刷新 → 从 PATENTSCOPE 在线获取
+            # 无缓存或强制刷新 → 在线获取（引擎由 search_source 决定）
             self.log_panel.append_log("INFO",
-                f"PDF中获取公布号: {pub_num}，从 PATENTSCOPE 联网查询完整信息...")
+                f"PDF中获取公布号: {pub_num}，从 {self._engine_name()} 联网查询完整信息...")
             self._run_lookup_for_main(pub_num)
         else:
             # 无公布号 → 降级用 PDF 解析结果
@@ -531,7 +621,8 @@ class MainWindow(QMainWindow):
 
     def _run_lookup_for_main(self, pub_num: str):
         """主流程中的公布号查詢：获取完整信息后继续"""
-        self.status_label.setText(f"正在 PATENTSCOPE 查询 {pub_num} 的完整信息...")
+        self.status_label.setText(
+            f"正在 {self._engine_name()} 查询 {pub_num} 的完整信息...")
         self._current_worker = PatentLookupWorker(
             pub_num, self.settings)
         w = self._current_worker
@@ -544,8 +635,19 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_main_lookup_done(self, data: dict):
-        """PATENTSCOPE 查全完成后，转换为 PatentDocument 继续流程"""
+        """公布号查全完成后，转换为 PatentDocument 继续流程"""
         from src.pdf_extractor.extractor import PatentDocument
+
+        # 申请日/优先权日：查全数据优先，PDF 解析结果兜底
+        pdf_doc = self._patent_doc
+        application_date = (data.get("application_date")
+                            or (getattr(pdf_doc, "application_date", "")
+                                if pdf_doc else "")
+                            or "")
+        priority_date = (data.get("priority_date")
+                         or (getattr(pdf_doc, "priority_date", "")
+                             if pdf_doc else "")
+                         or "")
 
         patent_doc = PatentDocument(
             title=data.get("title", ""),
@@ -557,16 +659,23 @@ class MainWindow(QMainWindow):
             publication_number=data.get("publication_number", ""),
             application_number=data.get("application_number", ""),
             publication_date=data.get("publication_date", ""),
+            application_date=application_date,
+            priority_date=priority_date,
             full_text_markdown=data.get("full_text", ""),
         )
+        self._apply_manual_dates(patent_doc)
         self._patent_doc = patent_doc
 
-        # 保存到 PDF 旁边的 JSON 文件
+        # 保存到 PDF 旁边的 JSON 文件（含申请日/优先权日，缓存复用）
         if self._pdf_path:
             import json
             pdf_dir = Path(self._pdf_path).parent
             pub = patent_doc.publication_number or "unknown"
             info_path = pdf_dir / f"本申请_{pub}.json"
+            if not data.get("application_date"):
+                data["application_date"] = patent_doc.application_date
+            if not data.get("priority_date"):
+                data["priority_date"] = patent_doc.priority_date
             info_path.write_text(json.dumps(data, indent=2,
                 ensure_ascii=False, default=str), encoding="utf-8")
             self.log_panel.append_log("INFO",
@@ -618,15 +727,15 @@ class MainWindow(QMainWindow):
                         self.settings.analysis_max_detail_fetch)
         stop_after = self._user_params.get("stop_after", "full")
         max_queries = len(queries)
-        stop_labels = {"abstracts":"搜摘要", "screen":"粗筛", "download":"下载", "score":"评分", "full":"全程"}
+        stop_labels = {"abstracts":"搜摘要", "screen":"下载前", "download":"下载", "score":"评分", "full":"全程"}
         self.status_label.setText(
-            f"正在 PATENTSCOPE 检索 ({max_queries}检索式 × {max_results}条, "
+            f"正在 {self._engine_name()} 检索 ({max_queries}检索式 × {max_results}条, "
             f"下载上限{fetch_detail}篇, 断点:{stop_labels.get(stop_after,'?')})...")
         # 共享缓存目录（PDF 同级，多次运行共用）
         cache_dir = None
         if self._pdf_path:
-            cache_dir = Path(self._pdf_path).parent / "patent_cache"
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            from src.utils.paths import patent_detail_dir
+            cache_dir = patent_detail_dir(Path(self._pdf_path).parent)
         self._current_worker = PatentscopeSearchAndFetchWorker(
             queries, self.settings,
             patent_doc=self._patent_doc,
@@ -839,16 +948,18 @@ class MainWindow(QMainWindow):
         self._run_oa_writing(
             self._patent_doc, report.comparisons, self._dedup_results)
 
-    def _run_oa_writing(self, patent_doc, comparisons, dedup_results):
+    def _run_oa_writing(self, patent_doc, comparisons, dedup_results,
+                        options: dict | None = None):
         """启动审查意见通知书撰写"""
         ai_provider = self._user_params.get("ai_provider", "deepseek")
+        self._oa_options = options or {}
         self.status_label.setText("正在撰写审查意见通知书...")
         self.log_panel.append_log("INFO", "=" * 40)
         self.log_panel.append_log("INFO", "阶段5: AI 撰写审查意见通知书...")
 
         self._current_worker = OAWriterWorker(
             patent_doc, dedup_results, comparisons,
-            self.settings, ai_provider=ai_provider)
+            self.settings, ai_provider=ai_provider, options=self._oa_options)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
@@ -866,18 +977,24 @@ class MainWindow(QMainWindow):
         while oa_markdown.startswith("---"):
             oa_markdown = oa_markdown[3:].strip()
 
-        # 保存 OA 通知书
-        oa_path = self._output_dir / "05_审查意见通知书.md"
-        with open(oa_path, "w", encoding="utf-8") as f:
-            f.write(oa_markdown)
-        self.log_panel.append_log("INFO", f"  通知书已保存: {oa_path}")
+        options = getattr(self, "_oa_options", {}) or {}
 
-        # 也保存一份完整的最终输出
-        final_path = self._output_dir / "05_审查意见通知书.html"
-        try:
-            import markdown as md_lib
-            oa_html = md_lib.markdown(oa_markdown, extensions=["tables", "fenced_code"])
-            styled_html = f"""<!DOCTYPE html>
+        # 保存 OA 通知书（Markdown）
+        if options.get("output_md", True):
+            oa_path = self._output_dir / "05_审查意见通知书.md"
+            with open(oa_path, "w", encoding="utf-8") as f:
+                f.write(oa_markdown)
+            self.log_panel.append_log("INFO", f"  通知书已保存: {oa_path}")
+        else:
+            oa_path = self._output_dir / "05_审查意见通知书.md"
+
+        # 保存 HTML
+        if options.get("output_html", True):
+            final_path = self._output_dir / "05_审查意见通知书.html"
+            try:
+                import markdown as md_lib
+                oa_html = md_lib.markdown(oa_markdown, extensions=["tables", "fenced_code"])
+                styled_html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>审查意见通知书</title>
 <style>
@@ -892,24 +1009,127 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
 <body>
 {oa_html}
 </body></html>"""
-            with open(final_path, "w", encoding="utf-8") as f:
-                f.write(styled_html)
-            self.log_panel.append_log("INFO", f"  通知书 HTML: {final_path}")
-        except Exception:
-            pass
+                with open(final_path, "w", encoding="utf-8") as f:
+                    f.write(styled_html)
+                self.log_panel.append_log("INFO", f"  通知书 HTML: {final_path}")
+            except Exception:
+                pass
+
+        # 保存 DOCX（按 office_action 版式规范，从零生成）
+        if options.get("output_docx", False):
+            try:
+                from src.analysis.oa_docx import markdown_to_oa_docx
+                docx_path = self._output_dir / "07_审查意见通知书.docx"
+                markdown_to_oa_docx(oa_markdown, docx_path)
+                self.log_panel.append_log("INFO", f"  通知书 DOCX: {docx_path}")
+            except Exception as e:
+                self.log_panel.append_log("ERROR", f"  DOCX 生成失败: {e}")
 
         # 在报告面板显示
         self.report_panel.browser.setHtml(oa_markdown)
         self.input_panel.set_running_state(False)
         self.status_label.setText("审查意见通知书撰写完成")
 
+    def _on_oa_write_clicked(self):
+        """点击「📝 撰写通知书」→ 打开 OAWriteDialog 选择对比文件。"""
+        if not self._patent_doc:
+            QMessageBox.warning(self, "提示",
+                "请先选择专利申请 PDF 并完成解析，再执行撰写通知书。")
+            return
+
+        from src.ui.dialogs import OAWriteDialog
+        dlg = OAWriteDialog(
+            self._patent_doc, self._dedup_results, self.settings, parent=self)
+        dlg.start_oa.connect(self._on_oa_start)
+        dlg.exec()
+
+    def _on_oa_start(self, payload: dict):
+        """OAWriteDialog 确认 → 启动 OA 撰写。"""
+        patent_doc = payload.get("patent_doc")
+        dedup_results = payload.get("dedup_results") or self._dedup_results or []
+        comparisons = payload.get("comparisons") or []
+        options = payload.get("options") or {}
+
+        if not patent_doc:
+            QMessageBox.warning(self, "提示", "缺少本申请信息，无法撰写通知书。")
+            return
+        if not dedup_results:
+            QMessageBox.warning(self, "提示", "未选择对比文件，无法撰写通知书。")
+            return
+
+        # 输出目录兜底
+        if not self._output_dir:
+            from datetime import datetime
+            base = Path.cwd() / "data" / "output"
+            base.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self._output_dir = base / f"oa_{ts}"
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.input_panel.set_running_state(True)
+        self._run_oa_writing(patent_doc, comparisons, dedup_results, options)
+
     # --- 终选评述（从历史最佳中挑最终几篇做详细评述）---
+
+    def _select_snapshots_dialog(self, pdf_dir, pub_num):
+        """综评前弹窗：列出所有评分快照供勾选，默认全选。
+
+        Returns:
+            选中的快照文件路径列表；无快照返回 []；用户取消返回 None
+        """
+        from src.analysis.history import list_score_snapshots
+        snaps = list_score_snapshots(pdf_dir, pub_num)
+        if not snaps:
+            return []
+
+        from PySide6.QtWidgets import (
+            QDialog, QListWidget, QListWidgetItem,
+            QPushButton, QVBoxLayout, QHBoxLayout, QLabel)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择参与综评的评分记录")
+        dlg.resize(500, 380)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            f"共 {len(snaps)} 次评分记录，勾选参与综评的（默认全选）："))
+        lst = QListWidget()
+        for s in snaps:
+            created = s.get("created_at") or s.get("name") or "?"
+            run_dir = s.get("run_dir", "")
+            label = (f"{run_dir} · {created}（{s.get('count', 0)} 篇）"
+                     if run_dir else f"{created}（{s.get('count', 0)} 篇）")
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, s["path"])
+            item.setCheckState(Qt.Checked)
+            lst.addItem(item)
+        lay.addWidget(lst)
+
+        btn_lay = QHBoxLayout()
+        ok_btn = QPushButton("开始综评")
+        cancel_btn = QPushButton("取消")
+        ok_btn.setDefault(True)
+        btn_lay.addWidget(ok_btn)
+        btn_lay.addWidget(cancel_btn)
+        lay.addLayout(btn_lay)
+
+        selected = []
+        def _on_ok():
+            for i in range(lst.count()):
+                item = lst.item(i)
+                if item.checkState() == Qt.Checked:
+                    selected.append(item.data(Qt.UserRole))
+            dlg.accept()
+        ok_btn.clicked.connect(_on_ok)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return selected
 
     def _on_final_review(self):
         """点击「终选评述」：从历史最佳对比文件中挑最终 N 篇做详细评述"""
         if not self._patent_doc:
             QMessageBox.warning(self, "提示",
-                "请先选择专利申请 PDF 并运行「开始分析」积累历史记录，"
+                "请先选择专利申请 PDF 并运行「开始分析」积累评分记录，"
                 "再执行终选评述。")
             return
         if not self._pdf_path or not Path(self._pdf_path).exists():
@@ -920,10 +1140,22 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
             return
 
         ai_provider = self._user_params.get("ai_provider", "deepseek")
+
+        # 综评前：弹窗列出所有评分快照供勾选（默认全选）
+        selected = self._select_snapshots_dialog(
+            Path(self._pdf_path).parent,
+            self._patent_doc.publication_number)
+        if selected is None:
+            return  # 用户取消
+        if not selected:
+            QMessageBox.warning(self, "提示",
+                "没有评分记录，请先运行「开始分析」完成检索+Claims 广筛。")
+            return
+
         final_n = self.settings.analysis_final_review_n
         self.log_panel.append_log("INFO", "=" * 50)
         self.log_panel.append_log("INFO",
-            f"终选评述: 从历史最佳中挑最终 {final_n} 篇做详细评述")
+            f"终选评述: 从选中的 {len(selected)} 份评分记录中挑最终 {final_n} 篇做详细评述")
 
         # 输出目录兜底为 PDF 所在目录（OA 通知书 / 终选评述都存这里）
         if not self._output_dir:
@@ -933,7 +1165,7 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
         self.status_label.setText("终选评述...")
         self._current_worker = FinalReviewWorker(
             self._patent_doc, self.settings, self._pdf_path,
-            ai_provider=ai_provider)
+            ai_provider=ai_provider, snapshot_files=selected)
         w = self._current_worker
         w.signals.progress.connect(self.log_panel.update_progress)
         w.signals.log.connect(self.log_panel.append_log)
@@ -1046,7 +1278,8 @@ blockquote {{ border-left: 3px solid #ccc; padding-left: 15px; color: #555; }}
         doc_id = patent.get("doc_id", "")
         if not self._pdf_path:
             return None
-        cache_dir = Path(self._pdf_path).parent / "patent_cache"
+        from src.utils.paths import patent_detail_dir
+        cache_dir = patent_detail_dir(Path(self._pdf_path).parent)
         for key in (pub, doc_id):
             if not key:
                 continue

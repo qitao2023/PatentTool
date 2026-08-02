@@ -24,6 +24,7 @@ class PatentDocument:
     publication_number: str = ""
     application_number: str = ""
     priority_date: str = ""
+    application_date: str = ""
     publication_date: str = ""
     full_text_markdown: str = ""
 
@@ -146,21 +147,17 @@ class PatentPDFExtractor:
         ipc_list = self.SECTION_PATTERNS["ipc"].findall(text)
         patent.ipc_classifications = [ipc.strip() for ipc in ipc_list]
 
-        # 公开日
-        for line in text.split("\n"):
-            if "公开日" in line or "申请公布日" in line or "Publication Date" in line:
-                m = re.search(r"(\d{4}[.\-年]\d{1,2}[.\-月]\d{1,2}[日]?)", line)
-                if m:
-                    patent.publication_date = m.group(1).strip()
-                    break
-
-        # 优先权日
-        for line in text.split("\n"):
-            if "优先权" in line or "Priority" in line:
-                m = re.search(r"(\d{4}[.\-年]\d{1,2}[.\-月]\d{1,2}[日]?)", line)
-                if m:
-                    patent.priority_date = m.group(1).strip()
-                    break
+        # 公开日 / 优先权日 / 申请日（与 extract_application_date 共用同一规则）
+        patent.publication_date = _extract_date_from_lines(
+            text, ("公开日", "申请公布日", "Publication Date"))
+        # 公开日兜底：CN 首页底部公告栏「公布号 + 日期」两行布局
+        if not patent.publication_date:
+            patent.publication_date = _extract_date_after_pub_number(
+                text, patent.publication_number)
+        patent.priority_date = _extract_date_from_lines(
+            text, ("优先权", "Priority"))
+        patent.application_date = _extract_date_from_lines(
+            text, ("申请日", "Application Filing Date", "Filing Date"))
 
     def _parse_sections(self, text: str, patent: PatentDocument):
         """解析专利各部分：标题、摘要、权利要求、说明书"""
@@ -249,3 +246,127 @@ class PatentPDFExtractor:
         # 如果title为空，尝试从文件名提取
         if not patent.title:
             patent.title = self.pdf_path.stem
+
+
+# 英文月份（3字母小写 → 月份号），用于英文著录日期
+_EN_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+# 中文/数字日期（年份在前）
+_DATE_RE = re.compile(r"(\d{4}[.\-/年]\d{1,2}[.\-/月]\d{1,2}[日]?)")
+# 英文月份日期：May 1, 2023 / 1 May 2023
+_EN_DATE_1_RE = re.compile(r"([A-Za-z]{3,9})\s+(\d{1,2})[,\s]+(\d{4})")
+_EN_DATE_2_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]{3,9})[,\s]+(\d{4})")
+
+
+def _date_from_line(line: str) -> str:
+    """从单行提取任意格式日期；无日期返回 ""。"""
+    if not line:
+        return ""
+    m = _DATE_RE.search(line)
+    if m:
+        return m.group(1).strip()
+    m = _EN_DATE_1_RE.search(line)
+    if m and m.group(1).lower()[:3] in _EN_MONTHS:
+        return m.group(0).strip()
+    m = _EN_DATE_2_RE.search(line)
+    if m and m.group(2).lower()[:3] in _EN_MONTHS:
+        return m.group(0).strip()
+    return ""
+
+
+def _starts_with_date(line: str) -> bool:
+    """行首是否为日期（用于识别「标签行 + 日期延续行」布局）。
+
+    仅当下一行以日期开头才视为延续，避免误取相邻的其他 INID 字段日期。
+    """
+    if not line:
+        return False
+    if _DATE_RE.match(line):
+        return True
+    return bool(_EN_DATE_1_RE.match(line) or _EN_DATE_2_RE.match(line))
+
+
+def _extract_date_from_lines(text: str, keywords: tuple[str, ...]) -> str:
+    """在文本行中按关键词找首个日期，找不到返回 ""。
+
+    与 _parse_metadata 共用同一规则，保证轻量提取与全量解析结果一致。
+    - 关键词大小写不敏感（覆盖 "Filing date"/"Publication Date" 等写法）
+    - 支持中文/数字/英文格式：2023年05月01日、2023-05-01、2023/05/01、May 1, 2023
+    - 支持日期延续到下一行：标签行无日期时，若下一行以日期开头则取下一行
+      （如 "(30)优先权" 换行后是 "2021.01.01 ..."）
+    - keywords 为空元组 → 任意行都扫描
+    """
+    kws = tuple(k.lower() for k in keywords)
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if kws and not any(k in line.lower() for k in kws):
+            continue
+        d = _date_from_line(line)
+        if d:
+            return d
+        # 日期延续到下一行：仅当下一行以日期开头才取
+        if i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt and _starts_with_date(nxt):
+                d = _date_from_line(nxt)
+                if d:
+                    return d
+    return ""
+
+
+def _extract_date_after_pub_number(text: str, pub_number: str) -> str:
+    """从公布号附近提取公开日：CN 首页底部公告栏常为「公布号 + 日期」两行。
+
+    例：
+      CN 116110953 A
+      2023.05.12
+    仅当关键词法提取不到公开日时兜底调用。
+    """
+    if not pub_number:
+        return ""
+    digits = re.sub(r"\D", "", pub_number)
+    if not digits:
+        return ""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if digits not in re.sub(r"\D", "", line):
+            continue
+        # 公布号同行日期（如 "CN 116110953 A 2023.05.12"）
+        d = _date_from_line(line)
+        if d:
+            return d
+        # 公布号紧邻下一行的日期（如 "CN 116110953 A" / "2023.05.12"）
+        for j in range(i + 1, min(i + 3, len(lines))):
+            nxt = lines[j].strip()
+            if nxt and _starts_with_date(nxt):
+                return _date_from_line(nxt)
+    return ""
+
+
+def extract_application_date(pdf_path: str | Path) -> str:
+    """轻量提取申请日：只读 PDF 前两页文本，避免整份解析。
+
+    用于：选择 PDF 后自动提取、点「提取」按钮手动重试。
+
+    Returns:
+        申请日字符串（如 "2023年05月01日"）；
+        提取不到或文件打不开/无文字层 → 返回 ""。
+    """
+    path = Path(pdf_path)
+    if not path.exists():
+        return ""
+    try:
+        doc = fitz.open(str(path))
+        try:
+            n = min(2, doc.page_count)
+            texts = [doc[i].get_text("text") for i in range(n)]
+        finally:
+            doc.close()
+    except Exception:
+        return ""
+    return _extract_date_from_lines(
+        "\n".join(texts),
+        ("申请日", "Application Filing Date", "Filing Date"))

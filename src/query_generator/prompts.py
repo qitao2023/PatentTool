@@ -7,13 +7,14 @@ from src.pdf_extractor.extractor import PatentDocument
 # Fallback 默认提示词（当配置文件中不存在时使用）
 # ============================================================
 
-FALLBACK_SYSTEM_PROMPT = """你是一名中国专利审查员，需要在 PATENTSCOPE 中检索现有技术。
+FALLBACK_SYSTEM_PROMPT = """你是一名中国专利审查员，需要在 Google Patents 中检索现有技术。
 
-## 检索语法（PATENTSCOPE 简单搜索）
+## 检索语法（Google Patents）
 
-- 直接输入关键词，用 AND/OR/NOT 连接
+- 直接输入关键词，用 AND/OR/NOT 连接（默认 AND，建议用括号分组：`(a OR b) AND c`）
 - 精确短语用英文双引号："lithium battery"
-- 通配符：* (多字符) ? (单字符)
+- 通配符：`*`（0 或多个字符）`?`（0 或 1 个字符），仅限单个英文单词
+- 排除词用 `-` 前缀：`-shovel`
 - 中英文混合：可以在同一个检索式中同时使用中文和英文关键词
 
 ## 核心原则
@@ -33,26 +34,6 @@ FALLBACK_SYSTEM_PROMPT = """你是一名中国专利审查员，需要在 PATENT
 - 每个检索式关键词数 ≤ 5 个
 - AND/OR 运算符 ≤ 2-3 个
 - 不要嵌套太深
-
-## 输出格式
-
-纯 JSON 对象，包含 queries 数组：
-
-```json
-{
-  "queries": [
-    {
-      "query_string": "PATENTSCOPE检索式（纯关键词）",
-      "search_angle": "角度说明",
-      "rationale": "为什么这个检索式有效",
-      "priority": 1
-    }
-  ]
-}
-```
-
-- priority: 1 = 最宽泛/最重要，往后逐渐精准
-- 第1个检索式必须最简单、最宽泛、保证有结果
 """
 
 FALLBACK_USER_PROMPT = """# 专利技术方案分析
@@ -63,7 +44,7 @@ FALLBACK_USER_PROMPT = """# 专利技术方案分析
 
 # 任务
 
-你是一名专利审查员，需要在 PATENTSCOPE 中检索和本申请相关的现有技术。
+需要在 Google Patents 中检索和本申请相关的现有技术。
 
 ## 检索式构建原则
 
@@ -185,26 +166,91 @@ def build_patent_markdown(patent: PatentDocument,
     return "\n\n".join(sections)
 
 
-def load_prompt_templates(settings) -> dict:
-    """从 Settings 加载当前活跃 profile 的提示词模板
+# ============================================================
+# 方案解析：default(通用) / semiconductor(半导体) / auto(按专利内容自动判断)
+# ============================================================
 
+# 半导体 IPC 分类号前缀（含 2023 年 IPC 拆分出的 H10* 新分类）
+_SEMICONDUCTOR_IPC_PREFIXES = (
+    "H01L", "H10B", "H10K", "H10N", "G11C", "H01S", "B81B", "B81C",
+)
+
+# 标题/摘要中的半导体强特征词（中英）
+_SEMICONDUCTOR_KEYWORDS = (
+    # 中文
+    "半导体", "晶体管", "芯片", "晶圆", "集成电路", "存储器", "闪存", "内存",
+    "微机电", "光刻", "刻蚀", "蚀刻", "外延", "氮化镓", "碳化硅", "砷化镓",
+    "多晶硅", "单晶硅", "光电", "发光二极管", "激光器", "太阳能电池",
+    "场效应", "鳍式", "栅极", "源漏", "功率器件",
+    # 英文
+    "semiconductor", "transistor", "finfet", "mosfet", "igbt", "chip",
+    "wafer", "integrated circuit", "memory", "flash", "microelectromechanical",
+    "mems", "lithography", "etching", "epitaxial", "gallium", "silicon",
+    "nitride", "dielectric", "cmos", "led", "laser", "photovoltaic",
+    "solar cell", "oled", "thin film", "tft", "tsv",
+)
+
+
+def _is_semiconductor_patent(patent) -> bool:
+    """按专利内容判断是否半导体领域（IPC 分类号 + 标题/摘要关键词）"""
+    if patent is None:
+        return False
+    for ipc in (getattr(patent, "ipc_classifications", None) or []):
+        code = str(ipc).replace(" ", "").upper()
+        for prefix in _SEMICONDUCTOR_IPC_PREFIXES:
+            if code.startswith(prefix):
+                return True
+    text = " ".join(filter(None, [
+        getattr(patent, "title", None) or "",
+        getattr(patent, "abstract", None) or "",
+    ])).lower()
+    for kw in _SEMICONDUCTOR_KEYWORDS:
+        if kw.lower() in text:
+            return True
+    return False
+
+
+def resolve_profile(settings, patent=None) -> str:
+    """解析实际使用的检索式方案
+
+    settings.prompts_active_profile:
+      auto          → 按专利内容自动判断（半导体/通用）
+      default       → 固定通用检索式
+      semiconductor → 固定半导体检索式
+    未知值回退到 semiconductor（当前默认）。
+    """
+    mode = settings.prompts_active_profile
+    if mode == "auto":
+        return "semiconductor" if _is_semiconductor_patent(patent) else "default"
+    if mode in ("default", "semiconductor"):
+        return mode
+    return "semiconductor"
+
+
+def load_prompt_templates(settings, patent=None) -> dict:
+    """从 Settings 加载实际使用的 profile 提示词模板
+
+    Args:
+        settings: Settings 对象
+        patent: PatentDocument，auto 方案按专利内容解析（可为 None，则按固定方案）
     Returns:
         {"system": str, "user": str}
     """
-    profile = settings.prompts_active_profile
+    profile = resolve_profile(settings, patent)
     system = settings.get_prompt_text(profile, "system") or FALLBACK_SYSTEM_PROMPT
     user = settings.get_prompt_text(profile, "user") or FALLBACK_USER_PROMPT
     return {"system": system, "user": user}
 
 
-def build_system_prompt(settings=None) -> str:
+def build_system_prompt(settings=None, patent=None) -> str:
     """构建 System Prompt
 
     Args:
         settings: Settings 对象。为 None 时使用 fallback 默认值。
+        patent: PatentDocument，auto 方案按专利内容解析。
     """
     if settings:
-        return load_prompt_templates(settings)["system"]
+        return load_prompt_templates(settings, patent)["system"]
     return FALLBACK_SYSTEM_PROMPT
 
 
@@ -217,10 +263,11 @@ def build_user_prompt(patent: PatentDocument, max_queries: int = 10,
         max_queries: 最大检索式数量
         settings: Settings 对象。为 None 时使用 fallback 默认值。
     """
-    max_desc = settings.query_max_description_chars if settings else 5000
+    # 0 = 不截断，说明书全文注入（默认）；>0 才截断
+    max_desc = settings.query_max_description_chars if settings else 0
     patent_md = build_patent_markdown(patent, max_description_chars=max_desc)
     if settings:
-        template = load_prompt_templates(settings)["user"]
+        template = load_prompt_templates(settings, patent)["user"]
     else:
         template = FALLBACK_USER_PROMPT
     return template.format(patent_markdown=patent_md, max_queries=max_queries)

@@ -19,11 +19,9 @@ class InputPanel(QWidget):
     stop_clicked = Signal()
     clear_log_clicked = Signal()
     file_selected = Signal(str)
-    test_clicked = Signal()                      # 打开测试工具对话框
     settings_clicked = Signal()
-    test_clicked = Signal()                     # 打开测试工具对话框
     open_existing = Signal(str)                 # 打开已有结果
-    final_review_clicked = Signal()             # 终选评述（从历史最佳中挑最终几篇）
+    extract_date_clicked = Signal()             # 点「提取」申请日按钮
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -51,6 +49,7 @@ class InputPanel(QWidget):
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("请选择或输入专利申请文件PDF路径...")
         self.path_edit.setMinimumWidth(400)
+        self.path_edit.returnPressed.connect(self._on_path_return_pressed)
         file_row.addWidget(self.path_edit, 1)
 
         self.browse_btn = QPushButton("浏览...")
@@ -107,6 +106,24 @@ class InputPanel(QWidget):
         self.fetch_detail_spin.setValue(1000)
         self.fetch_detail_spin.setSuffix(" 篇")
         param_row.addWidget(self.fetch_detail_spin)
+        param_row.addSpacing(20)
+
+        param_row.addWidget(QLabel("申请日(可选):"))
+        self.application_date_edit = QLineEdit()
+        self.application_date_edit.setPlaceholderText("如 2023-05-01")
+        self.application_date_edit.setFixedWidth(120)
+        self.application_date_edit.setToolTip(
+            "本申请的申请日，用于淘汰公开日晚于申请日的对比文件。\n"
+            "选择PDF后自动从首页提取；提取不到请点「提取」重试或手动填写。")
+        param_row.addWidget(self.application_date_edit)
+
+        self.extract_date_btn = QPushButton("提取")
+        self.extract_date_btn.setToolTip("从PDF第一页提取申请日")
+        self.extract_date_btn.clicked.connect(self.extract_date_clicked.emit)
+        param_row.addWidget(self.extract_date_btn)
+
+        self.date_status_label = QLabel("")
+        param_row.addWidget(self.date_status_label)
         param_row.addStretch(1)
 
         self.ai_label = QLabel("DeepSeek")
@@ -135,17 +152,6 @@ class InputPanel(QWidget):
         self.clear_log_btn.clicked.connect(self.clear_log_clicked.emit)
         btn_row.addWidget(self.clear_log_btn)
 
-        self.final_review_btn = QPushButton("🎯 终选评述")
-        self.final_review_btn.setToolTip(
-            "从历史最佳对比文件中挑最终几篇做详细评述（需先跑过开始分析积累记录）")
-        self.final_review_btn.clicked.connect(self.final_review_clicked.emit)
-        btn_row.addWidget(self.final_review_btn)
-
-        self.test_btn = QPushButton("🧪 测试")
-        self.test_btn.setToolTip("打开测试工具（检索式测试、公布号直查）")
-        self.test_btn.clicked.connect(self.test_clicked.emit)
-        btn_row.addWidget(self.test_btn)
-
         btn_row.addStretch(1)
 
         self.settings_btn = QPushButton("⚙ 设置")
@@ -167,6 +173,40 @@ class InputPanel(QWidget):
         if path:
             self.path_edit.setText(path)
             self.file_selected.emit(path)
+
+    def _on_path_return_pressed(self):
+        """路径框按回车 = 视为选中该 PDF，触发历史扫描 + 自动提取申请日。"""
+        path = self.get_pdf_path()
+        if path:
+            self.file_selected.emit(path)
+
+    # ── 申请日提取反馈 ──────────────────────────────────────────────
+
+    def _set_date_status(self, text: str, kind: str = ""):
+        """状态标签着色：ok=绿 warn=橙 error=红；kind 为空则清空样式。"""
+        color = {"ok": "#2e7d32", "warn": "#b26a00", "error": "#c62828"}.get(kind, "")
+        self.date_status_label.setStyleSheet(
+            f"color: {color}; font-size: 11px;" if color else "")
+        self.date_status_label.setText(text)
+
+    def apply_extracted_date(self, date_str: str):
+        """应用提取结果：成功填框+绿字；失败走 show_extract_failed。"""
+        date_str = (date_str or "").strip()
+        if date_str:
+            self.application_date_edit.setText(date_str)
+            self._set_date_status(f"✓ 已提取 {date_str}", "ok")
+        else:
+            self.show_extract_failed()
+
+    def show_extract_failed(self):
+        """提取失败提示：已手动填过则温和提示，否则红色提示去填写。"""
+        if self.application_date_edit.text().strip():
+            self._set_date_status("⚠ 未提取到，已保留手动填写", "warn")
+        else:
+            self._set_date_status("⚠ 未提取到申请日，请手动填写", "error")
+
+    def clear_extract_status(self):
+        self.date_status_label.clear()
 
     def show_runs(self, runs: list):
         self._runs_data = runs
@@ -206,6 +246,7 @@ class InputPanel(QWidget):
             "max_results": self.max_results_spin.value(),
             "fetch_detail": self.fetch_detail_spin.value(),
             "ai_provider": self._ai_provider,
+            "application_date": self.application_date_edit.text().strip(),
         }
 
     def set_ai_provider(self, provider: str):
@@ -220,12 +261,14 @@ class InputPanel(QWidget):
         self.max_queries_spin.setEnabled(not running)
         self.max_results_spin.setEnabled(not running)
         self.fetch_detail_spin.setEnabled(not running)
-        self.test_btn.setEnabled(not running)
-        self.final_review_btn.setEnabled(not running)
+        self.application_date_edit.setEnabled(not running)
+        self.extract_date_btn.setEnabled(not running)
 
     def reset(self):
         self.path_edit.clear()
         self.max_queries_spin.setValue(1)
+        self.application_date_edit.clear()
+        self.clear_extract_status()
         self.set_running_state(False)
         self.runs_group.setVisible(False)
         self.runs_list.clear()
