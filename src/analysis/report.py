@@ -52,10 +52,49 @@ class AnalysisReport:
         lines.append(f"- **详细分析**: {len(self.comparisons)} 篇高相关度文献")
         lines.append("")
 
-        # 3. 对比分析详情
+        # 3. 对比文件清单（报告首页：按最终评分从高到低列出）
+        if self.dedup_results:
+            lines.append("## 三、对比文件清单\n")
+
+            # 详细对比过（读完全文）的以 AI 最终评分为准，其余用原始评分；
+            # 统一按最终评分从高到低排列，与详细分析章节顺序保持一致
+            ai_scores = {
+                c.get("publication_number", ""): c.get("relevance_score", 0)
+                for c in self.comparisons
+            }
+
+            def _final_score(r):
+                pub = r.get("publication_number", "")
+                s = ai_scores.get(pub)
+                if s is not None:
+                    return s
+                return r.get("relevance_score", 0)
+
+            ordered = sorted(self.dedup_results,
+                             key=_final_score, reverse=True)
+            lines.append("| 序号 | 公布号 | 标题 | 申请人 | 公开日 | 相关度 |")
+            lines.append("|------|--------|------|--------|--------|--------|")
+            for i, r in enumerate(ordered[:50], 1):
+                pn = r.get("publication_number", "")
+                title = r.get("title", "")[:40]
+                applicant = r.get("applicant", "")[:20]
+                pd = r.get("publication_date", "")
+                score = _final_score(r)
+                score_str = f"{score}/100" if score else "-"
+                lines.append(f"| {i} | {pn} | {title} | {applicant} | {pd} | {score_str} |")
+            if len(self.dedup_results) > 50:
+                lines.append(f"\n*...共 {len(self.dedup_results)} 条，仅显示前50条*")
+            lines.append("")
+
+        # 4. 对比分析详情
         if self.comparisons:
-            lines.append("## 三、对比分析详情\n")
-            for i, comp in enumerate(self.comparisons, 1):
+            lines.append("## 四、对比分析详情\n")
+            # 以 AI 详细对比（读完全文）后的最终评分为准，从高到低排序
+            comparisons = sorted(
+                self.comparisons,
+                key=lambda c: c.get("relevance_score", 0) or 0,
+                reverse=True)
+            for i, comp in enumerate(comparisons, 1):
                 pn = comp.get("publication_number", f"#{i}")
                 score = comp.get("relevance_score", 0)
                 lines.append(f"### {i}. {pn} （相关度: {score}/100）\n")
@@ -85,23 +124,6 @@ class AnalysisReport:
                     lines.append(f"**综合评述**: {conclusion}\n")
 
                 lines.append("---\n")
-
-        # 4. 完整结果列表
-        if self.dedup_results:
-            lines.append("## 四、全部对比文献列表\n")
-            lines.append("| 序号 | 公布号 | 标题 | 申请人 | 公开日 | 相关度 |")
-            lines.append("|------|--------|------|--------|--------|--------|")
-            for i, r in enumerate(self.dedup_results[:50], 1):
-                pn = r.get("publication_number", "")
-                title = r.get("title", "")[:40]
-                applicant = r.get("applicant", "")[:20]
-                pd = r.get("publication_date", "")
-                score = r.get("relevance_score", "")
-                score_str = f"{score}/100" if score else "-"
-                lines.append(f"| {i} | {pn} | {title} | {applicant} | {pd} | {score_str} |")
-            if len(self.dedup_results) > 50:
-                lines.append(f"\n*...共 {len(self.dedup_results)} 条，仅显示前50条*")
-            lines.append("")
 
         return "\n".join(lines)
 

@@ -275,6 +275,16 @@ class Settings:
         return int(self._raw.get("google_patents", {}).get("timeout", 20))
 
     @property
+    def search_search_concurrency(self) -> int:
+        """Google 搜索并发数（多检索式并行搜，多标签页），默认 3。
+
+        wipo 引擎忽略此值（始终串行，防403）。
+        高并发更快但更易触发 Google 限流(403)，限制在 1-8。
+        """
+        v = self._raw.get("search", {}).get("search_concurrency", 3)
+        return max(1, min(int(v), 8))
+
+    @property
     def search_download_concurrency(self) -> int:
         """下载并发数（主流程下载 + 批量测试共用），默认 20。
 

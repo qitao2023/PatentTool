@@ -750,10 +750,14 @@ class PatentscopeScraper:
                 return_exceptions=True)
 
         total_ok = skipped + success_count
+        # fail_count 累加了第一轮的失败数，但二轮补下载成功后不归零，会误报。
+        # 用 len(failed_ids)：补下载前已 clear，仅统计补下载后仍失败的篇数。
+        remaining_fail = len(failed_ids)
         if signals:
             signals.log.emit("SUCCESS",
                 f"  并行抓取完成: {total_ok}/{len(doc_ids)} 篇 "
-                f"(新增 {success_count}, 缓存 {skipped}, 失败 {fail_count})")
+                f"(新增 {success_count}, 缓存 {skipped}, "
+                f"失败 {remaining_fail})")
         return total_ok
 
     # ================================================================

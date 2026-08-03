@@ -196,6 +196,15 @@ class SettingsDialog(QDialog):
             "WIPO 引擎: 自动保守为 1（高并发易403）")
         search_form.addRow("下载并发数:", self.download_concurrency_spin)
 
+        self.search_concurrency_spin = QSpinBox()
+        self.search_concurrency_spin.setRange(1, 8)
+        self.search_concurrency_spin.setValue(3)
+        self.search_concurrency_spin.setToolTip(
+            "Google 搜索的并行数（多个检索式并行搜，多标签页）\n"
+            "并发越高越快，但更易触发 Google 限流(403)，推荐 2-4\n"
+            "WIPO 引擎始终串行（忽略此值）")
+        search_form.addRow("搜索并发数:", self.search_concurrency_spin)
+
         params_layout.addWidget(search_group)
 
         # ── 检索式生成 ──
@@ -229,6 +238,15 @@ class SettingsDialog(QDialog):
             "  仅权利要求          system_claims（紧凑）\n"
             "  权利要求+具体实施方式 system_both（每篇各占一半预算）")
         analysis_form.addRow("广筛内容模式:", self.screen_content_combo)
+
+        self.detail_top_n_spin = QSpinBox()
+        self.detail_top_n_spin.setRange(1, 200)
+        self.detail_top_n_spin.setValue(10)
+        self.detail_top_n_spin.setToolTip(
+            "进入「详细对比」的对比文件篇数（按 Claims 广筛评分取 Top N）：\n"
+            "10 = 对相关度最高的 10 篇做 AI 全文详细对比并写入报告\n"
+            "需要更多可调大（如 15/20/50），耗时与 token 消耗随之增加")
+        analysis_form.addRow("详细对比篇数:", self.detail_top_n_spin)
 
         params_layout.addWidget(analysis_group)
         params_layout.addStretch(1)
@@ -300,6 +318,9 @@ class SettingsDialog(QDialog):
         # 下载并发数
         self.download_concurrency_spin.setValue(
             self.settings.search_download_concurrency)
+        # 搜索并发数
+        self.search_concurrency_spin.setValue(
+            self.settings.search_search_concurrency)
         # 流程断点
         stop = self.settings.search_stop_after
         idx = self.stop_after_combo.findData(stop)
@@ -310,6 +331,8 @@ class SettingsDialog(QDialog):
         idx = self.screen_content_combo.findData(sc)
         if idx >= 0:
             self.screen_content_combo.setCurrentIndex(idx)
+        # 详细对比篇数
+        self.detail_top_n_spin.setValue(self.settings.analysis_top_n)
         # 检索式方案
         pp = self.settings.prompts_active_profile
         idx = self.prompt_profile_combo.findData(pp)
@@ -465,8 +488,10 @@ class SettingsDialog(QDialog):
             "prefer_cn_family": self.prefer_cn_family_cb.isChecked(),
             "search_source": self.search_source_combo.currentData(),
             "download_concurrency": self.download_concurrency_spin.value(),
+            "search_concurrency": self.search_concurrency_spin.value(),
             "screen_content": self.screen_content_combo.currentData(),
             "prompt_profile": self.prompt_profile_combo.currentData(),
+            "analysis_top_n": self.detail_top_n_spin.value(),
         }
 
         # 写检索参数到 settings.yaml
@@ -503,6 +528,16 @@ class SettingsDialog(QDialog):
                     content = re.sub(
                         r'(search:\s*\n)',
                         f'\\1  download_concurrency: {_dl}\n', content)
+                # 搜索并发（整数）
+                _sc_conc = params["search_concurrency"]
+                if re.search(r'search_concurrency:\s*\d+', content):
+                    content = re.sub(
+                        r'search_concurrency:\s*\d+',
+                        f'search_concurrency: {_sc_conc}', content)
+                else:
+                    content = re.sub(
+                        r'(search:\s*\n)',
+                        f'\\1  search_concurrency: {_sc_conc}\n', content)
                 # 广筛内容模式（analysis 段）
                 _sc = params["screen_content"]
                 if re.search(r'screen_content:\s*\S+', content):
@@ -513,6 +548,16 @@ class SettingsDialog(QDialog):
                     content = re.sub(
                         r'(analysis:\s*\n)',
                         f'\\1  screen_content: "{_sc}"\n', content)
+                # 详细对比篇数（analysis 段）
+                _top = params["analysis_top_n"]
+                if re.search(r'top_n_for_detailed:\s*\d+', content):
+                    content = re.sub(
+                        r'top_n_for_detailed:\s*\d+',
+                        f'top_n_for_detailed: {_top}', content)
+                else:
+                    content = re.sub(
+                        r'(analysis:\s*\n)',
+                        f'\\1  top_n_for_detailed: {_top}\n', content)
                 # 检索式方案（query_generation 段）
                 _pp = params["prompt_profile"]
                 if re.search(r'prompt_profile:\s*"[^"]*"', content):
@@ -552,6 +597,7 @@ class SettingsDialog(QDialog):
             f"  优先使用中国同族: {'是' if params['prefer_cn_family'] else '否'}\n"
             f"  流程断点: {self.stop_after_combo.currentText()}\n"
             f"  广筛内容模式: {self.screen_content_combo.currentText()}\n"
+            f"  详细对比篇数: {self.detail_top_n_spin.value()}\n"
             f"  检索式方案: {self.prompt_profile_combo.currentText()}\n\n"
             "设置已写入 config/.env 和 config/settings.yaml，持续生效。")
 
@@ -1198,9 +1244,10 @@ class TestDialog(QDialog):
         max_results = (self._panel_max_results
                        or self._settings.patentscope_max_results)
         dl_conc = self._settings.search_download_concurrency
+        sc_conc = self._settings.search_search_concurrency
         self.batch_params_hint.setText(
             f"参数跟随设置：每式结果数 = 主面板 {max_results} 条/检索式，"
-            f"下载并发 = {dl_conc}（在 ⚙设置 中修改）")
+            f"搜索并发 = {sc_conc}，下载并发 = {dl_conc}（在 ⚙设置 中修改）")
 
     def _on_save_defaults(self):
         """将当前界面所有参数保存为默认值"""

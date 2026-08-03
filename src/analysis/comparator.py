@@ -50,6 +50,10 @@ class PatentComparator:
             if detail:
                 comparisons.append(detail)
 
+        # 详细对比完成后，以 AI 读完全文给出的最终评分为准，从高到低排序
+        comparisons.sort(
+            key=lambda c: c.get("relevance_score", 0) or 0, reverse=True)
+
         return comparisons
 
     def _detailed_comparison(self, client: AIClient,

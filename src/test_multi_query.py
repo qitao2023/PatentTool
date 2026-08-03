@@ -108,76 +108,147 @@ async def run_multi_query(queries: list[str], settings: Settings,
     per_query_dir.mkdir(parents=True, exist_ok=True)
 
     MAX_SEARCH_RETRIES = 3
-    for q_idx, q_str in enumerate(queries):
-        q_str = q_str.strip()
-        if not q_str:
-            continue
 
-        label = f"检索式{q_idx + 1}"
-        print(f"\n  --- {label} / {len(queries)} ---")
-        print(f"  {q_str}")
+    if settings.search_source == "google" and queries:
+        # ══ Google：并行搜索全部检索式（多标签页）══
+        from src.web_automation.google_patents import (
+            search_abstracts_parallel as gsearch_parallel)
+        q_strings = [str(q).strip() for q in queries]
+        print(f"  [阶段1] 并行搜索 {len(queries)} 个检索式 "
+              f"(并发 {settings.search_search_concurrency})")
+        per_query = await gsearch_parallel(
+            page, q_strings, max_results=max_results,
+            signals=signals, concurrency=settings.search_search_concurrency)
 
-        abstracts = []
-        error_msg = None
-        for attempt in range(1, MAX_SEARCH_RETRIES + 1):
+        # ── 失败的检索式：切浏览器 + 冷却 + 重试（最多3轮）──
+        failed_idx = [i for i, r in enumerate(per_query) if r.get("error")]
+        retry_round = 0
+        while failed_idx and retry_round < MAX_SEARCH_RETRIES:
+            retry_round += 1
+            err_text = "\n".join(per_query[i]["error"] or "" for i in failed_idx)
+            is_403 = "403" in err_text
+            is_net_error = any(kw in err_text for kw in (
+                "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                "NS_BINDING_ABORTED", "net::ERR_",
+            ))
+            if not (is_403 or is_net_error):
+                break  # 非限流错误，重试无意义
+            if is_403:
+                BrowserManager.switch_channel(on_403=True)
+                cool = 10 + retry_round * 5
+                reason = "403"
+            else:
+                BrowserManager.switch_channel()
+                cool = 3 + retry_round * 2
+                reason = "网络中断"
+            print(f"  ⚠️ 并行搜索 {len(failed_idx)} 个检索式遇 {reason}，"
+                  f"冷却 {cool}s 重试 ({retry_round}/{MAX_SEARCH_RETRIES})...")
+            await browser_mgr.close()
+            await asyncio.sleep(cool)
             try:
-                if settings.search_source == "google":
-                    from src.web_automation.google_patents import search_abstracts as gsearch
-                    abstracts = await gsearch(
-                        page, q_str, max_results=max_results, signals=signals)
-                else:
+                context, page = await browser_mgr.launch_with_retry(max_retries=1)
+            except Exception:
+                await asyncio.sleep(2)
+                context, page = await browser_mgr.launch_with_retry(max_retries=1)
+            human = HumanBehavior(settings)
+            scraper = PatentscopeScraper(page, settings, human)
+            retry_res = await gsearch_parallel(
+                page, [q_strings[i] for i in failed_idx],
+                max_results=max_results, signals=signals,
+                concurrency=min(settings.search_search_concurrency, len(failed_idx)))
+            for k, i in enumerate(failed_idx):
+                per_query[i] = retry_res[k]
+            failed_idx = [i for i in failed_idx if per_query[i].get("error")]
+
+        # ── 收尾：逐式存盘 + 日志 ──
+        for q_idx, q_str in enumerate(queries):
+            q_str = q_str.strip()
+            if not q_str:
+                continue
+            res = per_query[q_idx]
+            abstracts = res.get("abstracts", [])
+            error_msg = res.get("error")
+            for a in abstracts:
+                a["source_query"] = q_str
+            all_abstracts.append(abstracts)
+            _save_json(
+                per_query_dir / f"{q_idx + 1:02d}_abstracts.json",
+                {"query": q_str, "count": len(abstracts),
+                 "error": error_msg, "results": abstracts})
+            per_query_stats.append({
+                "index": q_idx + 1, "query": q_str,
+                "results_count": len(abstracts), "error": error_msg,
+            })
+            status = "✅" if not error_msg else "❌"
+            print(f"  {status} 检索式{q_idx + 1}: {len(abstracts)} 篇摘要")
+    else:
+        # ══ WIPO / 单检索式：串行（原逻辑）══
+        for q_idx, q_str in enumerate(queries):
+            q_str = q_str.strip()
+            if not q_str:
+                continue
+
+            label = f"检索式{q_idx + 1}"
+            print(f"\n  --- {label} / {len(queries)} ---")
+            print(f"  {q_str}")
+
+            abstracts = []
+            error_msg = None
+            for attempt in range(1, MAX_SEARCH_RETRIES + 1):
+                try:
                     abstracts = await scraper.search_abstracts(
                         q_str, max_results=max_results, signals=signals)
-                break
-            except Exception as e:
-                err_msg = str(e)
-                is_403 = "403" in err_msg
-                is_net_error = any(kw in err_msg for kw in (
-                    "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
-                    "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
-                    "NS_BINDING_ABORTED", "net::ERR_",
-                ))
-                if (is_403 or is_net_error) and attempt < MAX_SEARCH_RETRIES:
-                    if is_403:
-                        BrowserManager.switch_channel(on_403=True)
-                        cool = 10 + attempt * 5
-                    else:
-                        BrowserManager.switch_channel()
-                        cool = 3 + attempt * 2
-                    print(f"  ⚠️ 遇到{'403' if is_403 else '网络中断'}，"
-                          f"冷却 {cool}s 重试 ({attempt}/{MAX_SEARCH_RETRIES})...")
-                    await browser_mgr.close()
-                    await asyncio.sleep(cool)
-                    try:
-                        context, page = await browser_mgr.launch_with_retry(max_retries=1)
-                    except Exception:
-                        await asyncio.sleep(2)
-                        context, page = await browser_mgr.launch_with_retry(max_retries=1)
-                    human = HumanBehavior(settings)
-                    scraper = PatentscopeScraper(page, settings, human)
-                else:
-                    error_msg = str(e)
                     break
+                except Exception as e:
+                    err_msg = str(e)
+                    is_403 = "403" in err_msg
+                    is_net_error = any(kw in err_msg for kw in (
+                        "NS_ERROR_NET_INTERRUPT", "NS_ERROR_NET_RESET",
+                        "NS_ERROR_NET_TIMEOUT", "NS_ERROR_CONNECTION_REFUSED",
+                        "NS_BINDING_ABORTED", "net::ERR_",
+                    ))
+                    if (is_403 or is_net_error) and attempt < MAX_SEARCH_RETRIES:
+                        if is_403:
+                            BrowserManager.switch_channel(on_403=True)
+                            cool = 10 + attempt * 5
+                        else:
+                            BrowserManager.switch_channel()
+                            cool = 3 + attempt * 2
+                        print(f"  ⚠️ 遇到{'403' if is_403 else '网络中断'}，"
+                              f"冷却 {cool}s 重试 ({attempt}/{MAX_SEARCH_RETRIES})...")
+                        await browser_mgr.close()
+                        await asyncio.sleep(cool)
+                        try:
+                            context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                        except Exception:
+                            await asyncio.sleep(2)
+                            context, page = await browser_mgr.launch_with_retry(max_retries=1)
+                        human = HumanBehavior(settings)
+                        scraper = PatentscopeScraper(page, settings, human)
+                    else:
+                        error_msg = str(e)
+                        break
 
-        for a in abstracts:
-            a["source_query"] = q_str
-        all_abstracts.append(abstracts)
+            for a in abstracts:
+                a["source_query"] = q_str
+            all_abstracts.append(abstracts)
 
-        _save_json(
-            per_query_dir / f"{q_idx + 1:02d}_abstracts.json",
-            {"query": q_str, "count": len(abstracts),
-             "error": error_msg, "results": abstracts})
+            _save_json(
+                per_query_dir / f"{q_idx + 1:02d}_abstracts.json",
+                {"query": q_str, "count": len(abstracts),
+                 "error": error_msg, "results": abstracts})
 
-        per_query_stats.append({
-            "index": q_idx + 1, "query": q_str,
-            "results_count": len(abstracts), "error": error_msg,
-        })
+            per_query_stats.append({
+                "index": q_idx + 1, "query": q_str,
+                "results_count": len(abstracts), "error": error_msg,
+            })
 
-        status = "✅" if not error_msg else "❌"
-        print(f"  {status} {label}: {len(abstracts)} 篇摘要")
+            status = "✅" if not error_msg else "❌"
+            print(f"  {status} {label}: {len(abstracts)} 篇摘要")
 
-        if q_idx < len(queries) - 1:
-            await human.inter_search_delay(q_idx + 1)
+            if q_idx < len(queries) - 1:
+                await human.inter_search_delay(q_idx + 1)
 
     await browser_mgr.close()
 

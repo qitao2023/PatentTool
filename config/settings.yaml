@@ -43,10 +43,11 @@ web:
 # 检索参数（GUI 设置对话框可修改）
 search:
   include_citations: true       # 从说明书提取引用专利号
-  force_refresh: false          # 强制重新获取本申请
+  force_refresh: true          # 强制重新获取本申请
   stop_after: "full"            # 流程断点: abstracts | screen | download | score | full
   prefer_cn_family: true        # 优先使用中国同族专利：下载全文时若遇非CN专利，自动查专利族中的CN专利替换
   search_source: "google"            # 全链路引擎: wipo(搜索+下载走PATENTSCOPE) | google(搜索+下载走Google Patents)
+  search_concurrency: 3              # Google 搜索并发数（多检索式并行搜，多标签页；wipo 始终串行）
   download_concurrency: 20           # 下载并发数（主流程+批量测试共用；wipo 自动保守为1防403）
 
 # PATENTSCOPE 配置

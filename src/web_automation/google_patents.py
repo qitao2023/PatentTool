@@ -246,9 +246,11 @@ _GOOGLE_SEARCH_EXTRACT_JS = """(maxItems) => {
     }
     const results = [];
     let declared = null;
-    // Google 页头估算总数（"About 18 results"），用于与实际渲染数对比日志
-    const declaredM = (document.body.innerText || '').match(/(?:About\\s*)?(\\d+)\\s*results?/i);
-    if (declaredM) declared = parseInt(declaredM[1], 10);
+    // Google 页头估算总数（"About 18 results" / "More than 100,000 results"），
+    // 用于与实际渲染数对比日志。数字带千分位逗号（100,000），必须去逗号再转 int，
+    // 否则正则会匹配到 ",000" 尾巴算出 0 条（误导成"声明0条但渲染N条"）。
+    const declaredM = (document.body.innerText || '').match(/(?:About|More than)?\\s*([\\d,]+)\\s*results?/i);
+    if (declaredM) declared = parseInt(declaredM[1].replace(/,/g, ''), 10);
     document.querySelectorAll('search-result-item').forEach(item => {
         const root = item.shadowRoot || item;
         const title = (deepQ(root, 'h3')?.textContent || '').trim();
@@ -388,6 +390,93 @@ async def search_abstracts(page, query: str, max_results: int = 100,
             msg += f"（Google 声明约{declared}条，实际渲染{len(results)}条）"
         signals.log.emit("SUCCESS", msg)
     return results
+
+
+async def search_abstracts_parallel(
+    page, queries: list[str], max_results: int = 100,
+    signals=None, concurrency: int = 3,
+) -> list[dict]:
+    """并行执行多个 Google 检索式搜索。
+
+    在同一浏览器 context 下额外开 (concurrency-1) 个标签页并行搜索，
+    每个标签页串行处理分到的检索式（轮询分配，均衡负载）。返回与
+    queries 顺序一致的结果列表，供调用方决定哪些需要重试。
+
+    Args:
+        page: Playwright Page（工作标签页之一，其余从 page.context 新建）
+        queries: 检索式字符串列表
+        max_results: 每式上限
+        signals: WorkerSignals 兼容对象
+        concurrency: 并行标签页数（<=1 或单检索式时自动退化为串行）
+
+    Returns:
+        list[dict]: 与 queries 等长，每项
+            {"abstracts": list[dict], "error": str|None}
+    """
+    import asyncio
+
+    queries = [str(q).strip() for q in queries]
+    n = len(queries)
+    if n == 0:
+        return []
+    # 全部为空检索式 → 直接返回空结果，不动浏览器
+    if not any(queries):
+        return [{"abstracts": [], "error": None} for _ in queries]
+
+    # ── 串行退化路径（单检索式 / 并发<=1）──
+    if concurrency <= 1 or n == 1:
+        out = []
+        for q in queries:
+            if not q:
+                out.append({"abstracts": [], "error": None})
+                continue
+            try:
+                abstracts = await search_abstracts(
+                    page, q, max_results=max_results, signals=signals)
+                out.append({"abstracts": abstracts, "error": None})
+            except Exception as e:
+                out.append({"abstracts": [], "error": str(e)})
+        return out
+
+    context = page.context
+    created = []
+    try:
+        # 复用同一 context 开额外标签页（代理/会话一致）
+        for _ in range(min(concurrency, n) - 1):
+            p = await context.new_page()
+            p.set_default_timeout(60000)
+            created.append(p)
+        pool = [page] + created
+        results: list = [None] * n
+
+        async def _worker(pg, idxs):
+            for idx in idxs:
+                q = queries[idx]
+                if not q:
+                    results[idx] = {"abstracts": [], "error": None}
+                    continue
+                try:
+                    abstracts = await search_abstracts(
+                        pg, q, max_results=max_results, signals=signals)
+                    results[idx] = {"abstracts": abstracts, "error": None}
+                except Exception as e:
+                    results[idx] = {"abstracts": [], "error": str(e)}
+
+        # 轮询分配下标，均衡各标签页工作量
+        n_pages = len(pool)
+        tasks = [
+            asyncio.create_task(_worker(pool[i], range(i, n, n_pages)))
+            for i in range(n_pages)
+        ]
+        await asyncio.gather(*tasks)
+        return results
+    finally:
+        # 关闭额外标签页，还原为单页状态（page 由调用方持有/关闭）
+        for p in created:
+            try:
+                await p.close()
+            except Exception:
+                pass
 
 
 def fetch_patent_text(pub: str, proxy: str | None = None,
