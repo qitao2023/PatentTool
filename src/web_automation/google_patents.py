@@ -583,6 +583,7 @@ def fetch_patent_text(pub: str, proxy: str | None = None,
         if not result["abstract"] and meta.get("abstract_snippet"):
             result["abstract"] = meta["abstract_snippet"]
 
+        LAST_FETCH_ERROR = ""  # 成功即无失败原因
         return result
 
     if not LAST_FETCH_ERROR:
