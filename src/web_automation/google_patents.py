@@ -24,6 +24,7 @@ Google Patents HTML 提取模块 — 免登录、纯 HTTP 获取专利全文。
 """
 from __future__ import annotations
 
+import http.client
 import re
 import time
 import urllib.request
@@ -38,6 +39,10 @@ from src.utils.patent_extract import extract_embodiments
 GOOGLE_PATENTS_BASE = "https://patents.google.com/patent/{pub}"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+# 最近一次 fetch_patent_text 失败原因（诊断日志用）。
+# 高并发下多线程写读仅作参考；三轮串行终检时精确反映该篇失败原因。
+LAST_FETCH_ERROR = ""
 
 # 尝试的 URL 变体顺序：/zh（中文，CN 原文）→ 无后缀（原语言全文）
 _URL_VARIANTS = ["/zh", ""]
@@ -78,7 +83,13 @@ def _clean_text(s: str) -> str:
 
 def _try_fetch_tree(url: str, proxy: str | None,
                     timeout: int, attempts: int = 3) -> object | None:
-    """抓取并解析页面，带重试。返回 lxml 树或 None。"""
+    """抓取并解析页面，带重试。返回 lxml 树或 None。
+
+    ⚠️ http.client.HTTPException（IncompleteRead / RemoteDisconnected 等）
+    必须纳入重试：高并发下代理会中途截断大响应，属瞬时传输错误，单次即
+    放弃会被误判为"无全文"。重试耗尽后在 LAST_FETCH_ERROR 记录真实原因。
+    """
+    global LAST_FETCH_ERROR
     last_err = None
     for i in range(attempts):
         try:
@@ -87,10 +98,14 @@ def _try_fetch_tree(url: str, proxy: str | None,
             # fromstring(bytes) 会猜错编码产生乱码。
             return lxml_html.fromstring(html_bytes.decode("utf-8"))
         except (urllib.error.URLError, urllib.error.HTTPError,
-                OSError, TimeoutError, UnicodeDecodeError) as e:
+                OSError, TimeoutError, UnicodeDecodeError,
+                http.client.HTTPException) as e:
             last_err = e
             if i < attempts - 1:
                 time.sleep(1.0 + i)
+    if last_err is not None:
+        LAST_FETCH_ERROR = (f"网络/代理错误({type(last_err).__name__}): "
+                            f"{last_err}")
     return None
 
 
@@ -338,7 +353,7 @@ async def search_abstracts(page, query: str, max_results: int = 100,
     url = f"https://patents.google.com/?q={quote(query)}&num={num}"
 
     if signals:
-        signals.log.emit("INFO", f"  [Google] 搜索: {query[:60]}")
+        signals.log.emit("INFO", f"  [Google] 搜索: {query}")
         if max_results > GOOGLE_SEARCH_PAGE_MAX:
             signals.log.emit("WARN",
                 f"  Google 单页上限 {GOOGLE_SEARCH_PAGE_MAX} 条，"
@@ -498,8 +513,11 @@ def fetch_patent_text(pub: str, proxy: str | None = None,
     Returns:
         dict 兼容 PATENTSCOPE 提取格式；失败返回 None。
     """
+    global LAST_FETCH_ERROR
+    LAST_FETCH_ERROR = ""
     pub = _normalize_pub(pub)
     if not pub:
+        LAST_FETCH_ERROR = "无效公开号"
         return None
 
     for url in _page_urls(pub):
@@ -512,6 +530,7 @@ def fetch_patent_text(pub: str, proxy: str | None = None,
         title = _extract_title(tree)
         # 有效：claims 或 description 任一非空即可（非 CN 原语言也接受）
         if not (claims or description):
+            LAST_FETCH_ERROR = "Google Patents 无全文"
             continue
 
         used_zh = url.endswith("/zh")
@@ -566,4 +585,6 @@ def fetch_patent_text(pub: str, proxy: str | None = None,
 
         return result
 
+    if not LAST_FETCH_ERROR:
+        LAST_FETCH_ERROR = "未知原因"
     return None

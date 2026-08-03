@@ -230,10 +230,11 @@ class Settings:
 
     @property
     def search_stop_after(self) -> str:
-        """流程断点: abstracts | screen | download | score | full"""
-        v = self._raw.get("search", {}).get("stop_after", "full")
-        if isinstance(v, bool) or str(v) not in ("abstracts", "screen", "download", "score", "full"):
-            return "full"
+        """流程断点: abstracts | screen | download | score | analysis | full（默认 analysis）"""
+        v = self._raw.get("search", {}).get("stop_after", "analysis")
+        if isinstance(v, bool) or str(v) not in (
+                "abstracts", "screen", "download", "score", "analysis", "full"):
+            return "analysis"
         return str(v)
 
     @property

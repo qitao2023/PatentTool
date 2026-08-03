@@ -44,7 +44,8 @@ web:
 search:
   include_citations: true       # 从说明书提取引用专利号
   force_refresh: true          # 强制重新获取本申请
-  stop_after: "full"            # 流程断点: abstracts | screen | download | score | full
+  stop_after: "analysis"        # 流程断点: abstracts | screen | download | score | analysis | full（默认 analysis）
+                                 #   analysis = 生成对比分析报告后停止（不自动撰写审查意见通知书）
   prefer_cn_family: true        # 优先使用中国同族专利：下载全文时若遇非CN专利，自动查专利族中的CN专利替换
   search_source: "google"            # 全链路引擎: wipo(搜索+下载走PATENTSCOPE) | google(搜索+下载走Google Patents)
   search_concurrency: 3              # Google 搜索并发数（多检索式并行搜，多标签页；wipo 始终串行）

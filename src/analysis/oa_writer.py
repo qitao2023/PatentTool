@@ -135,11 +135,22 @@ class OAWriter:
         client = self._get_client()
         options = options or {}
 
+        # 最终评分：comparisons 是 AI 读完全文后的详细对比，其 relevance_score
+        # 才是最终评分；dedup_results 里的 relevance_score 是粗筛评分，仅用于
+        # 未参与详细对比时的回退（与 report.py 的 _final_score 逻辑一致）。
+        fulltext_scores = {
+            c.get("publication_number", ""): c.get("relevance_score")
+            for c in comparisons
+            if c.get("publication_number")
+            and c.get("relevance_score") is not None
+        }
+
         # 构建本申请信息
         patent_text = self._build_patent_text(patent_doc)
 
         # 构建对比文件信息（只取有全文、相关度高的）
-        top_docs = self._select_top_docs(dedup_results, max_count=5)
+        top_docs = self._select_top_docs(
+            dedup_results, max_count=5, score_map=fulltext_scores)
         docs_text = self._build_comparison_docs(top_docs)
 
         # 对比文件角色指定
@@ -196,28 +207,44 @@ class OAWriter:
 
         # 末尾追加检索对比文件清单附录（前 10 篇，按相关度排序）。
         # 直接取检索结果数据，不经 AI 生成，避免编造公布号。
-        appendix = self._build_appendix(dedup_results, max_count=10)
+        appendix = self._build_appendix(
+            dedup_results, max_count=10, score_map=fulltext_scores)
         if appendix:
             response = response.rstrip() + appendix
 
         return response
 
+    def _final_score(self, d: dict, score_map: dict) -> int:
+        """最终评分：优先 AI 读完全文的详细对比评分，缺失时回退粗筛评分。"""
+        pub = d.get("publication_number", "")
+        s = score_map.get(pub)
+        if s is not None:
+            return s
+        return d.get("relevance_score", 0) or 0
+
     def _build_appendix(self, dedup_results: list[dict],
-                        max_count: int = 10) -> str:
+                        max_count: int = 10,
+                        score_map: dict | None = None) -> str:
         """构建通知书末尾的「检索对比文件清单」附录。
 
         从检索结果中挑出相关度最高的不超过 max_count 篇对比文件，
         记录其公布号（编号）与标题，供审查员归档备查。
 
+        排序依据最终评分：AI 读完全文的详细对比评分（comparisons 的
+        relevance_score）优先，未参与详细对比的按粗筛 relevance_score 回退，
+        与通知书正文的评述顺序一致。
+
         Args:
             dedup_results: 去重后的对比文件列表
             max_count: 最多收录篇数（默认 10）
+            score_map: {公布号: AI 读完全文后的最终评分}，优先采用
 
         Returns:
             str: Markdown 附录段落；无可用对比文件时返回空字符串
         """
+        score_map = score_map or {}
         scored = [d for d in dedup_results if d.get("publication_number")]
-        scored.sort(key=lambda x: x.get("relevance_score", 0) or 0, reverse=True)
+        scored.sort(key=lambda x: self._final_score(x, score_map), reverse=True)
         top = scored[:max_count]
         if not top:
             return ""
@@ -227,8 +254,8 @@ class OAWriter:
             pub = d.get("publication_number", "")
             title = (d.get("title", "") or "").replace("|", "\\|")
             title_cell = title if title else "—"
-            score = d.get("relevance_score", "")
-            score_cell = str(score) if score not in ("", None) else ""
+            score = self._final_score(d, score_map)
+            score_cell = str(score) if score else ""
             rows.append(f"| {i} | {pub} | {title_cell} | {score_cell} |")
 
         header = (
@@ -276,20 +303,24 @@ class OAWriter:
         return "\n\n".join(parts)
 
     def _select_top_docs(self, dedup_results: list[dict],
-                         max_count: int = 5) -> list[dict]:
+                         max_count: int = 5,
+                         score_map: dict | None = None) -> list[dict]:
         """选出最相关的对比文件（有全文 + 相关度高的优先）"""
+        score_map = score_map or {}
         # 优先有全文、高相关度的
         with_full = [d for d in dedup_results if d.get("full_text") or d.get("claims")]
         without_full = [d for d in dedup_results
                         if not d.get("full_text") and not d.get("claims")]
 
-        # 按相关度排序
-        with_full.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+        # 按最终评分排序（读完全文的 AI 评分优先，缺失回退粗筛评分）
+        with_full.sort(
+            key=lambda x: self._final_score(x, score_map), reverse=True)
 
         selected = with_full[:max_count]
         # 不够则补充
         if len(selected) < max_count:
-            without_full.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+            without_full.sort(
+                key=lambda x: self._final_score(x, score_map), reverse=True)
             selected.extend(without_full[:max_count - len(selected)])
 
         return selected

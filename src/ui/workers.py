@@ -486,13 +486,13 @@ class PatentscopeSearchAndFetchWorker(QThread):
 
                 if not abstracts and attempt >= 3:
                     self.signals.log.emit("WARN",
-                        f"  兜底: {fq_str[:60]}... → 重试3次仍失败")
+                        f"  兜底: {fq_str} → 重试3次仍失败")
                     continue
                 for a in abstracts:
                     a["source_query"] = fq_str
                 fallback_abstracts.append(abstracts)
                 self.signals.log.emit("INFO",
-                    f"  兜底: {fq_str[:60]}... → {len(abstracts)} 篇")
+                    f"  兜底: {fq_str} → {len(abstracts)} 篇")
             await browser_mgr.close()
             seen = set()
             unique_abstracts = []
@@ -866,14 +866,22 @@ class PatentscopeSearchAndFetchWorker(QThread):
             # screen_claims_all 内部按批创建独立 client 并写 ai_logs/batch_NN/
             all_scored = []
             if history is not None:
-                # 分区：已有历史评分的直接复用，只对新出现的走广筛
+                # 分区：已有历史评分的直接复用；只有"本次有效新增"走 AI 广筛。
+                # 本次有效新增 = 本次下载(to_fetch，≤下载上限)中未评分/未缓存的文件，
+                #   数量天然 ≤ 下载上限，无需再截断；
+                # 缓存里更早运行遗留的未评分文件不拉入本次 AI，只有再次被检索命中
+                #   进入 to_fetch 时才评分。
+                this_run_pubs = {a.get("publication_number", "")
+                                 for a in to_fetch if a.get("publication_number")}
                 new_pubs = set()
+                old_unscored = 0
                 for f in sorted(Path(details_dir).glob("*.json")):
                     try:
                         d = json_module.loads(f.read_text(encoding="utf-8"))
                         if d.get("fetch_status") != "ok" or not d.get("claims"):
                             continue
-                        rec = history.get(d.get("publication_number", ""))
+                        pub = d.get("publication_number", "")
+                        rec = history.get(pub)
                         if rec and rec.get("best_score", 0) > 0:
                             d["fulltext_score"] = rec["best_score"]
                             d["fulltext_reason"] = rec.get(
@@ -881,16 +889,23 @@ class PatentscopeSearchAndFetchWorker(QThread):
                             d["key_features"] = rec.get("key_features", [])
                             d["_history_reused"] = True
                             all_scored.append(d)
+                        elif pub in this_run_pubs:
+                            new_pubs.add(pub)
                         else:
-                            new_pubs.add(d.get("publication_number", ""))
+                            old_unscored += 1
                     except Exception:
                         pass
                 if all_scored:
                     self.signals.log.emit("INFO",
                         f"  历史记录复用: {len(all_scored)} 篇已评分，跳过 AI")
+                if old_unscored:
+                    self.signals.log.emit("INFO",
+                        f"  缓存遗留未评分 {old_unscored} 篇（非本次下载），本次跳过，"
+                        f"再次命中检索时才评分")
                 if new_pubs:
                     self.signals.log.emit("INFO",
-                        f"  新增对比文件: {len(new_pubs)} 篇，开始 Claims 广筛...")
+                        f"  本次有效新增: {len(new_pubs)} 篇 (≤ 下载上限 {max_detail})，"
+                        f"开始 Claims 广筛...")
                     new_scored = screener2.screen_claims_all(
                         self.patent_doc, str(details_dir),
                         signals=self.signals,
@@ -1396,8 +1411,10 @@ class FinalReviewWorker(QThread):
                     f"  [{i+1}/{total}] {sel_pub} 复用历史评述")
                 review = dict(rec["detailed_review"])
                 review.pop("reviewed_at", None)
-                review["relevance_score"] = rec.get(
-                    "best_score", review.get("relevance_score", 0))
+                # 读完全文的详细评分为准；缺失时才回退 best_score（粗筛评分）
+                review["relevance_score"] = (
+                    review.get("relevance_score")
+                    or rec.get("best_score", 0))
                 review["source_raw"] = result
                 comparisons.append(review)
             else:
@@ -1408,8 +1425,10 @@ class FinalReviewWorker(QThread):
                 detail = comparator._detailed_comparison(
                     comp_client, self.patent_doc, result)
                 if detail:
-                    detail["relevance_score"] = rec.get(
-                        "best_score", detail.get("relevance_score", 0))
+                    # 读完全文的 AI 评分为准；缺失时才回退 best_score（粗筛评分）
+                    detail["relevance_score"] = (
+                        detail.get("relevance_score")
+                        or rec.get("best_score", 0))
                     comparisons.append(detail)
                     # 只存评述字段，不含全文，保持历史库轻量
                     history.set_detailed_review(sel_pub, {

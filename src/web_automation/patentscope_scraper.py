@@ -11,6 +11,7 @@ from src.utils.config import Settings
 from src.utils.text_cleaner import clean_patent_html_text
 from src.web_automation.human_behavior import HumanBehavior
 from src.web_automation.google_patents import fetch_patent_text
+from src.web_automation import google_patents as google_patents_mod
 
 
 # 记录最近一次详情提取失败的具体原因，供外层日志使用。
@@ -566,18 +567,22 @@ class PatentscopeScraper:
                             signals.log.emit("INFO",
                                 f"    ✓G [{idx}/{len(remaining)}] {pub}")
                         return
-                    # google 模式：无全文直接记为失败，不降级浏览器
+                    # google 模式：无全文/网络失败直接记为失败，不降级浏览器
                     fail_count += 1
                     failed_ids.append(doc_id)
                     safe = _safe_filename(doc_id)
                     fpath = out / f"{safe}.json"
+                    # 区分「网络/代理截断」与「真无全文」，避免把并发传输错误
+                    # 误报为"无全文"（三轮串行终检时该值精确；并发轮仅参考）
+                    reason = (google_patents_mod.LAST_FETCH_ERROR
+                              or "Google Patents 无全文")
                     fpath.write_text(
                         json_module.dumps({
                             "doc_id": doc_id,
                             "fetch_status": "failed",
                             "url": (f"https://patents.google.com/patent/"
                                     f"{pub}/zh"),
-                            "error": "Google Patents 无全文",
+                            "error": reason,
                         }, indent=2, ensure_ascii=False),
                         encoding="utf-8")
                     if signals:
@@ -585,7 +590,7 @@ class PatentscopeScraper:
                             doc_id, success_count + fail_count)
                         signals.log.emit("WARN",
                             f"    ✗G [{idx}/{len(remaining)}] "
-                            f"{pub}: Google 无全文")
+                            f"{pub}: {reason}")
                     return
 
                 pg = await current_context.new_page()
@@ -748,6 +753,28 @@ class PatentscopeScraper:
             await asyncio.gather(
                 *[_fetch_one(did) for did in retry_list],
                 return_exceptions=True)
+
+        # ── 三轮终检：剩余失败串行重试 ──
+        # 二轮仍失败的多数是并发下代理截断响应（IncompleteRead 等瞬时传输
+        # 错误，单发抓取实测全部成功），降为单并发 + 冷却串行重试可救回。
+        if failed_ids:
+            final_list = list(failed_ids)
+            failed_ids.clear()
+            if signals:
+                signals.log.emit("INFO",
+                    f"  === 三轮终检 {len(final_list)} 篇（串行重试）=== ")
+            from src.web_automation.browser_manager import BrowserManager
+            BrowserManager.switch_channel()
+            await _restart_browser()
+            consecutive_403 = 0
+            batch_count = 0
+            await asyncio.sleep(3)
+            for did in final_list:
+                try:
+                    await _fetch_one(did)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)  # 串行冷却，避免再次并发截断
 
         total_ok = skipped + success_count
         # fail_count 累加了第一轮的失败数，但二轮补下载成功后不归零，会误报。

@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
             f"批量检索测试: {len(queries)} 个检索式")
         self.log_panel.append_log("SUCCESS", f"检索引擎: {eng_name}")
         for i, q in enumerate(queries, 1):
-            self.log_panel.append_log("INFO", f"  [{i}] {q[:100]}")
+            self.log_panel.append_log("INFO", f"  [{i}] {q}")
         self.input_panel.set_running_state(True)
         self.status_label.setText(
             f"批量测试 [{eng_name}] ({len(queries)} 检索式 × {max_results} 条)...")
@@ -303,14 +303,14 @@ class MainWindow(QMainWindow):
         })
         stop_labels = {
             "abstracts": "搜完摘要", "screen": "下载前", "download": "下载后",
-            "score": "评分后", "full": "全程"
+            "score": "评分后", "analysis": "对比分析报告后", "full": "全程"
         }
         cn_family = "开启" if self._user_params.get("prefer_cn_family", True) else "关闭"
         self.log_panel.append_log("INFO",
             f"检索设置: {self._user_params.get('max_queries', 3)}个检索式 "
             f"× {self._user_params.get('max_results', 100)}条/检索式 "
             f"| AI: {self._user_params.get('ai_provider', 'deepseek')} "
-            f"| 断点: {stop_labels.get(self._user_params.get('stop_after','full'), '全程')} "
+            f"| 断点: {stop_labels.get(self._user_params.get('stop_after','analysis'), '全程')} "
             f"| CN同族优先: {cn_family}")
 
         # 保存界面设置（reset 会清掉）
@@ -725,9 +725,9 @@ class MainWindow(QMainWindow):
                         self.settings.patentscope_max_results)
         fetch_detail = self._user_params.get("fetch_detail",
                         self.settings.analysis_max_detail_fetch)
-        stop_after = self._user_params.get("stop_after", "full")
+        stop_after = self._user_params.get("stop_after", "analysis")
         max_queries = len(queries)
-        stop_labels = {"abstracts":"搜摘要", "screen":"下载前", "download":"下载", "score":"评分", "full":"全程"}
+        stop_labels = {"abstracts":"搜摘要", "screen":"下载前", "download":"下载", "score":"评分", "analysis":"分析报告后", "full":"全程"}
         self.status_label.setText(
             f"正在 {self._engine_name()} 检索 ({max_queries}检索式 × {max_results}条, "
             f"下载上限{fetch_detail}篇, 断点:{stop_labels.get(stop_after,'?')})...")
@@ -770,8 +770,9 @@ class MainWindow(QMainWindow):
         self._all_raw_results = all_enriched
 
         # 断点模式：结果已在 Worker 中处理好，直接显示
-        stop_after = self._user_params.get("stop_after", "full")
-        if stop_after != "full":
+        # 注：analysis 断点不停在这里，继续去重+对比分析，出报告后再停
+        stop_after = self._user_params.get("stop_after", "analysis")
+        if stop_after in ("abstracts", "screen", "download", "score"):
             from src.result_collector.deduplicator import Deduplicator
             deduper = Deduplicator(self.settings)
             deduped, removed = deduper.deduplicate(all_enriched)
@@ -943,6 +944,17 @@ class MainWindow(QMainWindow):
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(report.html_content)
         self.log_panel.append_log("INFO", f"  报告已保存: {html_path}")
+
+        # ── 断点：仅生成对比分析报告（不自动撰写审查意见通知书）──
+        if self._user_params.get("stop_after", "full") == "analysis":
+            self.log_panel.append_log("SUCCESS",
+                "对比分析报告已生成，按断点停止（不自动撰写审查意见通知书）")
+            self.log_panel.append_log("INFO",
+                "如需撰写通知书，可稍后从菜单「撰写通知书」手动启动。")
+            self.log_panel.update_progress(100, "对比分析报告完成")
+            self.input_panel.set_running_state(False)
+            self.status_label.setText("对比分析报告已生成")
+            return
 
         # 启动审查意见通知书撰写
         self._run_oa_writing(

@@ -162,13 +162,15 @@ class SettingsDialog(QDialog):
 
         self.stop_after_combo = QComboBox()
         self.stop_after_combo.addItem("跑完全程（撰写通知书）", "full")
+        self.stop_after_combo.addItem("生成对比分析报告后停止（不写通知书）", "analysis")
         self.stop_after_combo.addItem("Claims广筛评分后停止", "score")
         self.stop_after_combo.addItem("下载对比文件后停止", "download")
         self.stop_after_combo.addItem("下载前停止（结果截断后）", "screen")
         self.stop_after_combo.addItem("检索命中后停止（最省时，不下载）", "abstracts")
         self.stop_after_combo.setToolTip(
             "流程运行到选定步骤后自动停止：\n"
-            "  检索命中后（不下载） / 下载前（截断选择后） / 下载后 / Claims广筛评分后 / 全程")
+            "  检索命中后（不下载） / 下载前（截断选择后） / 下载后 / Claims广筛评分后 /\n"
+            "  生成对比分析报告后（只出报告，不自动撰写审查意见通知书） / 全程")
         search_form.addRow("流程断点:", self.stop_after_combo)
 
         self.prefer_cn_family_cb = QCheckBox("优先使用中国同族专利（下载全文时自动替换非CN专利）")
