@@ -8,7 +8,9 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QGroupBox, QFileDialog,
     QListWidget, QListWidgetItem, QAbstractItemView,
 )
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import Signal, Slot, QSize
+
+from src.ui.icons import icon
 
 
 class InputPanel(QWidget):
@@ -40,11 +42,12 @@ class InputPanel(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(12, 8, 12, 6)
+        layout.setSpacing(6)
 
         # ── 文件路径行 ──────────────────────────────────────────────
         file_row = QHBoxLayout()
+        file_row.setSpacing(8)
         file_row.addWidget(QLabel("专利PDF路径:"))
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("请选择或输入专利申请文件PDF路径...")
@@ -52,13 +55,15 @@ class InputPanel(QWidget):
         self.path_edit.returnPressed.connect(self._on_path_return_pressed)
         file_row.addWidget(self.path_edit, 1)
 
-        self.browse_btn = QPushButton("浏览...")
+        self.browse_btn = QPushButton(" 浏览...")
+        self.browse_btn.setIcon(icon("folder"))
+        self.browse_btn.setIconSize(QSize(16, 16))
         self.browse_btn.clicked.connect(self._on_browse)
         file_row.addWidget(self.browse_btn)
         layout.addLayout(file_row)
 
         # ── 历史运行选择 ────────────────────────────────────────────
-        self.runs_group = QGroupBox("📂 历史运行")
+        self.runs_group = QGroupBox("历史运行")
         self.runs_group.setVisible(False)
         runs_layout = QVBoxLayout(self.runs_group)
         runs_layout.setContentsMargins(8, 4, 8, 4)
@@ -70,10 +75,15 @@ class InputPanel(QWidget):
         runs_layout.addWidget(self.runs_list)
 
         runs_btn_row = QHBoxLayout()
-        self.open_existing_btn = QPushButton("📂 打开选中结果")
+        runs_btn_row.setSpacing(8)
+        self.open_existing_btn = QPushButton("打开选中结果")
+        self.open_existing_btn.setIcon(icon("folder"))
+        self.open_existing_btn.setIconSize(QSize(16, 16))
         self.open_existing_btn.clicked.connect(self._on_open_existing_clicked)
         runs_btn_row.addWidget(self.open_existing_btn)
-        self.new_analysis_btn = QPushButton("🔄 开始新分析")
+        self.new_analysis_btn = QPushButton("开始新分析")
+        self.new_analysis_btn.setIcon(icon("refresh"))
+        self.new_analysis_btn.setIconSize(QSize(16, 16))
         self.new_analysis_btn.clicked.connect(self.start_clicked.emit)
         runs_btn_row.addWidget(self.new_analysis_btn)
         runs_btn_row.addStretch(1)
@@ -83,6 +93,7 @@ class InputPanel(QWidget):
 
         # ── 参数行 ──────────────────────────────────────────────────
         param_row = QHBoxLayout()
+        param_row.setSpacing(8)
 
         param_row.addWidget(QLabel("最多检索式数:"))
         self.max_queries_spin = QSpinBox()
@@ -90,7 +101,7 @@ class InputPanel(QWidget):
         self.max_queries_spin.setValue(20)
         self.max_queries_spin.setSuffix(" 个")
         param_row.addWidget(self.max_queries_spin)
-        param_row.addSpacing(20)
+        param_row.addSpacing(16)
 
         param_row.addWidget(QLabel("每式结果数:"))
         self.max_results_spin = QSpinBox()
@@ -98,7 +109,7 @@ class InputPanel(QWidget):
         self.max_results_spin.setValue(100)
         self.max_results_spin.setSuffix(" 条/检索式")
         param_row.addWidget(self.max_results_spin)
-        param_row.addSpacing(20)
+        param_row.addSpacing(16)
 
         param_row.addWidget(QLabel("全文下载上限:"))
         self.fetch_detail_spin = QSpinBox()
@@ -106,7 +117,7 @@ class InputPanel(QWidget):
         self.fetch_detail_spin.setValue(1000)
         self.fetch_detail_spin.setSuffix(" 篇")
         param_row.addWidget(self.fetch_detail_spin)
-        param_row.addSpacing(20)
+        param_row.addSpacing(16)
 
         param_row.addWidget(QLabel("申请日(可选):"))
         self.application_date_edit = QLineEdit()
@@ -118,6 +129,8 @@ class InputPanel(QWidget):
         param_row.addWidget(self.application_date_edit)
 
         self.extract_date_btn = QPushButton("提取")
+        self.extract_date_btn.setIcon(icon("calendar"))
+        self.extract_date_btn.setIconSize(QSize(16, 16))
         self.extract_date_btn.setToolTip("从PDF第一页提取申请日")
         self.extract_date_btn.clicked.connect(self.extract_date_clicked.emit)
         param_row.addWidget(self.extract_date_btn)
@@ -134,28 +147,37 @@ class InputPanel(QWidget):
 
         # ── 控制按钮行 ──────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        self.start_btn = QPushButton("▶ 开始分析")
+        btn_row.setSpacing(8)
+        self.start_btn = QPushButton(" 开始分析")
         self.start_btn.setObjectName("startBtn")
+        self.start_btn.setIcon(icon("play", "#FFFFFF"))
+        self.start_btn.setIconSize(QSize(18, 18))
         self.start_btn.setMinimumHeight(40)
         self.start_btn.clicked.connect(self.start_clicked.emit)
         btn_row.addWidget(self.start_btn)
 
-        self.stop_btn = QPushButton("■ 停止")
+        self.stop_btn = QPushButton(" 停止")
         self.stop_btn.setObjectName("stopBtn")
+        self.stop_btn.setIcon(icon("stop", "#FFFFFF"))
+        self.stop_btn.setIconSize(QSize(18, 18))
         self.stop_btn.setMinimumHeight(40)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_clicked.emit)
         btn_row.addWidget(self.stop_btn)
 
-        self.clear_log_btn = QPushButton("🧹 清空日志")
+        self.clear_log_btn = QPushButton(" 清空日志")
+        self.clear_log_btn.setIcon(icon("trash"))
+        self.clear_log_btn.setIconSize(QSize(16, 16))
         self.clear_log_btn.setToolTip("清空日志面板内容，不影响当前分析状态")
         self.clear_log_btn.clicked.connect(self.clear_log_clicked.emit)
         btn_row.addWidget(self.clear_log_btn)
 
         btn_row.addStretch(1)
 
-        self.settings_btn = QPushButton("⚙ 设置")
+        self.settings_btn = QPushButton(" 设置")
         self.settings_btn.setObjectName("settingsBtn")
+        self.settings_btn.setIcon(icon("settings"))
+        self.settings_btn.setIconSize(QSize(16, 16))
         self.settings_btn.setMinimumHeight(36)
         self.settings_btn.setToolTip("配置AI引擎、检索参数等")
         self.settings_btn.clicked.connect(self.settings_clicked.emit)

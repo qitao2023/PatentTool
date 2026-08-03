@@ -8,7 +8,9 @@ from PySide6.QtWidgets import (
     QLabel,
 )
 from PySide6.QtCore import Slot, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+
+from src.ui.theme import DEFAULT_THEME, LEVEL_TOKENS
 
 
 class LogPanel(QWidget):
@@ -16,12 +18,10 @@ class LogPanel(QWidget):
 
     progress_clicked = Signal()
 
+    # 日志级别 → 颜色（取自集中主题模块，可整体换肤）
     LEVEL_COLORS = {
-        "INFO": QColor("#2b6cb0"),
-        "WARN": QColor("#c05621"),
-        "ERROR": QColor("#c53030"),
-        "SUCCESS": QColor("#276749"),
-        "DEBUG": QColor("#718096"),
+        lv: QColor(DEFAULT_THEME[tok])
+        for lv, tok in LEVEL_TOKENS.items()
     }
 
     def __init__(self, parent=None):
@@ -33,33 +33,19 @@ class LogPanel(QWidget):
         layout.setContentsMargins(0, 4, 0, 4)
         layout.setSpacing(4)
 
-        # 进度条行
+        # 进度条行（样式见主题模块 QProgressBar）
         progress_row = QHBoxLayout()
         progress_row.addWidget(QLabel("进度:"))
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setFixedHeight(22)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #aaa;
-                border-radius: 4px;
-                text-align: center;
-                font-weight: bold;
-                font-size: 13px;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4CAF50, stop:1 #2196F3);
-                border-radius: 3px;
-            }
-        """)
         progress_row.addWidget(self.progress_bar, 1)
         self.status_label = QLabel("就绪")
         progress_row.addWidget(self.status_label)
         layout.addLayout(progress_row)
 
-        # 日志区域
+        # 日志区域（仅指定等宽字体，背景/边框由主题模块统一接管）
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumBlockCount(2000)
@@ -67,10 +53,6 @@ class LogPanel(QWidget):
             QPlainTextEdit {
                 font-family: "Cascadia Code", "Consolas", "Microsoft YaHei", monospace;
                 font-size: 12px;
-                background-color: #fafbfc;
-                border: 1px solid #d0d7de;
-                border-radius: 4px;
-                padding: 4px;
             }
         """)
         layout.addWidget(self.log_text, 1)
@@ -81,11 +63,18 @@ class LogPanel(QWidget):
 
     @Slot(str, str)
     def append_log(self, level: str, message: str):
-        """添加一条日志（同时写入 UI 和文件）"""
+        """添加一条日志（按级别着色，同时写入 UI 和文件）"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         icon = {"INFO": "i", "WARN": "!", "ERROR": "X", "SUCCESS": "V", "DEBUG": "."}.get(level, ".")
         line = f"[{timestamp}] {icon} {message}"
-        self.log_text.appendPlainText(line)
+        color = self.LEVEL_COLORS.get(level.upper(), QColor(DEFAULT_THEME["text"]))
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(color)
+        cursor.insertText(line + "\n", fmt)
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
         # 同步写入日志文件
         if getattr(self, "_log_file", None):
             try:

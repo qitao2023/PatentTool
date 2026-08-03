@@ -25,6 +25,7 @@ class ResultPanel(QWidget):
         # 顶部信息
         info_row = QHBoxLayout()
         self.summary_label = QLabel("检索结果: 等待执行...")
+        self.summary_label.setObjectName("hintLabel")
         info_row.addWidget(self.summary_label)
         info_row.addStretch(1)
         layout.addLayout(info_row)
@@ -38,6 +39,8 @@ class ResultPanel(QWidget):
         self.summary_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
+        self.summary_table.verticalHeader().setVisible(False)
+        self.summary_table.verticalHeader().setDefaultSectionSize(32)
         self.summary_table.setAlternatingRowColors(True)
         self.summary_table.setSelectionBehavior(
             self.summary_table.SelectionBehavior.SelectRows

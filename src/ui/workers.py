@@ -1707,13 +1707,11 @@ class MultiQueryTestWorker(QThread):
     """
 
     def __init__(self, queries: list[str], settings: "Settings",
-                 test_name: str = "", max_results: int = 100,
-                 concurrency: int = 1,
+                 max_results: int = 100, concurrency: int = 1,
                  output_dir: str | None = None, parent=None):
         super().__init__(parent)
         self.queries = queries
         self.settings = settings
-        self.test_name = test_name
         self.max_results = max_results
         self.concurrency = concurrency
         self._given_output_dir = output_dir
@@ -1738,7 +1736,6 @@ class MultiQueryTestWorker(QThread):
             self.signals.finished.emit(False, str(e))
 
     async def _run_async(self):
-        import re as _re
         import json as json_module
         from datetime import datetime
         from pathlib import Path
@@ -1751,9 +1748,8 @@ class MultiQueryTestWorker(QThread):
         if self._given_output_dir:
             self.output_dir = Path(self._given_output_dir)
         else:
-            name = _re.sub(r'[\\/:*?"<>|]', '_', self.test_name or "batch_test")
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.output_dir = Path.cwd() / "data" / "output" / "test_multi" / f"{name}_{ts}"
+            self.output_dir = Path.cwd() / "data" / "output" / "test_multi" / f"batch_test_{ts}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         out = self.output_dir
         detail_dir = out / "02_patent_details"
@@ -1761,7 +1757,6 @@ class MultiQueryTestWorker(QThread):
 
         # 保存输入检索式
         self._save_json(out / "queries.json", {
-            "test_name": self.test_name,
             "max_results": self.max_results,
             "concurrency": self.concurrency,
             "queries": self.queries,

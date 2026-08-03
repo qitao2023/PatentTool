@@ -16,8 +16,14 @@ class Settings:
         if config_dir is None:
             import sys
             if getattr(sys, 'frozen', False):
-                # PyInstaller 打包：exe 同目录下的 config/
+                # PyInstaller 打包：优先 exe 同目录下的 config/（可覆盖/自定义）
                 config_dir = Path(sys.executable).parent / "config"
+                # 单文件 exe 且同目录没有 config/ 时，回退到打包内嵌的
+                # config/（PyInstaller onefile 会解压到 sys._MEIPASS）
+                if not config_dir.exists():
+                    config_dir = (
+                        Path(getattr(sys, "_MEIPASS", sys.executable)) / "config"
+                    )
             else:
                 config_dir = Path(__file__).parent.parent.parent / "config"
         self.config_dir = Path(config_dir)

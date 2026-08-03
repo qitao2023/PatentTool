@@ -7,18 +7,20 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextBrowser, QPushButton, QLabel,
     QFileDialog, QMessageBox, QButtonGroup, QTabWidget, QStackedWidget,
 )
-from PySide6.QtCore import Slot
+from PySide6.QtCore import Slot, QSize
 import markdown
 
 from src.utils.patent_formatter import format_patent_text
 from src.utils.patent_extract import extract_embodiments
+from src.ui.icons import icon
+from src.ui.theme import DEFAULT_THEME as _T
 
-_BROWSER_STYLE = """
+_BROWSER_STYLE = f"""
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
     font-size: 13px;
-    background-color: #ffffff;
-    border: 1px solid #d0d7de;
-    border-radius: 4px;
+    background-color: {_T['card']};
+    border: 1px solid {_T['border']};
+    border-radius: 8px;
     padding: 12px;
     line-height: 1.8;
 """
@@ -41,14 +43,19 @@ class ReportPanel(QWidget):
 
         # ── 标题行 + 视图切换 ──────────────────────────────────────────
         title_row = QHBoxLayout()
+        title_row.setSpacing(8)
 
-        self.btn_detail = QPushButton("📋 专利详情")
+        self.btn_detail = QPushButton(" 专利详情")
+        self.btn_detail.setIcon(icon("file_text"))
+        self.btn_detail.setIconSize(QSize(16, 16))
         self.btn_detail.setCheckable(True)
         self.btn_detail.setChecked(True)
         self.btn_detail.setObjectName("viewToggleBtn")
         self.btn_detail.clicked.connect(lambda: self._switch_view("detail"))
 
-        self.btn_ai = QPushButton("🤖 AI 分析")
+        self.btn_ai = QPushButton(" AI 分析")
+        self.btn_ai.setIcon(icon("robot"))
+        self.btn_ai.setIconSize(QSize(16, 16))
         self.btn_ai.setCheckable(True)
         self.btn_ai.setObjectName("viewToggleBtn")
         self.btn_ai.clicked.connect(lambda: self._switch_view("ai"))
@@ -57,7 +64,9 @@ class ReportPanel(QWidget):
         title_row.addWidget(self.btn_ai)
         title_row.addStretch(1)
 
-        self.export_word_btn = QPushButton("📄 导出 Word")
+        self.export_word_btn = QPushButton(" 导出 Word")
+        self.export_word_btn.setIcon(icon("download"))
+        self.export_word_btn.setIconSize(QSize(16, 16))
         self.export_word_btn.setObjectName("exportBtn")
         self.export_word_btn.setEnabled(False)
         self.export_word_btn.clicked.connect(self._export_word)
@@ -72,51 +81,40 @@ class ReportPanel(QWidget):
 
         # ── 专利详情标签页 ──────────────────────────────────────────────
         self.detail_tabs = QTabWidget()
-        self.detail_tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid #d0d7de; }
-            QTabBar::tab { padding: 6px 18px; font-size: 13px; }
-        """)
 
         # Tab 1: 摘要
         self.tab_summary = QTextBrowser()
         self.tab_summary.setOpenExternalLinks(True)
         self.tab_summary.setStyleSheet(f"QTextBrowser {{{_BROWSER_STYLE}}}")
-        self.detail_tabs.addTab(self.tab_summary, "📋 摘要")
+        self.detail_tabs.addTab(self.tab_summary, " 摘要")
+        self.detail_tabs.setTabIcon(0, icon("doc"))
 
         # Tab 2: 说明书
         self.tab_desc = QTextBrowser()
         self.tab_desc.setOpenExternalLinks(True)
         self.tab_desc.setStyleSheet(f"QTextBrowser {{{_BROWSER_STYLE}}}")
-        self.detail_tabs.addTab(self.tab_desc, "📖 说明书")
+        self.detail_tabs.addTab(self.tab_desc, " 说明书")
+        self.detail_tabs.setTabIcon(1, icon("book"))
 
         # Tab 3: 权利要求书
         self.tab_claims = QTextBrowser()
         self.tab_claims.setOpenExternalLinks(True)
         self.tab_claims.setStyleSheet(f"QTextBrowser {{{_BROWSER_STYLE}}}")
-        self.detail_tabs.addTab(self.tab_claims, "📜 权利要求书")
+        self.detail_tabs.addTab(self.tab_claims, " 权利要求书")
+        self.detail_tabs.setTabIcon(2, icon("file_text"))
 
         # Tab 4: 具体实施方式（下载时从说明书抽取的详述/实施例部分）
         self.tab_embodiments = QTextBrowser()
         self.tab_embodiments.setOpenExternalLinks(True)
         self.tab_embodiments.setStyleSheet(f"QTextBrowser {{{_BROWSER_STYLE}}}")
-        self.detail_tabs.addTab(self.tab_embodiments, "🧪 具体实施方式")
+        self.detail_tabs.addTab(self.tab_embodiments, " 具体实施方式")
+        self.detail_tabs.setTabIcon(3, icon("flask"))
 
         # ── 堆叠切换 ───────────────────────────────────────────────────
         self.stack = QStackedWidget()
         self.stack.addWidget(self.detail_tabs)   # index 0
         self.stack.addWidget(self.ai_browser)     # index 1
         layout.addWidget(self.stack, 1)
-
-        # 按钮样式
-        self.setStyleSheet("""
-            QPushButton#viewToggleBtn {
-                padding: 4px 14px; border: 1px solid #c0c0c0;
-                border-radius: 3px; background: #f5f5f5;
-            }
-            QPushButton#viewToggleBtn:checked {
-                background: #0078d4; color: white; border-color: #0078d4;
-            }
-        """)
 
         self._show_placeholder()
 
@@ -391,20 +389,27 @@ class ReportPanel(QWidget):
 
     @staticmethod
     def _wrap_html(body: str) -> str:
-        css = """
-        body { font-family:"Microsoft YaHei",sans-serif; line-height:1.8;
-               padding:10px; color:#222; }
-        h1 { border-bottom:2px solid #333; padding-bottom:8px; }
-        h2 { border-bottom:1px solid #999; padding-bottom:5px; margin-top:24px; }
-        h3 { margin-top:18px; }
-        table { border-collapse:collapse; width:100%; margin:8px 0 12px 0; }
-        td { border:1px solid #ddd; padding:6px 10px; font-size:13px; }
-        td:first-child { background:#f5f7fa; width:80px; white-space:nowrap; }
-        th, td { border:1px solid #ccc; padding:8px; text-align:left; }
-        th { background:#f0f0f0; }
-        blockquote { border-left:3px solid #0078D4; padding-left:15px;
-                     color:#555; background:#f5f9ff; }
-        code { background:#f5f5f5; padding:1px 4px; border-radius:3px; }
+        accent = _T["accent"]
+        border = _T["border"]
+        surface = _T["surface"]
+        css = f"""
+        body {{ font-family:"Microsoft YaHei",sans-serif; line-height:1.8;
+               padding:10px; color:{_T['text']}; }}
+        h1 {{ border-bottom:2px solid {accent}; padding-bottom:8px; }}
+        h2 {{ border-bottom:1px solid {border}; padding-bottom:5px;
+             margin-top:24px; color:{accent}; }}
+        h3 {{ margin-top:18px; }}
+        table {{ border-collapse:collapse; width:100%; margin:8px 0 12px 0; }}
+        td {{ border:1px solid {border}; padding:6px 10px; font-size:13px; }}
+        td:first-child {{ background:{surface}; width:80px; white-space:nowrap;
+                         font-weight:bold; }}
+        th, td {{ border:1px solid {border}; padding:8px; text-align:left; }}
+        th {{ background:{surface}; }}
+        blockquote {{ border-left:3px solid {accent}; padding-left:15px;
+                     color:{_T['text_secondary']}; background:{_T['accent_soft']};
+                     border-radius:0 6px 6px 0; }}
+        code {{ background:{surface}; padding:1px 4px; border-radius:3px;
+                font-family:"Cascadia Code","Consolas",monospace; }}
         """
         return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>{css}</style></head>

@@ -16,6 +16,9 @@ from PySide6.QtCore import Qt, Signal
 
 from src.utils.config import Settings
 from src.ai_client import PROVIDER_CONFIG, get_provider_models
+from src.ui.theme import DEFAULT_THEME as _T
+from src.ui.icons import icon
+from PySide6.QtCore import QSize
 
 
 class SettingsDialog(QDialog):
@@ -738,7 +741,7 @@ class PromptEditorDialog(QDialog):
             "提示词中的 JSON 示例花括号 {} 会原样保留，无需转义。"
         )
         var_label.setWordWrap(True)
-        var_label.setStyleSheet("color: #666; font-size: 11px; padding: 4px;")
+        var_label.setStyleSheet(f"color: {_T['text_secondary']}; font-size: 11px; padding: 4px;")
         rl.addWidget(var_label)
 
         splitter.addWidget(right)
@@ -943,7 +946,7 @@ class TestDialog(QDialog):
     """测试工具对话框 — 检索式测试、公布号查询等"""
 
     lookup_patent = Signal(str)        # doc_id（公布号直查，保留）
-    batch_test = Signal(list, str, int, int)  # queries, test_name, max_results, concurrency
+    batch_test = Signal(list, int, int)  # queries, max_results, concurrency
 
     _HISTORY_FILE = Path(__file__).parent.parent.parent / "data" / "lookup_history.json"
     _MAX_HISTORY = 20
@@ -965,14 +968,6 @@ class TestDialog(QDialog):
         # ── 批量检索测试（替代原单条检索式测试）──
         batch_group = QGroupBox("📋 批量检索测试")
         batch_layout = QVBoxLayout(batch_group)
-
-        # 测试名称
-        name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("测试名称:"))
-        self.batch_name_edit = QLineEdit()
-        self.batch_name_edit.setPlaceholderText("可选，用于命名输出目录...")
-        name_row.addWidget(self.batch_name_edit, 1)
-        batch_layout.addLayout(name_row)
 
         # 检索式列表 + 按钮
         list_label_row = QHBoxLayout()
@@ -999,12 +994,14 @@ class TestDialog(QDialog):
 
         # 参数跟随设置：每式结果数 = 主面板参数，并发 = ⚙设置 下载并发数
         self.batch_params_hint = QLabel()
-        self.batch_params_hint.setStyleSheet("color:#718096;")
+        self.batch_params_hint.setStyleSheet(f"color:{_T['text_muted']};")
         batch_layout.addWidget(self.batch_params_hint)
 
         # 操作按钮
         batch_btn_row = QHBoxLayout()
-        self.batch_run_btn = QPushButton("▶ 运行批量测试")
+        self.batch_run_btn = QPushButton(" 运行批量测试")
+        self.batch_run_btn.setIcon(icon("play"))
+        self.batch_run_btn.setIconSize(QSize(16, 16))
         self.batch_run_btn.setObjectName("saveBtn")
         self.batch_run_btn.setMinimumHeight(32)
         self.batch_run_btn.setToolTip(
@@ -1217,14 +1214,13 @@ class TestDialog(QDialog):
         if not queries:
             QMessageBox.warning(self, "无检索式", "请先添加至少一个检索式。")
             return
-        test_name = self.batch_name_edit.text().strip()
         # 每式结果数 = 主面板参数；并发 = 设置 search.download_concurrency
         max_results = (self._panel_max_results
                        or (self._settings.patentscope_max_results
                            if self._settings else 100))
         concurrency = (self._settings.search_download_concurrency
                        if self._settings else 20)
-        self.batch_test.emit(queries, test_name, max_results, concurrency)
+        self.batch_test.emit(queries, max_results, concurrency)
 
     def _on_batch_open_output(self):
         """打开批量测试输出目录"""
@@ -1319,7 +1315,7 @@ class OAWriteDialog(QDialog):
         self.patent_label = QLabel(
             f"公布号: {pub or '（未解析）'}  |  {title}")
         self.patent_label.setWordWrap(True)
-        self.patent_label.setStyleSheet("color: #1a365d; padding: 4px;")
+        self.patent_label.setStyleSheet(f"color: {_T['accent']}; padding: 4px;")
         patent_layout.addWidget(self.patent_label)
         layout.addWidget(patent_box)
 
@@ -1335,7 +1331,7 @@ class OAWriteDialog(QDialog):
         self.search_list.itemSelectionChanged.connect(self._sync_current_docs)
         tsl.addWidget(self.search_list)
         hint = QLabel("从当前检索结果中多选对比文件；默认按相关度自动分配 D1/D2，可在下方调整。")
-        hint.setStyleSheet("color: #666; font-size: 11px;")
+        hint.setStyleSheet(f"color: {_T['text_secondary']}; font-size: 11px;")
         tsl.addWidget(hint)
         self.source_tabs.addTab(tab_search, "从检索结果")
 
@@ -1378,7 +1374,7 @@ class OAWriteDialog(QDialog):
         role_layout.addRow("最接近的现有技术 (D1):", self.d1_combo)
         role_layout.addRow("辅助评述 (D2):", self.d2_combo)
         role_hint = QLabel("默认按相关度自动分配；如只需一篇对比文件，D2 选「不使用」。")
-        role_hint.setStyleSheet("color: #666; font-size: 11px;")
+        role_hint.setStyleSheet(f"color: {_T['text_secondary']}; font-size: 11px;")
         role_layout.addRow("", role_hint)
         layout.addWidget(role_box)
 

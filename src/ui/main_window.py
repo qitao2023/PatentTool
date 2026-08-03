@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QAction
 
+from src.ui.icons import icon
 from src.ui.input_panel import InputPanel
 from src.ui.log_panel import LogPanel
 from src.ui.result_panel import ResultPanel
@@ -58,8 +59,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(6, 6, 6, 6)
-        main_layout.setSpacing(4)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
 
         # ① 输入面板
         self.input_panel = InputPanel()
@@ -105,47 +106,58 @@ class MainWindow(QMainWindow):
 
         file_menu = menubar.addMenu("文件(&F)")
         open_action = QAction("打开PDF...", self)
+        open_action.setIcon(icon("folder", size=16))
         open_action.triggered.connect(self._menu_open_pdf)
         file_menu.addAction(open_action)
         file_menu.addSeparator()
         settings_action = QAction("设置...", self)
+        settings_action.setIcon(icon("settings", size=16))
         settings_action.triggered.connect(self._on_open_settings)
         file_menu.addAction(settings_action)
         file_menu.addSeparator()
         history_action = QAction("历史记录...", self)
+        history_action.setIcon(icon("clock", size=16))
         history_action.triggered.connect(self._on_open_history)
         file_menu.addAction(history_action)
         file_menu.addSeparator()
         prompts_action = QAction("提示词配置...", self)
+        prompts_action.setIcon(icon("book", size=16))
         prompts_action.triggered.connect(self._on_open_prompt_editor)
         file_menu.addAction(prompts_action)
         file_menu.addSeparator()
         final_review_action = QAction("终选评述...", self)
+        final_review_action.setIcon(icon("star", size=16))
         final_review_action.triggered.connect(self._on_final_review)
         file_menu.addAction(final_review_action)
         file_menu.addSeparator()
         oa_action = QAction("撰写通知书...", self)
+        oa_action.setIcon(icon("file_text", size=16))
         oa_action.triggered.connect(self._on_oa_write_clicked)
         file_menu.addAction(oa_action)
         file_menu.addSeparator()
         test_action = QAction("测试工具...", self)
+        test_action.setIcon(icon("flask", size=16))
         test_action.triggered.connect(self._on_open_test)
         file_menu.addAction(test_action)
         file_menu.addSeparator()
         exit_action = QAction("退出", self)
+        exit_action.setIcon(icon("log_out", size=16))
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
         run_menu = menubar.addMenu("运行(&R)")
         start_action = QAction("开始分析", self)
+        start_action.setIcon(icon("play", size=16))
         start_action.triggered.connect(self._on_start)
         run_menu.addAction(start_action)
         stop_action = QAction("停止", self)
+        stop_action.setIcon(icon("stop", size=16))
         stop_action.triggered.connect(self._on_stop)
         run_menu.addAction(stop_action)
 
         help_menu = menubar.addMenu("帮助(&H)")
         about_action = QAction("关于", self)
+        about_action.setIcon(icon("info", size=16))
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
@@ -158,11 +170,17 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.session_label)
 
     def _show_about(self):
-        QMessageBox.about(self, "关于 专利检索分析工具",
+        from src.ui.icons import app_icon
+        msg = QMessageBox(self)
+        msg.setWindowTitle("关于 专利检索分析工具")
+        msg.setIconPixmap(app_icon().pixmap(64, 64))
+        msg.setText(
             "<h3>专利检索分析工具 v1.0</h3>"
             "<p>AI驱动的专利PDF检索、对比分析和撰写辅助工具。</p>"
             "<p>技术栈: PySide6 + DeepSeek/Kimi + Playwright</p>"
         )
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
 
     def _on_open_test(self):
         """打开测试工具对话框"""
@@ -197,9 +215,9 @@ class MainWindow(QMainWindow):
         self.input_panel.set_running_state(False)
         self.status_label.setText("查询完成")
 
-    @Slot(list, str, int, int)
-    def _on_batch_test(self, queries: list[str], test_name: str,
-                       max_results: int, concurrency: int):
+    @Slot(list, int, int)
+    def _on_batch_test(self, queries: list[str], max_results: int,
+                       concurrency: int):
         """批量检索测试：搜索 → 去重 → 下载 → 报告（零 AI）"""
         if not queries:
             return
@@ -217,7 +235,6 @@ class MainWindow(QMainWindow):
         self._current_worker = MultiQueryTestWorker(
             queries=queries,
             settings=self.settings,
-            test_name=test_name,
             max_results=max_results,
             concurrency=concurrency,
         )
@@ -243,15 +260,6 @@ class MainWindow(QMainWindow):
         if flat:
             self.result_panel.show_dedup_results(flat)
             self.report_panel.show_patent_detail(flat[0])
-        # 保存测试结果
-        from datetime import datetime
-        out = (Path.cwd() / "data" / "output"
-               / "test" / datetime.now().strftime("%Y%m%d_%H%M%S"))
-        out.mkdir(parents=True, exist_ok=True)
-        import json as json_module
-        with open(out / "test_results.json", "w", encoding="utf-8") as f:
-            json_module.dump(results, f, indent=2, ensure_ascii=False, default=str)
-        self.log_panel.append_log("INFO", f"结果已保存: {out / 'test_results.json'}")
 
     def _on_open_settings(self):
         """打开设置对话框"""
