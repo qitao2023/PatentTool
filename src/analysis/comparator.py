@@ -49,6 +49,10 @@ class PatentComparator:
             detail = self._detailed_comparison(client, patent, r)
             if detail:
                 comparisons.append(detail)
+            else:
+                import sys
+                pn = r.get("publication_number", "?")
+                print(f"[WARN] 详细对比跳过: {pn} (AI响应解析失败或API异常)", file=sys.stderr, flush=True)
 
         # 详细对比完成后，以 AI 读完全文给出的最终评分为准，从高到低排序
         comparisons.sort(
@@ -98,8 +102,23 @@ class PatentComparator:
             if detail:
                 detail["source_raw"] = result
                 return detail
+            # JSON 解析失败时，用原始响应构建兜底对比条目，避免整篇丢失
+            import sys
+            pn = result.get("publication_number", "?")
+            print(f"[WARN] 详细对比 JSON 解析失败: {pn}，使用兜底条目", file=sys.stderr, flush=True)
+            return {
+                "publication_number": pn,
+                "relevance_score": result.get("relevance_score", 0),
+                "novelty_impact": "unknown",
+                "inventive_step_impact": "unknown",
+                "key_features_same": [],
+                "key_features_different": [],
+                "conclusion": f"AI 对比分析响应解析失败，请重新运行。原始响应:\n\n{content[:500]}",
+                "source_raw": result,
+            }
         except Exception as e:
-            print(f"详细对比失败 ({result.get('publication_number', '')}): {e}")
+            import sys
+            print(f"详细对比失败 ({result.get('publication_number', '')}): {e}", file=sys.stderr, flush=True)
 
         return None
 
@@ -107,17 +126,35 @@ class PatentComparator:
         try:
             content = self._clean_json(content)
             return json.loads(content)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            import sys
+            print(f"[WARN] _parse_detail JSON解析失败: {e}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] 原始响应前200字符: {content[:200]}", file=sys.stderr, flush=True)
             return None
 
     def _clean_json(self, content: str) -> str:
         content = content.strip()
+        # 优先提取 ```json ... ``` 代码块
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0].strip()
         elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
+            # 尝试匹配 JSON 代码块（可能有 ` ```json ` 或只有 ` ``` `）
+            parts = content.split("```")
+            # 找最长的看起来像 JSON 的块
+            best = ""
+            for i in range(1, len(parts), 2):
+                p = parts[i].strip()
+                if p and (p.startswith("{") or p.startswith("[")):
+                    if len(p) > len(best):
+                        best = p
+            if best:
+                content = best
+            else:
+                content = content.split("```")[1].split("```")[0].strip()
+        # 去掉前缀 markdown 文本（找到第一个 JSON 开始标记）
         while content and content[0] not in "[{":
             content = content[1:]
+        # 从尾部反向查找 JSON 结束标记
         while content and content[-1] not in "]}":
             content = content[:-1]
         return content
