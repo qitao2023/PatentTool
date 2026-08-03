@@ -43,7 +43,7 @@ class PatentPDFExtractor:
         "description_cn": re.compile(r"说\s*明\s*书"),
         "description_en": re.compile(r"(?:DESCRIPTION|DETAILED DESCRIPTION)", re.IGNORECASE),
         "ipc": re.compile(r"(?:Int\.Cl\.|Int\.Cl\s*:|IPC)\s*([\w/\d.]+)", re.IGNORECASE),
-        "publication_number": re.compile(r"(?:CN|US|EP|WO|JP|KR)\s*\d+[A-Z]?\d*"),
+        "publication_number": re.compile(r"(?:CN|US|EP|WO|JP|KR) *\d+[A-Z]?\d*"),
         "applicant": re.compile(r"(?:申请人|Applicant)\s*[:：]?\s*(.+)", re.IGNORECASE),
         "inventor": re.compile(r"(?:发明人|Inventor)\s*[:：]?\s*(.+)", re.IGNORECASE),
     }
@@ -110,18 +110,30 @@ class PatentPDFExtractor:
 
     def _parse_metadata(self, text: str, patent: PatentDocument):
         """解析元数据：公布号、申请人等"""
+        lines = text.split("\n")
         # 公布号
-        for line in text.split("\n"):
+        for i, line in enumerate(lines):
             if "公布号" in line or "申请公布号" in line or "Publication Number" in line:
-                m = re.search(r"(\w{2}\s*\d+[A-Z]?\d*)", line)
+                # 先在本行查找
+                m = re.search(r"([A-Z]{2} *\d+[A-Z]?\d*)", line)
                 if m:
                     patent.publication_number = normalize_patent_number(m.group(1))
                     break
+                # 本行没有则向后查找最多3行（中文专利 INID 标签与值常在不同行）
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    m = re.search(r"([A-Z]{2} *\d+[A-Z]?\d*)", lines[j])
+                    if m:
+                        patent.publication_number = normalize_patent_number(m.group(1))
+                        break
+                if patent.publication_number:
+                    break
         if not patent.publication_number:
-            # 放宽匹配
-            for m in self.SECTION_PATTERNS["publication_number"].finditer(text):
-                patent.publication_number = normalize_patent_number(m.group(0))
-                break
+            # 放宽匹配：逐行搜索，避免跨行误匹配（如「US」在行尾、「18」在下行首）
+            for line in lines:
+                m = self.SECTION_PATTERNS["publication_number"].search(line)
+                if m:
+                    patent.publication_number = normalize_patent_number(m.group(0))
+                    break
 
         # 申请号
         for line in text.split("\n"):
